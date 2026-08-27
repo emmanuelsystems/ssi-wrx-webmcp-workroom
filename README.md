@@ -6,8 +6,6 @@ SSI-WRX Workroom is a local-first decision workflow for making evidence, agent r
 
 ![SSI-WRX Workroom screenshot](assets/workroom.png)
 
-![SSI-WRX Workroom animated preview](assets/workroom-preview.gif)
-
 The `assets/` folder also includes captures of the new-episode dialog and a second sample episode view.
 
 ## What the workroom does
