@@ -75,12 +75,23 @@ npm run dev
 
 Vite will print the local URL, normally `http://localhost:5173`.
 
+### Initialize the workroom and open the browser
+
+For the usual next-start workflow, run:
+
+```bash
+npm run initialize
+```
+
+This starts Vite on `127.0.0.1:5173`, waits for the app to respond, and opens the workroom in the system browser. Keep that terminal open while working; press `Ctrl+C` to stop the server. Codex can work in parallel with the running app: leave this process active, then ask Codex to inspect or interact with the open browser session.
+
 ### Other commands
 
 ```bash
 npm run build    # Create a production build in dist/
 npm run preview  # Serve the production build locally
 npm run lint     # Run Oxlint
+npm run initialize # Start Vite and open the workroom in the browser
 ```
 
 ## Project structure
