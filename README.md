@@ -2,6 +2,14 @@
 
 SSI-WRX Workroom is a local-first decision workflow for making evidence, agent reasoning, human questions, and final human disposition visible in one place. It is built as a Vite + React single-page application and uses React Flow to render the episode workflow as an interactive node canvas.
 
+## Preview
+
+![SSI-WRX Workroom screenshot](assets/workroom.png)
+
+![SSI-WRX Workroom animated preview](assets/workroom-preview.gif)
+
+The `assets/` folder also includes captures of the new-episode dialog and a second sample episode view.
+
 ## What the workroom does
 
 The workroom organizes work into **episodes**. An episode is a bounded piece of work that moves through three stages:
