@@ -106,6 +106,12 @@ function slugify(value) {
 }
 
 function getTemplateKey(node) {
+  const nodeKind = node?.data?.workflowKind ?? node?.kind;
+  if (nodeKind === "inquiry") return "inquiry";
+  if (nodeKind === "evidence") return "evidence";
+  if (nodeKind === "gap") return "gaps";
+  if (nodeKind === "recommendation") return "recommendation";
+  if (nodeKind === "evaluation") return "evaluation";
   if (node?.id === "inquiry") return "inquiry";
   if (node?.id === "evidence") return "evidence";
   if (node?.id === "gaps") return "gaps";
@@ -164,7 +170,6 @@ export function createOrchestrationPlan({
     id: tasks[index].id,
     taskId: tasks[index].id,
     role: assignment.role,
-    status: index === 0 ? "Complete" : index === 1 ? "Working" : "Waiting",
   }));
 
   return {
@@ -184,7 +189,8 @@ export function createOrchestrationPlan({
       }))
     ),
     reviewPlan: {
-      role: tasks[tasks.length - 1]?.id,
+      role: template[template.length - 1]?.role,
+      taskId: tasks[tasks.length - 1]?.id,
       description: "Independent review before any human disposition.",
     },
     humanGates: [
@@ -211,13 +217,31 @@ export function createOrchestrationPlan({
   };
 }
 
-export function getOrchestrationPlanSummary(plan) {
+export function createMockExecutionState(plan) {
+  const assignments = plan?.assignments ?? [];
+  return assignments.reduce((state, assignment, index) => {
+    const status = index === 0
+      ? "Complete"
+      : index === 1
+      ? "Working"
+      : assignment.role.toLowerCase().includes("review")
+      ? "Human required"
+      : "Waiting";
+
+    return {
+      ...state,
+      [assignment.id]: status,
+    };
+  }, {});
+}
+
+export function getOrchestrationPlanSummary(plan, executionState = {}) {
   const assignments = plan?.assignments ?? [];
   return {
     total: assignments.length,
-    complete: assignments.filter((item) => item.status === "Complete").length,
-    working: assignments.filter((item) => item.status === "Working").length,
-    humanRequired: assignments.filter((item) => item.status === "Human required").length,
-    waiting: assignments.filter((item) => item.status === "Waiting").length,
+    complete: assignments.filter((item) => executionState[item.id] === "Complete").length,
+    working: assignments.filter((item) => executionState[item.id] === "Working").length,
+    humanRequired: assignments.filter((item) => executionState[item.id] === "Human required").length,
+    waiting: assignments.filter((item) => executionState[item.id] === "Waiting").length,
   };
 }

@@ -26,6 +26,9 @@ The agent can add evidence, recommendations, evaluations, and questions for a hu
 - **Node conversations** — ask or answer questions attached to a node. Pending questions are shown as thread nodes.
 - **Stage gates** — advance the active episode manually when the current stage is ready.
 - **Human disposition** — record the final human-owned outcome from the last stage.
+- **Local orchestration planner** — create a deterministic concept-testing plan for eligible work nodes. It proposes tasks, specialist roles, dependencies, expected outputs, review, and human gates; it does not execute agents, call an external First Mate runtime, or persist mock execution as real episode state.
+
+“First Mate” is currently a UI/conceptual orchestration role. The local planner is replaceable by a future external runtime adapter.
 
 ## WebMCP tools
 
@@ -83,7 +86,7 @@ For the usual next-start workflow, run:
 npm run initialize
 ```
 
-This starts Vite on `127.0.0.1:5173`, waits for the app to respond, and opens the workroom in the system browser. Keep that terminal open while working; press `Ctrl+C` to stop the server. Codex can work in parallel with the running app: leave this process active, then ask Codex to inspect or interact with the open browser session.
+This starts Vite on `http://localhost:5173/` with an explicit port and `strictPort`, waits for the app to respond, and opens the workroom in the system browser. Keep that terminal open while working; press `Ctrl+C` to stop the server. Codex can work in parallel with the running app: leave this process active, then ask Codex to inspect or interact with the open browser session.
 
 ### Other commands
 
@@ -100,6 +103,7 @@ npm run initialize # Start Vite and open the workroom in the browser
 .
 ├── src/
 │   ├── App.jsx              # Workflow model, UI, persistence, and WebMCP tools
+│   ├── orchestration.js     # Local deterministic orchestration planning contract
 │   ├── App.css              # Workroom and React Flow styling
 │   ├── NewEpisodeModal.jsx  # New episode form
 │   ├── NewEpisodemodal.css  # New episode modal styles
@@ -121,4 +125,4 @@ npm run initialize # Start Vite and open the workroom in the browser
 
 ## Current scope
 
-This repository is a frontend workroom/prototype. It does not currently provide multi-user synchronization, server-side persistence, account management, automated stage advancement, or a deployment configuration.
+This repository is a frontend workroom/prototype. It does not currently provide multi-user synchronization, server-side persistence, account management, automated stage advancement, real agent orchestration, external First Mate integration, or a deployment configuration. Orchestration is currently local planning UI only and is not exposed through WebMCP.

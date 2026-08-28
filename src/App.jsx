@@ -22,10 +22,22 @@ import "@xyflow/react/dist/style.css";
 import { useWebMCP } from "use-webmcp-tool";
 
 import {
+  createMockExecutionState,
   createOrchestrationPlan,
   createOrchestrationRequest,
   getOrchestrationPlanSummary,
 } from "./orchestration";
+
+import {
+  createEpisodeIntakeRequest,
+  normalizeEpisodeIntake,
+  validateEpisodeStructureProposal,
+} from "./episodeIntake";
+
+import {
+  PROJECTS_STORAGE_KEY,
+  normalizeProjects,
+} from "./projects";
 
 import "./App.css";
 
@@ -35,22 +47,27 @@ import "./App.css";
 
 const STORAGE_KEY = "ssi-wrx-workroom-v4";
 
+function deriveEpisodeName(title) {
+  const value = title?.replace(/\s+/g, " ").trim() ?? "";
+  if (!value) return "Untitled episode";
+  if (/weekly huddle.*follow.?up/i.test(value)) return "Huddle follow-up workflow";
+  if (/reconstructed workflow.*evidence|workflow.*explicit evidence/i.test(value)) return "Workflow validation";
+  if (/meeting.*unclear.*next/i.test(value)) return "Product huddle follow-up";
+  const words = value.replace(/[?!.:,;]/g, "").split(" ").slice(0, 6);
+  const result = words.join(" ");
+  return `${result.slice(0, 42).replace(/\s+$/, "")}${result.length > 42 || words.length < value.split(" ").length ? "…" : ""}`;
+}
+
 function getContextSummary(episode) {
+  const rawContext = episode?.context?.trim() ?? "";
+  const summary = rawContext
+    ? rawContext.replace(/\s+/g, " ").trim()
+    : "No additional context provided.";
+
   return {
     source: episode?.title ?? "Synthetic episode",
-    confirmed: [
-      "Visible bounded follow-up work",
-      "Human approval remains final",
-    ],
-    proposed: [
-      "Connector-assisted context retrieval",
-      "Workroom-native orchestrator",
-    ],
-    unresolved: [
-      "Runtime choice",
-      "Default connectors",
-      "Orchestration start condition",
-    ],
+    summary,
+    highlights: rawContext ? [summary] : [],
   };
 }
 
@@ -510,6 +527,10 @@ function normalizeEpisode(
       episode.objective ??
       `Episode ${index + 1}`,
 
+    name:
+      episode.name?.trim() ||
+      deriveEpisodeName(episode.title ?? episode.objective),
+
     context:
       legacyContext,
 
@@ -549,6 +570,15 @@ function normalizeEpisode(
               )
             : null,
       })),
+
+    intake: normalizeEpisodeIntake(episode.intake),
+
+    workflow: {
+      nodes: episode.workflow?.nodes ?? [],
+      edges: episode.workflow?.edges ?? [],
+    },
+
+    projectId: episode.projectId ?? null,
   };
 }
 
@@ -577,7 +607,7 @@ function loadEpisodes() {
     }
 
     if (!raw) {
-      return INITIAL_EPISODES;
+      return INITIAL_EPISODES.map(normalizeEpisode);
     }
 
     const parsed =
@@ -587,14 +617,23 @@ function loadEpisodes() {
       !Array.isArray(parsed) ||
       parsed.length === 0
     ) {
-      return INITIAL_EPISODES;
+      return INITIAL_EPISODES.map(normalizeEpisode);
     }
 
     return parsed.map(
       normalizeEpisode
     );
   } catch {
-    return INITIAL_EPISODES;
+    return INITIAL_EPISODES.map(normalizeEpisode);
+  }
+}
+
+function loadProjects() {
+  try {
+    const raw = localStorage.getItem(PROJECTS_STORAGE_KEY);
+    return raw ? normalizeProjects(JSON.parse(raw)) : [];
+  } catch {
+    return [];
   }
 }
 
@@ -606,12 +645,24 @@ function NewEpisodeModal({
   open,
   onClose,
   onCreate,
+  projects = [],
+  initialProjectId = null,
+  onCreateProject,
 }) {
   const [title, setTitle] =
     useState("");
 
+  const [name, setName] =
+    useState("");
+
   const [context, setContext] =
     useState("");
+
+  const [setupMode, setSetupMode] =
+    useState("agent-assisted");
+
+  const [projectId, setProjectId] =
+    useState(initialProjectId ?? "");
 
   useEffect(() => {
     if (!open) {
@@ -644,9 +695,16 @@ function NewEpisodeModal({
   useEffect(() => {
     if (!open) {
       setTitle("");
+      setName("");
       setContext("");
+      setSetupMode("agent-assisted");
+      setProjectId(initialProjectId ?? "");
     }
-  }, [open]);
+  }, [open, initialProjectId]);
+
+  useEffect(() => {
+    if (open && initialProjectId) setProjectId(initialProjectId);
+  }, [open, initialProjectId]);
 
   if (!open) {
     return null;
@@ -671,8 +729,14 @@ function NewEpisodeModal({
       title:
         cleanTitle,
 
+      name:
+        name.trim() || deriveEpisodeName(cleanTitle),
+
       context:
         cleanContext,
+
+      setupMode,
+      projectId: projectId || null,
     });
 
     setTitle("");
@@ -733,6 +797,20 @@ function NewEpisodeModal({
             handleSubmit
           }
         >
+          <label className="episode-field project-select-field">
+            <span>Project <em>Optional</em></span>
+            <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+              <option value="">Unassigned</option>
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>{project.name}</option>
+              ))}
+            </select>
+            <button type="button" className="text-button" onClick={onCreateProject}>+ Create new project</button>
+          </label>
+          <label className="episode-field">
+            <span>Episode name <em>Optional</em></span>
+            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Product huddle follow-up" />
+          </label>
           <label className="episode-field">
             <span>
               What are we
@@ -758,6 +836,38 @@ function NewEpisodeModal({
               placeholder="e.g. Is our conversation → follow-up workflow simple enough for a new team member to use confidently?"
             />
           </label>
+
+          <fieldset className="episode-setup-field">
+            <legend>Episode setup</legend>
+
+            <label>
+              <input
+                type="radio"
+                name="episode-setup"
+                value="manual"
+                checked={setupMode === "manual"}
+                onChange={() => setSetupMode("manual")}
+              />
+              <span>Start manually</span>
+            </label>
+
+            <label>
+              <input
+                type="radio"
+                name="episode-setup"
+                value="agent-assisted"
+                checked={setupMode === "agent-assisted"}
+                onChange={() => setSetupMode("agent-assisted")}
+              />
+              <span>Analyze and propose structure</span>
+            </label>
+
+            <p>
+              An agent can analyze the Episode and propose the context, work
+              inquiries, action areas, and human checkpoints. Nothing is
+              accepted until you review it.
+            </p>
+          </fieldset>
 
           <label className="episode-field">
             <span>
@@ -822,9 +932,75 @@ function NewEpisodeModal({
                 !title.trim()
               }
             >
-              Create episode
+              {setupMode === "agent-assisted"
+                ? "Create & Analyze"
+                : "Create Episode"}
             </button>
           </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function NewProjectModal({ open, onClose, onCreate, project = null }) {
+  const [name, setName] = useState(project?.name ?? "");
+  const [description, setDescription] = useState(project?.description ?? "");
+
+  if (!open) return null;
+
+  function handleSubmit(event) {
+    event.preventDefault();
+    if (!name.trim()) return;
+    onCreate({ name: name.trim(), description: description.trim(), projectId: project?.id ?? null });
+    setName("");
+    setDescription("");
+  }
+
+  return (
+    <div className="episode-modal-overlay project-modal-overlay" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section className="episode-modal project-modal" role="dialog" aria-modal="true">
+        <div className="episode-modal-header">
+          <div><div className="episode-modal-eyebrow">{project ? "Edit project" : "New project"}</div><h2>{project ? "Update project details" : "Organize related episodes"}</h2></div>
+          <button type="button" className="episode-modal-close" onClick={onClose}>×</button>
+        </div>
+        <form className="episode-modal-form" onSubmit={handleSubmit}>
+          <label className="episode-field"><span>Project name <strong>Required</strong></span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. SSI-WRX" /></label>
+          <label className="episode-field"><span>Description <em>Optional</em></span><textarea rows="3" value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+          <div className="episode-modal-actions">
+            <button type="button" className="episode-modal-button" onClick={onClose}>Cancel</button>
+            <button type="submit" className="episode-modal-button primary" disabled={!name.trim()}>{project ? "Save changes" : "Create Project"}</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function RenameEpisodeModal({ open, episode, onClose, onSave }) {
+  const [name, setName] = useState(episode?.name ?? "");
+
+  useEffect(() => {
+    if (open) setName(episode?.name ?? "");
+  }, [open, episode]);
+
+  if (!open || !episode) return null;
+
+  function handleSubmit(event) {
+    event.preventDefault();
+    if (name.trim()) onSave(name.trim());
+  }
+
+  return (
+    <div className="episode-modal-overlay project-modal-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="episode-modal project-modal" role="dialog" aria-modal="true">
+        <div className="episode-modal-header"><div><div className="episode-modal-eyebrow">Rename episode</div><h2>Update navigation name</h2></div><button type="button" className="episode-modal-close" onClick={onClose}>×</button></div>
+        <form className="episode-modal-form" onSubmit={handleSubmit}>
+          <label className="episode-field"><span>Episode name <strong>Required</strong></span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} /></label>
+          <p className="rename-episode-note">This changes the sidebar label only. The full objective and Episode data stay intact.</p>
+          <div className="episode-modal-actions"><button type="button" className="episode-modal-button" onClick={onClose}>Cancel</button><button type="submit" className="episode-modal-button primary" disabled={!name.trim()}>Save name</button></div>
         </form>
       </section>
     </div>
@@ -895,7 +1071,7 @@ function CardNode({
         selected
           ? "selected"
           : ""
-      }`}
+      } ${data.proposed ? "proposed-node" : ""}`}
     >
       <MessageBadge
         count={
@@ -945,18 +1121,7 @@ function CardNode({
       {data.contextSummary && (
         <div className="context-summary">
           <strong>{data.contextSummary.source}</strong>
-          {[
-            ["Confirmed", data.contextSummary.confirmed],
-            ["Proposed", data.contextSummary.proposed],
-            ["Unresolved", data.contextSummary.unresolved],
-          ].map(([label, items]) => (
-            <div key={label} className="context-summary-group">
-              <span>{label}</span>
-              {items.slice(0, 3).map((item) => (
-                <div key={item}>• {item}</div>
-              ))}
-            </div>
-          ))}
+          <p>{data.contextSummary.summary}</p>
         </div>
       )}
 
@@ -1314,6 +1479,7 @@ const NODE_TYPES = {
   thread: ThreadNode,
   orchestration: OrchestrationPreviewNode,
   orchestrationOutput: OrchestrationOutputNode,
+  intake: EpisodeIntakeNode,
 };
 
 const ORCHESTRATION_AGENTS = [
@@ -1550,13 +1716,24 @@ const ORCHESTRATION_ELIGIBLE_NODES = new Set([
   "evaluation",
 ]);
 
-function getOrchestrationSummary(nodeId, plan) {
+function isOrchestrationEligibleNode(node) {
+  return Boolean(
+    node &&
+    (ORCHESTRATION_ELIGIBLE_NODES.has(node.id) ||
+      ["inquiry", "evidence", "gap", "recommendation", "evaluation"].includes(
+        node.data?.workflowKind ?? node.kind
+      ))
+  );
+}
+
+function getOrchestrationSummary(nodeId, plan, executionState) {
   return getOrchestrationPlanSummary(
     plan ??
       createOrchestrationPlan({
         episode: { id: "concept-preview" },
         node: { id: nodeId },
-      })
+      }),
+    executionState
   );
 }
 
@@ -1589,7 +1766,8 @@ function isValidOrchestrationPlan(plan) {
 function buildOrchestrationPreviewNodes(
   parentNodeId,
   parentPosition,
-  plan
+  plan,
+  executionState = {}
 ) {
   const baseX = parentPosition.x;
   const baseY = parentPosition.y;
@@ -1601,9 +1779,11 @@ function buildOrchestrationPreviewNodes(
       position: { x: baseX + 330, y: baseY + 30 },
       data: {
         label: "First Mate",
-        title: "Coordinating 3 agents",
-        status: "working",
-        statusLabel: "Working",
+        title: `Coordinating ${plan.assignments?.length ?? 0} agents`,
+        status: orchestrationSummaryStatus(
+          getOrchestrationPlanSummary(plan, executionState)
+        ),
+        statusLabel: "Mock preview",
         result: "Concept only · no execution",
         orchestrationPreview: true,
         detailId: "first-mate",
@@ -1622,8 +1802,8 @@ function buildOrchestrationPreviewNodes(
       data: {
         label: assignment.role,
         title: task.title,
-        status: orchestrationStatusClass(assignment.status),
-        statusLabel: `Mock · ${assignment.status}`,
+        status: orchestrationStatusClass(executionState[assignment.id] ?? "Waiting"),
+        statusLabel: `Mock · ${executionState[assignment.id] ?? "Waiting"}`,
         result: `Output: ${task.output}`,
         orchestrationPreview: true,
         detailId: assignment.id,
@@ -1650,7 +1830,7 @@ function buildOrchestrationPreviewEdges(parentNodeId, plan) {
   );
   const reviewer = assignments.find((agent) =>
     agent.role.toLowerCase().includes("review")
-  ) ?? plan[plan.length - 1];
+  ) ?? assignments[assignments.length - 1];
   const reviewerId = `orchestration-${parentNodeId}-${reviewer.id}`;
   const outputId = `orchestration-${parentNodeId}-output`;
 
@@ -1726,11 +1906,95 @@ function OrchestrationOutputNode({ data: _data }) {
   );
 }
 
+function EpisodeIntakeNode({ data }) {
+  return (
+    <div className="flow-node episode-intake-node">
+      <Handle type="target" position={Position.Top} id="flow-target" className="flow-handle" />
+      <div className="node-label">Episode intake</div>
+      <div className="node-title">Agent structuring</div>
+      <div className="node-body">Awaiting agent analysis</div>
+      <button type="button" onClick={data.onOpen}>View intake request</button>
+      <Handle type="source" position={Position.Bottom} id="flow-source" className="flow-handle" />
+    </div>
+  );
+}
+
+function EpisodeIntakePanel({
+  open,
+  episode,
+  intake,
+  onClose,
+  onRequestRevision,
+  onAccept,
+}) {
+  if (!open || !episode || !intake || intake.status === "idle") {
+    return null;
+  }
+
+  const request = intake.request ?? createEpisodeIntakeRequest({ episode });
+  const proposal = intake.proposal;
+
+  return (
+    <aside className="episode-intake-panel" aria-label="Episode intake">
+      <header>
+        <div>
+          <div className="concept-preview-label">Agent-assisted setup</div>
+          <h2>
+            {intake.status === "pending"
+              ? "Agent structuring"
+              : "Proposed episode structure"}
+          </h2>
+        </div>
+        <button type="button" onClick={onClose} aria-label="Close intake">×</button>
+      </header>
+
+      {intake.status === "pending" && (
+        <div className="episode-intake-panel-body">
+          <strong>Awaiting agent analysis</strong>
+          <p>The agent will propose a work map for human review. Nothing is accepted yet.</p>
+          <div className="intake-request-list">
+            {request.requestedAnalysis.map((item) => <span key={item}>• {item}</span>)}
+          </div>
+        </div>
+      )}
+
+      {intake.status === "proposed" && proposal && (
+        <div className="episode-intake-panel-body">
+          <div className="proposal-status">Agent proposed · Not accepted</div>
+          <div className="intake-section"><span>Objective</span><strong>{proposal.objective}</strong></div>
+          <div className="intake-section"><span>Context summary</span><p>{proposal.context?.summary}</p></div>
+          <div className="intake-section">
+            <span>Work map</span>
+            {proposal.workNodes.map((node) => (
+              <p key={node.id}><strong>{node.title}</strong><br />{node.kind} · {node.description}</p>
+            ))}
+          </div>
+          <div className="intake-section"><span>Assumptions</span><p>{proposal.assumptions?.join(" · ") || "None provided."}</p></div>
+          <div className="intake-section"><span>Unresolved questions</span><p>{proposal.unresolved?.join(" · ") || "None provided."}</p></div>
+          <div className="intake-section"><span>Human checkpoints</span>{proposal.humanGates.map((gate) => <p key={gate.id}>{gate.title}</p>)}</div>
+        </div>
+      )}
+
+      <footer>
+        {intake.status === "pending" ? (
+          <button type="button" onClick={onClose}>Close</button>
+        ) : (
+          <>
+            <button type="button" onClick={onRequestRevision}>Regenerate / Request revision</button>
+            <button type="button" onClick={onAccept} className="primary">Accept structure</button>
+          </>
+        )}
+      </footer>
+    </aside>
+  );
+}
+
 function OrchestrationDetailOverlay({
   nodeTitle,
   nodeType,
   detailId,
   plan,
+  executionState = {},
   onClose,
 }) {
   const assignments = plan?.assignments ?? [];
@@ -1784,8 +2048,8 @@ function OrchestrationDetailOverlay({
           </div>
           <div className="orchestration-detail-section">
             <span>Status</span>
-            <p className={`orchestration-detail-status ${orchestrationStatusClass(assignment?.status ?? "Waiting")}`}>
-              <span className="status-dot" /> {assignment?.status}
+            <p className={`orchestration-detail-status ${orchestrationStatusClass(executionState[assignment?.id] ?? "Waiting")}`}>
+              <span className="status-dot" /> {executionState[assignment?.id] ?? "Waiting"}
             </p>
           </div>
           <div className="orchestration-detail-section">
@@ -1844,6 +2108,7 @@ function NodeOrchestrationWindow({
   nodeType,
   nodeBody,
   summary,
+  executionState = {},
   phase,
   plan,
   onMinimize,
@@ -2092,8 +2357,8 @@ function NodeOrchestrationWindow({
                 <span>Coordinating {summary.total} agents · Preview approved</span>
                 <div className="node-orchestration-status-list">
                   {validPlan.assignments.map((assignment) => (
-                    <span key={assignment.id} className={orchestrationStatusClass(assignment.status)}>
-                      <span className="status-dot" /> {assignment.role} · Mock {assignment.status}
+                    <span key={assignment.id} className={orchestrationStatusClass(executionState[assignment.id] ?? "Waiting")}>
+                      <span className="status-dot" /> {assignment.role} · Mock {executionState[assignment.id] ?? "Waiting"}
                     </span>
                   ))}
                 </div>
@@ -2387,10 +2652,10 @@ function AnchoredConversationCard({
       </header>
 
       <div className="anchored-conversation-thread">
-        {contextSummary ? (
+          {contextSummary ? (
           <div className="anchored-context-summary">
             <strong>{contextSummary.source}</strong>
-            <p>Full context is available in the drawer.</p>
+            <p>{contextSummary.summary}</p>
             <button type="button" onClick={onViewContext}>View context</button>
           </div>
         ) : (
@@ -2790,6 +3055,17 @@ export default function App() {
     loadedEpisodes
   );
 
+  const [projects, setProjects] = useState(() => loadProjects());
+  const [projectModalOpen, setProjectModalOpen] = useState(false);
+  const [editingProject, setEditingProject] = useState(null);
+  const [openProjectMenuId, setOpenProjectMenuId] = useState(null);
+  const [openEpisodeMenuId, setOpenEpisodeMenuId] = useState(null);
+  const [movingEpisodeId, setMovingEpisodeId] = useState(null);
+  const [renamingEpisode, setRenamingEpisode] = useState(null);
+  const [episodeSearch, setEpisodeSearch] = useState("");
+  const [expandedProjects, setExpandedProjects] = useState({});
+  const [newEpisodeProjectId, setNewEpisodeProjectId] = useState(null);
+
   const [
     activeEpisodeId,
     setActiveEpisodeId,
@@ -2859,6 +3135,11 @@ export default function App() {
   ] = useState(null);
 
   const [
+    intakePanelOpen,
+    setIntakePanelOpen,
+  ] = useState(false);
+
+  const [
     viewportRevision,
     setViewportRevision,
   ] = useState(0);
@@ -2905,6 +3186,10 @@ export default function App() {
         activeEpisodeId,
       ]
     );
+
+  function getProjectName(projectId) {
+    return projects.find((project) => project.id === projectId)?.name ?? null;
+  }
 
   const activeStageTemplate =
     EPISODE_STAGES[
@@ -2968,6 +3253,10 @@ export default function App() {
   }, [episodes]);
 
   useEffect(() => {
+    localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projects));
+  }, [projects]);
+
+  useEffect(() => {
     if (!activeEpisode) {
       return;
     }
@@ -2994,6 +3283,9 @@ export default function App() {
     setOrchestrationMinimized(false);
     setOrchestrationDetailId(null);
     setOrchestrationPreviews({});
+    setIntakePanelOpen(
+      ["pending", "proposed"].includes(activeEpisode.intake?.status)
+    );
   }, [activeEpisodeId]);
 
   /* ---------------------------------------------------------------------- */
@@ -3075,6 +3367,13 @@ export default function App() {
       return base.title;
     }
 
+    const workflowNode = episode.workflow?.nodes?.find(
+      (node) => node.id === nodeId
+    );
+    if (workflowNode) {
+      return workflowNode.title;
+    }
+
     const addition =
       episode.additions?.find(
         (item) =>
@@ -3117,6 +3416,13 @@ export default function App() {
       return base.type;
     }
 
+    const workflowNode = episode.workflow?.nodes?.find(
+      (node) => node.id === nodeId
+    );
+    if (workflowNode) {
+      return workflowNode.kind;
+    }
+
     const addition =
       episode.additions?.find(
         (item) =>
@@ -3155,6 +3461,13 @@ export default function App() {
 
     if (base) {
       return base.position;
+    }
+
+    const workflowNode = episode.workflow?.nodes?.find(
+      (node) => node.id === nodeId
+    );
+    if (workflowNode) {
+      return workflowNode.position;
     }
 
     const addition =
@@ -3268,10 +3581,11 @@ export default function App() {
   }
 
   function getLocalOrchestrationRequest(nodeId) {
+    const node = nodes.find((item) => item.id === nodeId);
     if (
       !activeEpisode ||
       !nodeId ||
-      !ORCHESTRATION_ELIGIBLE_NODES.has(nodeId)
+      !isOrchestrationEligibleNode(node)
     ) {
       return null;
     }
@@ -3291,10 +3605,11 @@ export default function App() {
   }
 
   function getLocalOrchestrationPlan(nodeId) {
+    const node = nodes.find((item) => item.id === nodeId);
     if (
       !activeEpisode ||
       !nodeId ||
-      !ORCHESTRATION_ELIGIBLE_NODES.has(nodeId)
+      !isOrchestrationEligibleNode(node)
     ) {
       return null;
     }
@@ -3320,11 +3635,11 @@ export default function App() {
   }
 
   function openNodeOrchestration(nodeId) {
+    const node = nodes.find((item) => item.id === nodeId);
     if (
       !activeEpisode ||
       !nodeId ||
-      !nodes.some((node) => node.id === nodeId) ||
-      !ORCHESTRATION_ELIGIBLE_NODES.has(nodeId)
+      !isOrchestrationEligibleNode(node)
     ) {
       return;
     }
@@ -3374,15 +3689,20 @@ export default function App() {
       return;
     }
 
-    setOrchestrationPreviews((current) => ({
-      ...current,
-      [orchestrationNodeId]: {
-        state: "preview-approved",
-        plan:
-          current[orchestrationNodeId]?.plan ??
-          getLocalOrchestrationPlan(orchestrationNodeId),
-      },
-    }));
+    setOrchestrationPreviews((current) => {
+      const plan =
+        current[orchestrationNodeId]?.plan ??
+        getLocalOrchestrationPlan(orchestrationNodeId);
+
+      return {
+        ...current,
+        [orchestrationNodeId]: {
+          state: "preview-approved",
+          plan,
+          executionState: createMockExecutionState(plan),
+        },
+      };
+    });
     setOrchestrationExpanded(true);
     setOrchestrationMinimized(false);
   }
@@ -3403,9 +3723,120 @@ export default function App() {
     setOrchestrationDetailId(null);
   }
 
+  function findEpisodeById(episodeId) {
+    return episodes.find((episode) => episode.id === episodeId) ?? null;
+  }
+
+  function submitEpisodeStructure(proposal) {
+    const episode = findEpisodeById(proposal?.episodeId);
+    if (!episode) {
+      throw new Error("Episode not found.");
+    }
+    if (!["pending", "proposed"].includes(episode.intake?.status)) {
+      throw new Error("Episode intake is not awaiting a proposal.");
+    }
+
+    const normalizedProposal = {
+      episodeId: episode.id,
+      objective: proposal.objective,
+      context: {
+        summary: proposal.context?.summary ?? proposal.context_summary ?? "",
+        suggestedSources: proposal.context?.suggestedSources ?? proposal.suggested_sources ?? [],
+      },
+      workNodes: proposal.workNodes ?? proposal.work_nodes ?? [],
+      humanGates: proposal.humanGates ?? proposal.human_gates ?? [],
+      assumptions: proposal.assumptions ?? [],
+      unresolved: proposal.unresolved ?? [],
+    };
+    const validation = validateEpisodeStructureProposal(normalizedProposal, episode.id);
+    if (!validation.valid) {
+      throw new Error(validation.error);
+    }
+
+    updateEpisode(episode.id, (current) => ({
+      ...current,
+      intake: {
+        ...normalizeEpisodeIntake(current.intake),
+        status: "proposed",
+        proposal: normalizedProposal,
+      },
+    }));
+    setActiveEpisodeId(episode.id);
+    setViewStage(0);
+    setIntakePanelOpen(true);
+    return normalizedProposal;
+  }
+
+  function requestIntakeRevision() {
+    if (!activeEpisode) return;
+    updateEpisode(activeEpisode.id, (episode) => ({
+      ...episode,
+      intake: {
+        ...normalizeEpisodeIntake(episode.intake),
+        status: "pending",
+      },
+    }));
+  }
+
+  function acceptEpisodeStructure() {
+    const proposal = activeEpisode?.intake?.proposal;
+    if (!activeEpisode || !proposal) return;
+
+    const validation = validateEpisodeStructureProposal(proposal, activeEpisode.id);
+    if (!validation.valid) return;
+    const nodes = proposal.workNodes.map((node, index) => ({
+      id: node.id,
+      type: node.kind,
+      kind: node.kind,
+      title: node.title,
+      body: node.description,
+      meta: node.rationale,
+      position: {
+        x: 120 + (index % 3) * 330,
+        y: 300 + Math.floor(index / 3) * 240,
+      },
+    }));
+    const dependencies = proposal.workNodes.flatMap((node) =>
+      node.dependsOn?.length
+        ? node.dependsOn.map((dependency) => [dependency, node.id])
+        : [["work", node.id]]
+    );
+    const terminalNodes = proposal.workNodes.filter(
+      (node) => !proposal.workNodes.some((candidate) => candidate.dependsOn?.includes(node.id))
+    );
+
+    updateEpisode(activeEpisode.id, (episode) => ({
+      ...episode,
+      intake: {
+        ...normalizeEpisodeIntake(episode.intake),
+        status: "accepted",
+        acceptedAt: new Date().toISOString(),
+      },
+      workflow: {
+        nodes,
+        edges: [
+          ...dependencies,
+          ...terminalNodes.map((node) => [node.id, "gate"]),
+        ],
+      },
+    }));
+    setIntakePanelOpen(false);
+  }
+
   /* ---------------------------------------------------------------------- */
   /* OPEN CHAT                                                              */
   /* ---------------------------------------------------------------------- */
+
+  function openContextDrawer() {
+    if (!activeEpisode) {
+      return;
+    }
+
+    setSelectedNodeId("context");
+    setActiveThreadId(null);
+    setAnchoredConversationMinimized(false);
+    setDrawerOpen(true);
+  }
 
   function openDrawerForNode(
     nodeId
@@ -3803,7 +4234,10 @@ export default function App() {
 
   function createEpisode({
     title,
+    name,
     context,
+    setupMode,
+    projectId,
   }) {
     const nextNumber =
       episodes.reduce(
@@ -3839,6 +4273,8 @@ export default function App() {
 
       title,
 
+      name: name || deriveEpisodeName(title),
+
       context,
 
       currentStage: 0,
@@ -3850,7 +4286,25 @@ export default function App() {
       layouts: {},
 
       additions: [],
+
+      intake: {
+        status: setupMode === "agent-assisted" ? "pending" : "idle",
+        request: null,
+        proposal: null,
+        acceptedAt: null,
+      },
+
+      workflow: {
+        nodes: [],
+        edges: [],
+      },
+
+      projectId: projectId ?? null,
     };
+
+    if (setupMode === "agent-assisted") {
+      episode.intake.request = createEpisodeIntakeRequest({ episode });
+    }
 
     setEpisodes(
       (current) => [
@@ -3869,9 +4323,68 @@ export default function App() {
       null
     );
 
+    setIntakePanelOpen(
+      setupMode === "agent-assisted"
+    );
+
     setCreateOpen(
       false
     );
+    setNewEpisodeProjectId(null);
+  }
+
+  function createProject({ name, description }) {
+    const project = {
+      id: `project-${crypto.randomUUID()}`,
+      name,
+      description,
+      createdAt: new Date().toISOString(),
+      archived: false,
+    };
+    setProjects((current) => [...current, project]);
+    setExpandedProjects((current) => ({ ...current, [project.id]: true }));
+    setNewEpisodeProjectId(createOpen ? project.id : null);
+    setProjectModalOpen(false);
+  }
+
+  function saveProject({ name, description, projectId }) {
+    if (!projectId) {
+      createProject({ name, description });
+      return;
+    }
+    setProjects((current) => current.map((project) => project.id === projectId ? { ...project, name, description } : project));
+    setEditingProject(null);
+    setProjectModalOpen(false);
+  }
+
+  function removeProject(projectId) {
+    const project = projects.find((item) => item.id === projectId);
+    if (!project || !window.confirm(`Remove project “${project.name}”? Its Episodes will move to Unassigned.`)) return;
+    setProjects((current) => current.filter((item) => item.id !== projectId));
+    setEpisodes((current) => current.map((episode) => episode.projectId === projectId ? { ...episode, projectId: null } : episode));
+  }
+
+  function moveEpisode(episodeId, projectId) {
+    updateEpisode(episodeId, (episode) => ({ ...episode, projectId: projectId || null }));
+  }
+
+  function renameEpisode(name) {
+    if (!renamingEpisode) return;
+    updateEpisode(renamingEpisode.id, (episode) => ({ ...episode, name }));
+    setRenamingEpisode(null);
+  }
+
+  function archiveEpisode(episodeId) {
+    updateEpisode(episodeId, (episode) => ({ ...episode, status: "archived" }));
+    setOpenEpisodeMenuId(null);
+  }
+
+  function removeEpisode(episodeId) {
+    const episode = episodes.find((item) => item.id === episodeId);
+    if (!episode || !window.confirm(`Remove Episode “${episode.name}”?`)) return;
+    setEpisodes((current) => current.filter((item) => item.id !== episodeId));
+    if (activeEpisodeId === episodeId) setActiveEpisodeId(episodes.find((item) => item.id !== episodeId)?.id ?? null);
+    setOpenEpisodeMenuId(null);
   }
 
   /* ---------------------------------------------------------------------- */
@@ -4128,6 +4641,46 @@ export default function App() {
   /* BUILD FLOW NODES                                                       */
   /* ---------------------------------------------------------------------- */
 
+  function getVisibleStageNodes() {
+    if (!activeEpisode || viewStage !== 0) {
+      return activeStageTemplate?.nodes ?? [];
+    }
+
+    const intake = activeEpisode.intake;
+    if (intake?.status === "pending") {
+      return activeStageTemplate.nodes.filter(
+        (node) => node.id === "work" || node.id === "gate"
+      );
+    }
+
+    if (intake?.status === "proposed" && intake.proposal) {
+      return [
+        activeStageTemplate.nodes.find((node) => node.id === "work"),
+        ...intake.proposal.workNodes.map((node, index) => ({
+          id: node.id,
+          type: node.kind,
+          kind: node.kind,
+          title: node.title,
+          body: node.description,
+          meta: "Proposed · " + (node.rationale ?? "Structure proposal"),
+          position: { x: 120 + (index % 3) * 330, y: 300 + Math.floor(index / 3) * 240 },
+          proposed: true,
+        })),
+        activeStageTemplate.nodes.find((node) => node.id === "gate"),
+      ].filter(Boolean);
+    }
+
+    if (intake?.status === "accepted" && activeEpisode.workflow?.nodes?.length) {
+      return [
+        activeStageTemplate.nodes.find((node) => node.id === "work"),
+        ...activeEpisode.workflow.nodes,
+        activeStageTemplate.nodes.find((node) => node.id === "gate"),
+      ].filter(Boolean);
+    }
+
+    return activeStageTemplate.nodes;
+  }
+
   function buildFlowNodes() {
     if (
       !activeEpisode ||
@@ -4136,8 +4689,9 @@ export default function App() {
       return [];
     }
 
+    const visibleStageNodes = getVisibleStageNodes();
     const baseNodes =
-      activeStageTemplate.nodes.map(
+      visibleStageNodes.map(
         (node) => {
           let title =
             node.title;
@@ -4225,6 +4779,12 @@ export default function App() {
               secondary:
                 false,
 
+              proposed:
+                node.proposed ?? false,
+
+              workflowKind:
+                node.kind,
+
               selected:
                 selectedNodeId === node.id,
 
@@ -4234,17 +4794,19 @@ export default function App() {
               contextSummary,
 
               onViewContext: () =>
-                openDrawerForNode(node.id),
+                openContextDrawer(),
 
               orchestrationEligible:
-                ORCHESTRATION_ELIGIBLE_NODES.has(
-                  node.id
-                ),
+                isOrchestrationEligibleNode({
+                  id: node.id,
+                  kind: node.kind,
+                }),
 
               orchestrationSummary:
                 getOrchestrationSummary(
                   node.id,
-                  orchestration?.plan
+                  orchestration?.plan,
+                  orchestration?.executionState
                 ),
 
               orchestrationApproved:
@@ -4431,6 +4993,8 @@ export default function App() {
     const orchestrationPlan =
       orchestrationPreviews[orchestrationNodeId]?.plan ??
       getLocalOrchestrationPlan(orchestrationNodeId);
+    const orchestrationExecutionState =
+      orchestrationPreviews[orchestrationNodeId]?.executionState ?? {};
 
     const orchestrationNodes =
       orchestrationExpanded &&
@@ -4446,12 +5010,25 @@ export default function App() {
               viewStage,
               orchestrationNodeId
             ),
-            orchestrationPlan
+            orchestrationPlan,
+            orchestrationExecutionState
           )
         : [];
 
+    const intakeNodes = activeEpisode.intake?.status === "pending"
+      ? [{
+          id: "episode-intake",
+          type: "intake",
+          position: { x: 420, y: 300 },
+          data: {
+            onOpen: () => setIntakePanelOpen(true),
+          },
+        }]
+      : [];
+
     return [
       ...baseNodes,
+      ...intakeNodes,
       ...additions,
       ...orchestrationNodes,
     ];
@@ -4469,8 +5046,31 @@ export default function App() {
       return [];
     }
 
+    let visibleStageEdges = activeStageTemplate.edges;
+    const intake = activeEpisode.intake;
+
+    if (viewStage === 0 && intake?.status === "pending") {
+      visibleStageEdges = [["work", "gate"]];
+    } else if (viewStage === 0 && intake?.status === "accepted" && activeEpisode.workflow?.edges?.length) {
+      visibleStageEdges = activeEpisode.workflow.edges;
+    } else if (viewStage === 0 && intake?.status === "proposed" && intake.proposal) {
+      const proposedNodes = intake.proposal.workNodes;
+      const dependencies = proposedNodes.flatMap((node) =>
+        node.dependsOn?.length
+          ? node.dependsOn.map((dependency) => [dependency, node.id])
+          : [["work", node.id]]
+      );
+      const terminalNodes = proposedNodes.filter(
+        (node) => !proposedNodes.some((candidate) => candidate.dependsOn?.includes(node.id))
+      );
+      visibleStageEdges = [
+        ...dependencies,
+        ...terminalNodes.map((node) => [node.id, "gate"]),
+      ];
+    }
+
     const baseEdges =
-      activeStageTemplate.edges.map(
+      visibleStageEdges.map(
         (
           [
             source,
@@ -4495,7 +5095,9 @@ export default function App() {
             "smoothstep",
 
           className:
-            "governed-edge",
+            intake?.status === "proposed" && viewStage === 0
+              ? "proposed-edge"
+              : "governed-edge",
         })
       );
 
@@ -4643,6 +5245,78 @@ export default function App() {
   /* ---------------------------------------------------------------------- */
 
   useWebMCP({
+    name: "get_pending_episode_intakes",
+    description: "List Episodes awaiting human-reviewed agent structuring proposals.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true },
+    execute: async () => ({
+      intakes: episodes
+        .filter((episode) => episode.intake?.status === "pending")
+        .map((episode) => ({
+          episodeId: episode.id,
+          title: episode.title,
+          objective: episode.title,
+          providedContext: episode.context,
+          authority: episode.intake.request?.authority ?? createEpisodeIntakeRequest({ episode }).authority,
+        })),
+    }),
+  });
+
+  useWebMCP({
+    name: "get_episode_intake",
+    description: "Inspect one Episode intake request and any proposed structure.",
+    inputSchema: {
+      type: "object",
+      properties: { episode_id: { type: "string" } },
+      required: ["episode_id"],
+    },
+    annotations: { readOnlyHint: true },
+    execute: async ({ episode_id }) => {
+      const episode = findEpisodeById(episode_id);
+      if (!episode) throw new Error("Episode not found.");
+      return {
+        episodeId: episode.id,
+        title: episode.title,
+        intake: {
+          ...normalizeEpisodeIntake(episode.intake),
+          request: episode.intake?.request ?? createEpisodeIntakeRequest({ episode }),
+        },
+      };
+    },
+  });
+
+  useWebMCP({
+    name: "submit_episode_structure",
+    description: "Submit a proposed Episode structure for human review. This does not accept or execute it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        episode_id: { type: "string" },
+        objective: { type: "string" },
+        context_summary: { type: "string" },
+        work_nodes: { type: "array" },
+        human_gates: { type: "array" },
+        assumptions: { type: "array" },
+        unresolved: { type: "array" },
+      },
+      required: ["episode_id", "objective", "context_summary", "work_nodes", "human_gates", "assumptions", "unresolved"],
+    },
+    annotations: { readOnlyHint: false },
+    execute: async ({ episode_id, objective, context_summary, work_nodes, human_gates, assumptions, unresolved }) => {
+      const proposal = submitEpisodeStructure({
+        episodeId: episode_id,
+        objective,
+        context_summary,
+        work_nodes,
+        human_gates,
+        assumptions,
+        unresolved,
+      });
+      return { success: true, status: "proposed", proposal };
+    },
+  });
+
+  useWebMCP({
     name:
       "list_episodes",
 
@@ -4691,6 +5365,10 @@ export default function App() {
 
               disposition:
                 episode.disposition,
+
+              project_id: episode.projectId,
+
+              project_name: getProjectName(episode.projectId),
             })
           ),
       }),
@@ -4792,6 +5470,10 @@ export default function App() {
 
           disposition:
             episode.disposition,
+
+          project_id: episode.projectId,
+
+          project_name: getProjectName(episode.projectId),
 
           coreNodes,
 
@@ -5743,6 +6425,25 @@ export default function App() {
         onCreate={
           createEpisode
         }
+        projects={projects}
+        initialProjectId={newEpisodeProjectId}
+        onCreateProject={() => setProjectModalOpen(true)}
+      />
+
+      <NewProjectModal
+        key={editingProject?.id ?? "new-project"}
+        open={projectModalOpen}
+        onClose={() => { setProjectModalOpen(false); setEditingProject(null); }}
+        onCreate={saveProject}
+        project={editingProject}
+      />
+
+      <RenameEpisodeModal
+        key={renamingEpisode?.id ?? "rename-episode"}
+        open={Boolean(renamingEpisode)}
+        episode={renamingEpisode}
+        onClose={() => setRenamingEpisode(null)}
+        onSave={renameEpisode}
       />
 
       <div className="workroom">
@@ -5811,72 +6512,64 @@ export default function App() {
           <aside className="sidebar">
             <div className="sidebar-content">
               <div className="sidebar-section-header">
-                <span>
-                  Episodes
-                </span>
-
-                <button
-                  type="button"
-                  className="small-button"
-                  onClick={() =>
-                    setCreateOpen(
-                      true
-                    )
-                  }
-                >
-                  + New
-                </button>
+                <span>Projects</span>
+                <div className="sidebar-project-actions">
+                  <button type="button" className="small-button" onClick={() => setProjectModalOpen(true)}>+ New Project</button>
+                  <button type="button" className="small-button" onClick={() => { setNewEpisodeProjectId(null); setCreateOpen(true); }}>+ Episode</button>
+                </div>
               </div>
-
-              <div className="episodes">
-                {episodes.map(
-                  (episode) => (
-                    <button
-                      type="button"
-                      key={
-                        episode.id
-                      }
-                      className={`episode ${
-                        episode.id ===
-                        activeEpisodeId
-                          ? "active"
-                          : ""
-                      }`}
-                      onClick={() =>
-                        setActiveEpisodeId(
-                          episode.id
-                        )
-                      }
-                    >
-                      <span className="episode-symbol">
-                        E
-                      </span>
-
-                      <span className="episode-copy">
-                        <small>
-                          {
-                            episode.id
-                          }
-                          {" · "}
-                          Episode
-                        </small>
-
-                        <strong>
-                          {
-                            episode.title
-                          }
-                        </strong>
-
-                        <small>
-                          Stage{" "}
-                          {episode.currentStage +
-                            1}{" "}
-                          of 3
-                        </small>
-                      </span>
-                    </button>
-                  )
-                )}
+              <label className="episode-search">
+                <span className="sr-only">Search episodes</span>
+                <input value={episodeSearch} onChange={(event) => setEpisodeSearch(event.target.value)} placeholder="Search episodes..." />
+              </label>
+              <div className="project-tree">
+                {(() => {
+                  const query = episodeSearch.trim().toLowerCase();
+                  const projectMatches = (project) =>
+                    !query || project.name.toLowerCase().includes(query) || episodes.some((episode) => episode.projectId === project.id && (episode.id.toLowerCase().includes(query) || episode.name.toLowerCase().includes(query) || episode.title.toLowerCase().includes(query)));
+                  const renderEpisode = (episode) => (
+                    <div className="project-episode" key={episode.id}>
+                      <button type="button" className={`episode ${episode.id === activeEpisodeId ? "active" : ""}`} onClick={() => setActiveEpisodeId(episode.id)}>
+                        <span className="episode-symbol">E</span>
+                        <span className="episode-copy"><small>{episode.id}</small><strong title={episode.title}>{episode.name || deriveEpisodeName(episode.title)}</strong><small>Stage {episode.currentStage + 1} · {episode.intake?.status === "pending" ? "Pending intake" : episode.status === "archived" ? "Archived" : "Active"}</small></span>
+                      </button>
+                      {openEpisodeMenuId === episode.id && <div className="episode-menu-wrap">
+                        <button type="button" className="episode-menu-button" aria-label={`Episode options for ${episode.name}`} aria-expanded="true" onClick={(event) => { event.stopPropagation(); setOpenEpisodeMenuId(null); setMovingEpisodeId(null); }}>⋮</button>
+                        <div className="episode-menu" role="menu">
+                          <button type="button" role="menuitem" onClick={() => { setRenamingEpisode(episode); setOpenEpisodeMenuId(null); }}>Rename episode</button>
+                          <button type="button" role="menuitem" onClick={() => setMovingEpisodeId(episode.id)}>Move to project</button>
+                          {movingEpisodeId === episode.id && <select autoFocus className="episode-menu-select" aria-label={`Move ${episode.name} to project`} value={episode.projectId ?? ""} onChange={(event) => { moveEpisode(episode.id, event.target.value); setOpenEpisodeMenuId(null); setMovingEpisodeId(null); }}><option value="">Unassigned</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>}
+                          <button type="button" role="menuitem" onClick={() => archiveEpisode(episode.id)}>Archive</button>
+                          <button type="button" role="menuitem" className="danger" onClick={() => removeEpisode(episode.id)}>Remove</button>
+                        </div>
+                      </div>}
+                      {openEpisodeMenuId !== episode.id && <button type="button" className="episode-menu-button" aria-label={`Episode options for ${episode.name}`} title="Episode options" onClick={(event) => { event.stopPropagation(); setOpenEpisodeMenuId(episode.id); setMovingEpisodeId(null); }}>⋮</button>}
+                    </div>
+                  );
+                  const renderGroup = (project, projectEpisodes) => {
+                    const expanded = query || expandedProjects[project.id] !== false;
+                    return <div className="project-group" key={project.id}>
+                      <div className="project-row">
+                        <button type="button" className="project-toggle" onClick={() => setExpandedProjects((current) => ({ ...current, [project.id]: !current[project.id] }))}><span>{expanded ? "▾" : "▸"}</span><strong>{project.name}</strong><small>{projectEpisodes.length}</small></button>
+                        {project.id !== "unassigned" && <div className="project-row-actions">
+                          <button type="button" className="project-add" aria-label={`Create episode in ${project.name}`} onClick={() => { setNewEpisodeProjectId(project.id); setCreateOpen(true); }}>+</button>
+                          <div className="project-menu-wrap">
+                            <button type="button" className="project-menu-button" aria-label={`More options for ${project.name}`} title="Project options" aria-expanded={openProjectMenuId === project.id} onClick={(event) => { event.stopPropagation(); setOpenProjectMenuId((current) => current === project.id ? null : project.id); }}>⋮</button>
+                            {openProjectMenuId === project.id && <div className="project-menu" role="menu">
+                              <button type="button" role="menuitem" onClick={() => { setEditingProject(project); setProjectModalOpen(true); setOpenProjectMenuId(null); }}>Rename</button>
+                              <button type="button" role="menuitem" className="danger" onClick={() => { removeProject(project.id); setOpenProjectMenuId(null); }}>Remove</button>
+                            </div>}
+                          </div>
+                        </div>}
+                      </div>
+                      {expanded && projectEpisodes.filter((episode) => !query || episode.id.toLowerCase().includes(query) || episode.name.toLowerCase().includes(query) || episode.title.toLowerCase().includes(query) || project.name.toLowerCase().includes(query)).map(renderEpisode)}
+                    </div>;
+                  };
+                  return <>
+                    {projects.filter((project) => !project.archived && projectMatches(project)).map((project) => renderGroup(project, episodes.filter((episode) => episode.projectId === project.id && episode.status !== "archived")))}
+                    {renderGroup({ id: "unassigned", name: "Unassigned" }, episodes.filter((episode) => !episode.projectId && episode.status !== "archived").filter((episode) => !query || episode.id.toLowerCase().includes(query) || episode.name.toLowerCase().includes(query) || episode.title.toLowerCase().includes(query)))}
+                  </>;
+                })()}
               </div>
 
               <div className="sidebar-divider" />
@@ -6195,6 +6888,15 @@ export default function App() {
                 />
               </ReactFlow>
 
+              <EpisodeIntakePanel
+                open={intakePanelOpen}
+                episode={activeEpisode}
+                intake={activeEpisode.intake}
+                onClose={() => setIntakePanelOpen(false)}
+                onRequestRevision={requestIntakeRevision}
+                onAccept={acceptEpisodeStructure}
+              />
+
               <OrchestrationErrorBoundary
                 key={orchestrationNodeId ?? "orchestration-idle"}
                 onClose={() => {
@@ -6225,8 +6927,12 @@ export default function App() {
                   )?.data?.body ?? ""}
                   summary={getOrchestrationPlanSummary(
                     orchestrationPreviews[orchestrationNodeId]?.plan ??
-                    getLocalOrchestrationPlan(orchestrationNodeId)
+                    getLocalOrchestrationPlan(orchestrationNodeId),
+                    orchestrationPreviews[orchestrationNodeId]?.executionState
                   )}
+                  executionState={
+                    orchestrationPreviews[orchestrationNodeId]?.executionState
+                  }
                   phase={
                     orchestrationPreviews[orchestrationNodeId]?.state ??
                     "request"
@@ -6276,6 +6982,9 @@ export default function App() {
                       orchestrationPreviews[orchestrationNodeId]?.plan ??
                       getLocalOrchestrationPlan(orchestrationNodeId)
                     }
+                    executionState={
+                      orchestrationPreviews[orchestrationNodeId]?.executionState
+                    }
                     onClose={() => setOrchestrationDetailId(null)}
                   />
                 )}
@@ -6311,7 +7020,8 @@ export default function App() {
                 }
                 orchestrationSummary={getOrchestrationPlanSummary(
                   orchestrationPreviews[selectedNodeId]?.plan ??
-                  getLocalOrchestrationPlan(selectedNodeId)
+                  getLocalOrchestrationPlan(selectedNodeId),
+                  orchestrationPreviews[selectedNodeId]?.executionState
                 )}
                 onOrchestrate={() => openNodeOrchestration(selectedNodeId)}
                 contextSummary={
@@ -6319,7 +7029,7 @@ export default function App() {
                     ? getContextSummary(activeEpisode)
                     : null
                 }
-                onViewContext={() => openDrawerForNode("context")}
+                onViewContext={openContextDrawer}
               />
             )}
 
