@@ -1,5 +1,7 @@
 import {
+  Component,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -19,6 +21,12 @@ import "@xyflow/react/dist/style.css";
 
 import { useWebMCP } from "use-webmcp-tool";
 
+import {
+  createOrchestrationPlan,
+  createOrchestrationRequest,
+  getOrchestrationPlanSummary,
+} from "./orchestration";
+
 import "./App.css";
 
 /* -------------------------------------------------------------------------- */
@@ -26,6 +34,25 @@ import "./App.css";
 /* -------------------------------------------------------------------------- */
 
 const STORAGE_KEY = "ssi-wrx-workroom-v4";
+
+function getContextSummary(episode) {
+  return {
+    source: episode?.title ?? "Synthetic episode",
+    confirmed: [
+      "Visible bounded follow-up work",
+      "Human approval remains final",
+    ],
+    proposed: [
+      "Connector-assisted context retrieval",
+      "Workroom-native orchestrator",
+    ],
+    unresolved: [
+      "Runtime choice",
+      "Default connectors",
+      "Orchestration start condition",
+    ],
+  };
+}
 
 /* -------------------------------------------------------------------------- */
 /* WORKFLOW                                                                   */
@@ -861,6 +888,10 @@ function CardNode({
   return (
     <div
       className={`flow-node ${
+        data.secondary
+          ? "branch-node"
+          : "core-node"
+      } ${
         selected
           ? "selected"
           : ""
@@ -868,7 +899,7 @@ function CardNode({
     >
       <MessageBadge
         count={
-          data.threadMessageCount
+          data.threadCount
         }
         pending={
           data.threadPending
@@ -877,6 +908,13 @@ function CardNode({
           data.onOpenThread
         }
       />
+
+      {data.orchestrationEligible && data.orchestrationApproved && data.selected && (
+        <OrchestrationBadge
+          summary={data.orchestrationSummary}
+          onClick={data.onOpenOrchestration}
+        />
+      )}
 
       <Handle
         type="target"
@@ -904,6 +942,24 @@ function CardNode({
         {data.title}
       </div>
 
+      {data.contextSummary && (
+        <div className="context-summary">
+          <strong>{data.contextSummary.source}</strong>
+          {[
+            ["Confirmed", data.contextSummary.confirmed],
+            ["Proposed", data.contextSummary.proposed],
+            ["Unresolved", data.contextSummary.unresolved],
+          ].map(([label, items]) => (
+            <div key={label} className="context-summary-group">
+              <span>{label}</span>
+              {items.slice(0, 3).map((item) => (
+                <div key={item}>• {item}</div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+
       {data.body && (
         <div className="node-body">
           {data.body}
@@ -914,6 +970,19 @@ function CardNode({
         <div className="node-meta">
           {data.meta}
         </div>
+      )}
+
+      {data.isContext && (
+        <button
+          type="button"
+          className="context-view-button nodrag"
+          onClick={(event) => {
+            event.stopPropagation();
+            data.onViewContext();
+          }}
+        >
+          View context
+        </button>
       )}
 
       <Handle
@@ -951,7 +1020,7 @@ function GateNode({
     >
       <MessageBadge
         count={
-          data.threadMessageCount
+          data.threadCount
         }
         pending={
           data.threadPending
@@ -1044,7 +1113,7 @@ function HumanNode({
     >
       <MessageBadge
         count={
-          data.threadMessageCount
+          data.threadCount
         }
         pending={
           data.threadPending
@@ -1160,14 +1229,20 @@ function ThreadNode({
 }) {
   return (
     <div
-      className={`flow-node thread-node ${
+      className={`flow-node thread-node branch-node ${
         selected
           ? "selected"
           : ""
       }`}
     >
-      <div className="thread-node-count">
-        ◌ {data.messageCount}
+      <div
+        className={`thread-node-count ${
+          data.pending
+            ? "pending"
+            : ""
+        }`}
+      >
+        ◌ {data.messageCount} {data.messageCount === 1 ? "message" : "messages"}
       </div>
 
       <Handle
@@ -1237,11 +1312,1150 @@ const NODE_TYPES = {
   gate: GateNode,
   human: HumanNode,
   thread: ThreadNode,
+  orchestration: OrchestrationPreviewNode,
+  orchestrationOutput: OrchestrationOutputNode,
 };
+
+const ORCHESTRATION_AGENTS = [
+  {
+    id: "research",
+    role: "Research Agent",
+    task: "Verify supporting evidence",
+    status: "Complete",
+    result: "6 sources retained",
+  },
+  {
+    id: "builder",
+    role: "Builder Agent",
+    task: "Draft recommended follow-up",
+    status: "Working",
+    result: "Output pending",
+  },
+  {
+    id: "analyst",
+    role: "Analyst Agent",
+    task: "Compare candidate actions",
+    status: "Complete",
+    result: "Recommendation prepared",
+  },
+  {
+    id: "reviewer",
+    role: "Reviewer Agent",
+    task: "Independent review",
+    status: "Human required",
+    result: "2 unsupported claims need disposition",
+  },
+];
+
+function orchestrationStatusClass(status) {
+  return status.toLowerCase().replaceAll(" ", "-");
+}
+
+function _OrchestrationPreviewLayer({
+  selectedId,
+  onSelect,
+  onClose,
+}) {
+  const humanAttentionRequired = ORCHESTRATION_AGENTS.some(
+    (agent) => agent.status === "Human required"
+  );
+  const selectedAgent = ORCHESTRATION_AGENTS.find(
+    (agent) => agent.id === selectedId
+  );
+
+  return (
+    <div className="orchestration-preview-layer">
+      <div className="orchestration-preview-head">
+        <div>
+          <div className="concept-preview-label">Concept preview</div>
+          <strong>Future orchestration</strong>
+        </div>
+
+        <button
+          type="button"
+          className="orchestration-preview-close"
+          onClick={onClose}
+          aria-label="Close orchestration preview"
+        >
+          ×
+        </button>
+      </div>
+
+      <svg
+        className="orchestration-preview-edges"
+        viewBox="0 0 640 350"
+        aria-hidden="true"
+      >
+        <path d="M145 174 C165 174 164 73 190 73" />
+        <path d="M145 174 C170 174 165 187 190 187" />
+        <path d="M145 174 C255 174 270 73 370 73" />
+        <path d="M145 174 C260 174 272 187 370 187" />
+        <path d="M275 73 C325 73 328 248 365 248" />
+        <path d="M275 187 C320 187 330 248 365 248" />
+        <path d="M455 73 C480 73 480 248 505 248" />
+        <path d="M455 187 C485 187 490 248 505 248" />
+      </svg>
+
+      <button
+        type="button"
+        className={`orchestration-first-mate ${
+          humanAttentionRequired ? "attention" : ""
+        }`}
+        onClick={() => onSelect("first-mate")}
+      >
+        <span className="preview-node-label">First Mate</span>
+        <strong>Orchestrator</strong>
+        <span>3 specialist agents · 4 assigned tasks</span>
+        <span className="orchestration-summary-status complete">
+          <span className="status-dot" /> 2 complete
+        </span>
+        <span className="orchestration-summary-status working">
+          <span className="status-dot" /> 1 working
+        </span>
+        <span className="orchestration-summary-status human-required">
+          <span className="status-dot" /> 1 human required
+        </span>
+        {humanAttentionRequired && (
+          <span className="orchestration-attention">
+            <span className="status-dot" /> Human attention required
+          </span>
+        )}
+      </button>
+
+      <div className="orchestration-agent-grid">
+        {ORCHESTRATION_AGENTS.map((agent) => (
+          <button
+            type="button"
+            key={agent.id}
+            className={`orchestration-agent-card ${
+              selectedId === agent.id ? "selected" : ""
+            }`}
+            onClick={() => onSelect(agent.id)}
+          >
+            <span className="preview-node-label">{agent.role}</span>
+            <strong>{agent.task}</strong>
+            <span
+              className={`preview-agent-status ${orchestrationStatusClass(
+                agent.status
+              )}`}
+            >
+              <span className="status-dot" />
+              {agent.status}
+            </span>
+            <span>{agent.result}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="orchestration-human-convergence">
+        <span>Output package</span>
+        <strong>Independent review → Human gate</strong>
+      </div>
+
+      {selectedId && (
+        <OrchestrationDetailCard
+          selectedId={selectedId}
+          selectedAgent={selectedAgent}
+          onClose={() => onSelect(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function OrchestrationDetailCard({
+  selectedId,
+  selectedAgent,
+  onClose,
+}) {
+  const firstMate = selectedId === "first-mate";
+
+  return (
+    <aside className="orchestration-detail-card">
+      <header>
+        <div>
+          <div className="concept-preview-label">
+            {firstMate ? "First Mate" : selectedAgent?.role}
+          </div>
+          <h2>
+            {firstMate ? "Episode orchestration" : selectedAgent?.task}
+          </h2>
+        </div>
+
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close orchestration detail"
+        >
+          ×
+        </button>
+      </header>
+
+      {firstMate ? (
+        <>
+          <div className="orchestration-detail-section">
+            <span>Assigned work</span>
+            <p>✓ Research supporting evidence</p>
+            <p>◌ Draft recommended follow-up</p>
+            <p>✓ Compare candidate actions</p>
+            <p>○ Independent review</p>
+          </div>
+          <div className="orchestration-detail-section">
+            <span>Human required</span>
+            <p>Review returned package</p>
+          </div>
+          <div className="orchestration-detail-section">
+            <span>Authority</span>
+            <p>May decompose and coordinate approved work.</p>
+            <p>Cannot change scope, advance stages, or make final disposition.</p>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="orchestration-detail-section">
+            <span>Status</span>
+            <p
+              className={`orchestration-detail-status ${orchestrationStatusClass(
+                selectedAgent?.status ?? "Waiting"
+              )}`}
+            >
+              <span className="status-dot" />
+              {selectedAgent?.status}
+            </p>
+          </div>
+          <div className="orchestration-detail-section">
+            <span>Input</span>
+            <p>Approved action + evidence</p>
+          </div>
+          <div className="orchestration-detail-section">
+            <span>Expected output</span>
+            <p>{selectedAgent?.id === "builder" ? "follow-up-draft.md" : selectedAgent?.result}</p>
+          </div>
+          <div className="orchestration-detail-section">
+            <span>Authority</span>
+            <p>May draft or analyze.</p>
+            <p>Cannot send, approve, or change scope.</p>
+          </div>
+        </>
+      )}
+    </aside>
+  );
+}
+
+const ORCHESTRATION_ELIGIBLE_NODES = new Set([
+  "inquiry",
+  "evidence",
+  "gaps",
+  "recommendation",
+  "evaluation",
+]);
+
+function getOrchestrationSummary(nodeId, plan) {
+  return getOrchestrationPlanSummary(
+    plan ??
+      createOrchestrationPlan({
+        episode: { id: "concept-preview" },
+        node: { id: nodeId },
+      })
+  );
+}
+
+function orchestrationSummaryStatus(summary) {
+  if (summary.humanRequired > 0) {
+    return "human-required";
+  }
+
+  if (summary.working > 0) {
+    return "working";
+  }
+
+  if (summary.complete === summary.total) {
+    return "complete";
+  }
+
+  return "waiting";
+}
+
+function isValidOrchestrationPlan(plan) {
+  return Boolean(
+    plan &&
+    typeof plan.objective === "string" &&
+    Array.isArray(plan.tasks) &&
+    Array.isArray(plan.assignments) &&
+    Array.isArray(plan.humanGates)
+  );
+}
+
+function buildOrchestrationPreviewNodes(
+  parentNodeId,
+  parentPosition,
+  plan
+) {
+  const baseX = parentPosition.x;
+  const baseY = parentPosition.y;
+  const preview = [
+    {
+      id: `orchestration-${parentNodeId}-first-mate`,
+      type: "orchestration",
+      draggable: false,
+      position: { x: baseX + 330, y: baseY + 30 },
+      data: {
+        label: "First Mate",
+        title: "Coordinating 3 agents",
+        status: "working",
+        statusLabel: "Working",
+        result: "Concept only · no execution",
+        orchestrationPreview: true,
+        detailId: "first-mate",
+      },
+    },
+    ...(plan.assignments ?? []).map((assignment, index) => {
+      const task = plan.tasks[index];
+      return {
+      id: `orchestration-${parentNodeId}-${assignment.id}`,
+      type: "orchestration",
+      draggable: false,
+      position: {
+        x: baseX + 650,
+        y: baseY - 70 + index * 105,
+      },
+      data: {
+        label: assignment.role,
+        title: task.title,
+        status: orchestrationStatusClass(assignment.status),
+        statusLabel: `Mock · ${assignment.status}`,
+        result: `Output: ${task.output}`,
+        orchestrationPreview: true,
+        detailId: assignment.id,
+      },
+      };
+    }),
+    {
+      id: `orchestration-${parentNodeId}-output`,
+      type: "orchestrationOutput",
+      draggable: false,
+      position: { x: baseX + 960, y: baseY + 245 },
+      data: { orchestrationPreview: true },
+    },
+  ];
+
+  return preview;
+}
+
+function buildOrchestrationPreviewEdges(parentNodeId, plan) {
+  const firstMateId = `orchestration-${parentNodeId}-first-mate`;
+  const assignments = plan.assignments ?? [];
+  const planNodeIds = assignments.map(
+    (agent) => `orchestration-${parentNodeId}-${agent.id}`
+  );
+  const reviewer = assignments.find((agent) =>
+    agent.role.toLowerCase().includes("review")
+  ) ?? plan[plan.length - 1];
+  const reviewerId = `orchestration-${parentNodeId}-${reviewer.id}`;
+  const outputId = `orchestration-${parentNodeId}-output`;
+
+  const edges = [
+    [parentNodeId, firstMateId, "branch-source", "flow-target"],
+    ...planNodeIds.map((nodeId) => [
+      firstMateId,
+      nodeId,
+      "flow-source",
+      "flow-target",
+    ]),
+    [reviewerId, outputId, "flow-source", "flow-target"],
+  ];
+
+  return edges.map(([source, target, sourceHandle, targetHandle], index) => ({
+    id: `orchestration-edge-${parentNodeId}-${index}`,
+    source,
+    target,
+    sourceHandle,
+    targetHandle,
+    type: "smoothstep",
+    className: "orchestration-preview-edge",
+  }));
+}
+
+function OrchestrationBadge({
+  summary,
+  onClick,
+}) {
+  const status = orchestrationSummaryStatus(summary);
+
+  return (
+    <button
+      type="button"
+      className={`node-orchestration-badge ${status} nodrag`}
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+      aria-label={`${summary.total} agents in orchestration preview`}
+      title="Open node orchestration preview"
+    >
+      <span className="status-dot" />
+      {summary.total} agents
+    </button>
+  );
+}
+
+function OrchestrationPreviewNode({ data }) {
+  return (
+    <div className={`flow-node orchestration-flow-node ${data.status}`}>
+      <Handle type="target" position={Position.Top} id="flow-target" className="flow-handle" />
+      <div className="node-label">{data.label}</div>
+      <div className="node-title">{data.title}</div>
+      <div className={`orchestration-flow-status ${data.status}`}>
+        <span className="status-dot" />
+        {data.statusLabel}
+      </div>
+      <div className="node-meta">{data.result}</div>
+      <Handle type="source" position={Position.Bottom} id="flow-source" className="flow-handle" />
+    </div>
+  );
+}
+
+function OrchestrationOutputNode({ data: _data }) {
+  return (
+    <div className="flow-node orchestration-output-node">
+      <Handle type="target" position={Position.Top} id="flow-target" className="flow-handle" />
+      <div className="node-label">Output</div>
+      <div className="node-title">Returned package</div>
+      <div className="node-meta">Human gate review</div>
+    </div>
+  );
+}
+
+function OrchestrationDetailOverlay({
+  nodeTitle,
+  nodeType,
+  detailId,
+  plan,
+  onClose,
+}) {
+  const assignments = plan?.assignments ?? [];
+  const tasks = plan?.tasks ?? [];
+  const assignment = assignments.find(
+    (item) => item.id === detailId
+  );
+  const task = tasks.find(
+    (item) => item.id === assignment?.taskId
+  );
+  const firstMate = detailId === "first-mate";
+
+  return (
+    <aside className="node-orchestration-detail">
+      <header>
+        <div>
+          <div className="concept-preview-label">Concept preview</div>
+          <h2>{firstMate ? "First Mate" : assignment?.role}</h2>
+          <span>{nodeType} · {nodeTitle}</span>
+        </div>
+        <button type="button" onClick={onClose} aria-label="Close orchestration detail">×</button>
+      </header>
+
+      {firstMate ? (
+        <>
+          <div className="orchestration-detail-section">
+            <span>Assigned work</span>
+            {assignments.map((item) => {
+              const assignedTask = tasks.find(
+                (candidate) => candidate.id === item.taskId
+              );
+              return (
+                <p key={item.id}>○ {item.role}: {assignedTask?.title}</p>
+              );
+            })}
+          </div>
+          <div className="orchestration-detail-section">
+            <span>Human required</span>
+            <p>Review returned package</p>
+          </div>
+          <div className="orchestration-detail-section">
+            <span>Authority</span>
+            <p>May coordinate approved work. Cannot change scope, advance stages, or make final disposition.</p>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="orchestration-detail-section">
+            <span>Assigned task</span>
+            <p>{task?.title}</p>
+          </div>
+          <div className="orchestration-detail-section">
+            <span>Status</span>
+            <p className={`orchestration-detail-status ${orchestrationStatusClass(assignment?.status ?? "Waiting")}`}>
+              <span className="status-dot" /> {assignment?.status}
+            </p>
+          </div>
+          <div className="orchestration-detail-section">
+            <span>Input · Expected output</span>
+            <p>Approved action + evidence · {task?.output}</p>
+          </div>
+          <div className="orchestration-detail-section">
+            <span>Authority</span>
+            <p>May draft or analyze. Cannot send, approve, or change scope.</p>
+          </div>
+        </>
+      )}
+    </aside>
+  );
+}
+
+class OrchestrationErrorBoundary extends Component {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error("Orchestration preview error", error, errorInfo);
+  }
+
+  render() {
+    if (!this.state.hasError) {
+      return this.props.children;
+    }
+
+    return (
+      <aside className="node-orchestration-detail orchestration-error" role="alert">
+        <header>
+          <div>
+            <div className="concept-preview-label">Concept preview</div>
+            <h2>Orchestration preview error</h2>
+          </div>
+          <button type="button" onClick={this.props.onClose} aria-label="Close preview">×</button>
+        </header>
+        <p>Something went wrong while preparing the preview.</p>
+        <button type="button" className="node-orchestration-error-close" onClick={this.props.onClose}>
+          Close preview
+        </button>
+      </aside>
+    );
+  }
+}
+
+function NodeOrchestrationWindow({
+  open,
+  minimized,
+  node,
+  nodeTitle,
+  nodeType,
+  nodeBody,
+  summary,
+  phase,
+  plan,
+  onMinimize,
+  onClose,
+  onExpand,
+  onFullscreen,
+  onPreviewPlan,
+  onBack,
+  onApprove,
+  onReset,
+  flowWrapperRef,
+  reactFlowInstance,
+  viewportRevision,
+}) {
+  const windowRef = useRef(null);
+  const basePositionRef = useRef({ left: 0, top: 0 });
+  const [position, setPosition] = useState(null);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  const dragRef = useRef(null);
+
+  useLayoutEffect(() => {
+    if (!open || !node || !reactFlowInstance || !flowWrapperRef.current) {
+      return;
+    }
+
+    const wrapperRect = flowWrapperRef.current.getBoundingClientRect();
+    const nodeWidth = node.measured?.width ?? node.width ?? 250;
+    const nodeScreen = reactFlowInstance.flowToScreenPosition(node.position);
+    const nodeRight = reactFlowInstance.flowToScreenPosition({
+      x: node.position.x + nodeWidth,
+      y: node.position.y,
+    });
+    const cardWidth = windowRef.current?.offsetWidth ?? 300;
+    const rightSpace = wrapperRect.right - nodeRight.x;
+    const side = rightSpace >= cardWidth + 18 ? "right" : "left";
+    const preferredLeft = side === "right"
+      ? nodeRight.x - wrapperRect.left + 18
+      : nodeScreen.x - wrapperRect.left - cardWidth - 18;
+    const baseLeft = Math.max(12, Math.min(preferredLeft, wrapperRect.width - cardWidth - 12));
+    const cardHeight = windowRef.current?.offsetHeight ?? 270;
+    const baseTop = Math.max(12, Math.min(nodeScreen.y - wrapperRect.top, wrapperRect.height - cardHeight - 12));
+
+    basePositionRef.current = {
+      left: baseLeft,
+      top: baseTop,
+    };
+
+    setPosition({
+      left: Math.max(12, Math.min(baseLeft + dragOffset.x, wrapperRect.width - cardWidth - 12)),
+      top: Math.max(12, Math.min(baseTop + dragOffset.y, wrapperRect.height - cardHeight - 12)),
+      side,
+    });
+  }, [
+    flowWrapperRef,
+    dragOffset,
+    node,
+    open,
+    reactFlowInstance,
+    viewportRevision,
+  ]);
+
+  useEffect(() => {
+    function handlePointerMove(event) {
+      if (!dragRef.current || !flowWrapperRef.current || !windowRef.current) {
+        return;
+      }
+
+      const wrapperRect = flowWrapperRef.current.getBoundingClientRect();
+      const card = windowRef.current.getBoundingClientRect();
+      const base = basePositionRef.current;
+      const nextLeft = base.left + dragRef.current.offset.x + event.clientX - dragRef.current.x;
+      const nextTop = base.top + dragRef.current.offset.y + event.clientY - dragRef.current.y;
+      const left = Math.max(12, Math.min(nextLeft, wrapperRect.width - card.width - 12));
+      const top = Math.max(12, Math.min(nextTop, wrapperRect.height - card.height - 12));
+      const nextOffset = {
+        x: left - base.left,
+        y: top - base.top,
+      };
+
+      setDragOffset(nextOffset);
+      setPosition((current) => ({
+        ...current,
+        left,
+        top,
+      }));
+    }
+
+    function handlePointerUp() {
+      dragRef.current = null;
+    }
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [flowWrapperRef]);
+
+  if (!open || minimized || !node || !position) {
+    return null;
+  }
+
+  const validPlan = isValidOrchestrationPlan(plan)
+    ? plan
+    : null;
+  const humanAttention = summary.humanRequired > 0;
+
+  return (
+    <aside
+      ref={windowRef}
+      className={`node-orchestration-window ${position.side}`}
+      style={{ left: position.left, top: position.top }}
+      aria-label={`Orchestration preview for ${nodeTitle}`}
+    >
+      <header
+        className="node-orchestration-window-header"
+        onPointerDown={(event) => {
+          if (event.target.closest("button")) {
+            return;
+          }
+          dragRef.current = {
+            x: event.clientX,
+            y: event.clientY,
+            offset: dragOffset,
+          };
+        }}
+      >
+        <div>
+          <div className="concept-preview-label">Concept preview</div>
+          <h2>
+            {phase === "request"
+              ? "Orchestration request"
+              : phase === "proposed"
+              ? "Proposed orchestration"
+              : "Node orchestration"}
+          </h2>
+          <span>{nodeType} · {nodeTitle}</span>
+        </div>
+        <div className="node-orchestration-controls">
+          {phase === "preview-approved" && (
+            <>
+              <button type="button" onClick={onExpand} aria-label="Expand orchestration">↗</button>
+              <button type="button" onClick={onFullscreen} aria-label="Open full-screen orchestration">⛶</button>
+            </>
+          )}
+          <button type="button" onClick={onMinimize} aria-label="Minimize orchestration">—</button>
+          <button type="button" onClick={onClose} aria-label="Close orchestration">×</button>
+        </div>
+      </header>
+
+      {phase === "request" && (
+        <>
+          <div className="node-orchestration-window-body request-body">
+            <div className="request-field">
+              <span>Node</span>
+              <strong>{nodeTitle}</strong>
+            </div>
+            <div className="request-field">
+              <span>Goal</span>
+              <strong>{nodeTitle}</strong>
+              {nodeBody && <p>{nodeBody}</p>}
+            </div>
+            <div className="request-field">
+              <span>Context</span>
+              <p>Episode + selected node</p>
+            </div>
+            <div className="request-authority">
+              <span>Authority</span>
+              <strong>Propose only · No execution</strong>
+            </div>
+          </div>
+          <div className="node-orchestration-window-actions">
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="button" className="primary" onClick={onPreviewPlan}>Preview First Mate</button>
+          </div>
+        </>
+      )}
+
+      {phase === "proposed" && (
+        <>
+          <div className="node-orchestration-window-body proposed-body">
+            {!validPlan ? (
+              <>
+                <strong>Unable to preview orchestration</strong>
+                <span>The local plan is not available yet.</span>
+              </>
+            ) : (
+              <>
+                <strong>First Mate · Proposed orchestration</strong>
+                <span>Concept preview — nothing has run.</span>
+                <div className="request-field">
+                  <span>Objective</span>
+                  <strong>{validPlan.objective}</strong>
+                </div>
+                <div className="node-orchestration-plan-list">
+                  {validPlan.assignments.map((assignment, index) => {
+                    const task = validPlan.tasks[index];
+                    if (!task) {
+                      return null;
+                    }
+
+                    return (
+                      <div key={assignment.id} className="node-orchestration-plan-item">
+                        <strong>{index + 1}. {assignment.role}</strong>
+                        <span>{task.title}</span>
+                        {task.dependsOn.length > 0 && (
+                          <span>
+                            Depends on: {task.dependsOn.map((dependencyId) =>
+                              validPlan.assignments.find((item) => item.id === dependencyId)?.role
+                            ).filter(Boolean).join(" + ")}
+                          </span>
+                        )}
+                        <span>Output: {task.output}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="request-authority">
+                  <span>Human gate</span>
+                  <strong>{validPlan.humanGates[0]}</strong>
+                  <span>Authority</span>
+                  <strong>Planning only · No execution</strong>
+                </div>
+              </>
+            )}
+          </div>
+          <div className="node-orchestration-window-actions">
+            <button type="button" onClick={onBack}>Back</button>
+            <button type="button" className="primary" onClick={onApprove} disabled={!validPlan}>Approve preview</button>
+          </div>
+        </>
+      )}
+
+      {phase === "preview-approved" && (
+        <>
+          <div className="node-orchestration-window-body">
+            {!validPlan ? (
+              <>
+                <strong>Unable to show orchestration</strong>
+                <span>The approved preview data is not available.</span>
+              </>
+            ) : (
+              <>
+                <strong>First Mate</strong>
+                <span>Coordinating {summary.total} agents · Preview approved</span>
+                <div className="node-orchestration-status-list">
+                  {validPlan.assignments.map((assignment) => (
+                    <span key={assignment.id} className={orchestrationStatusClass(assignment.status)}>
+                      <span className="status-dot" /> {assignment.role} · Mock {assignment.status}
+                    </span>
+                  ))}
+                </div>
+                <div className={`node-orchestration-human ${humanAttention ? "attention" : ""}`}>
+                  <span className="status-dot" />
+                  Human attention: {humanAttention ? "Required" : "None"}
+                </div>
+                <span className="node-orchestration-mock-note">Mock execution state · Nothing has run.</span>
+              </>
+            )}
+          </div>
+          <div className="node-orchestration-window-actions approved-actions">
+            <button type="button" onClick={onExpand} disabled={!validPlan}>Expand orchestration →</button>
+            <button type="button" onClick={onReset}>Reset preview</button>
+          </div>
+        </>
+      )}
+    </aside>
+  );
+}
 
 /* -------------------------------------------------------------------------- */
 /* RIGHT DRAWER                                                               */
 /* -------------------------------------------------------------------------- */
+
+function ConversationMessages({
+  thread,
+  compact = false,
+}) {
+  const messages = thread?.messages ?? [];
+  const visibleMessages = compact
+    ? messages.slice(-4)
+    : messages;
+  const pending = thread?.status === "pending";
+
+  return (
+    <div className="conversation-messages">
+      {!thread && (
+        <div className="drawer-empty anchored-empty">
+          <div className="drawer-empty-icon">◌</div>
+          <strong>No conversation yet</strong>
+          <p>
+            Ask the agent about this node. The conversation will stay
+            anchored here.
+          </p>
+        </div>
+      )}
+
+      {visibleMessages.map((message) => (
+        <div
+          key={message.id}
+          className={`drawer-message ${message.role}`}
+        >
+          <div className="drawer-message-inner">
+            <div className="drawer-message-role">
+              {message.role === "human" ? "You" : "Agent"}
+            </div>
+            <div className="drawer-message-bubble">
+              {message.content}
+            </div>
+          </div>
+        </div>
+      ))}
+
+      {compact && messages.length > visibleMessages.length && (
+        <div className="anchored-history-note">
+          Showing the latest part of this conversation
+        </div>
+      )}
+
+      {pending && (
+        <div className="drawer-agent-pending">
+          <span />
+          Waiting for agent response…
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ConversationComposer({
+  thread,
+  onSend,
+}) {
+  const [draft, setDraft] = useState("");
+  const pending = thread?.status === "pending";
+
+  function submit(event) {
+    event.preventDefault();
+
+    const clean = draft.trim();
+
+    if (!clean || pending) {
+      return;
+    }
+
+    onSend(clean);
+    setDraft("");
+  }
+
+  return (
+    <form className="drawer-composer" onSubmit={submit}>
+      <div className="drawer-composer-box">
+        <textarea
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          disabled={pending}
+          placeholder={
+            pending
+              ? "Waiting for the agent to respond..."
+              : thread
+              ? "Continue this node conversation..."
+              : "Ask the agent about this node..."
+          }
+        />
+
+        <div className="drawer-composer-actions">
+          <button
+            type="button"
+            className="drawer-secondary-button"
+            disabled={pending}
+            onClick={() =>
+              setDraft(
+                "What hidden judgment, conflict, assumption, or missing evidence would materially change this node?"
+              )
+            }
+          >
+            Find missing judgment
+          </button>
+
+          <button
+            type="submit"
+            className="drawer-send-button"
+            disabled={pending || !draft.trim()}
+          >
+            Ask agent
+          </button>
+        </div>
+      </div>
+    </form>
+  );
+}
+
+function AnchoredConversationCard({
+  episode,
+  stageIndex,
+  anchorNodeId,
+  anchorTitle,
+  anchorType,
+  thread,
+  nodes,
+  flowWrapperRef,
+  reactFlowInstance,
+  viewportRevision,
+  onSend,
+  onExpand,
+  onFullscreen,
+  onMinimize,
+  orchestrationEligible,
+  orchestrationApproved,
+  orchestrationSummary,
+  onOrchestrate,
+  contextSummary,
+  onViewContext,
+}) {
+  const cardRef = useRef(null);
+  const [placement, setPlacement] = useState("right");
+  const [position, setPosition] = useState(null);
+  const anchorNode = nodes.find((node) => node.id === anchorNodeId);
+
+  useLayoutEffect(() => {
+    if (!anchorNode || !reactFlowInstance || !flowWrapperRef.current) {
+      return;
+    }
+
+    const wrapper = flowWrapperRef.current;
+    const card = cardRef.current;
+    const wrapperRect = wrapper.getBoundingClientRect();
+    const nodeWidth = anchorNode.measured?.width ?? anchorNode.width ?? 250;
+    const nodeHeight = anchorNode.measured?.height ?? anchorNode.height ?? 150;
+    const cardWidth = card?.offsetWidth ?? 320;
+    const cardHeight = card?.offsetHeight ?? 300;
+    const nodeScreen = reactFlowInstance.flowToScreenPosition({
+      x: anchorNode.position.x,
+      y: anchorNode.position.y,
+    });
+    const nodeRightScreen = reactFlowInstance.flowToScreenPosition({
+      x: anchorNode.position.x + nodeWidth,
+      y: anchorNode.position.y,
+    });
+    const nodeBottomScreen = reactFlowInstance.flowToScreenPosition({
+      x: anchorNode.position.x,
+      y: anchorNode.position.y + nodeHeight,
+    });
+    const nodeLeft = nodeScreen.x - wrapperRect.left;
+    const nodeTop = nodeScreen.y - wrapperRect.top;
+    const nodeRight = nodeRightScreen.x - wrapperRect.left;
+    const nodeBottom = nodeBottomScreen.y - wrapperRect.top;
+    const gap = 20;
+    const rightSpace = wrapperRect.width - nodeRight;
+    const nextPlacement =
+      rightSpace >= cardWidth + gap ? "right" : "left";
+    const preferredLeft =
+      nextPlacement === "right"
+        ? nodeRight + gap
+        : nodeLeft - cardWidth - gap;
+    const left = Math.max(
+      12,
+      Math.min(preferredLeft, wrapperRect.width - cardWidth - 12)
+    );
+    const top = Math.max(
+      12,
+      Math.min(nodeTop, wrapperRect.height - cardHeight - 12)
+    );
+
+    if (placement !== nextPlacement) {
+      setPlacement(nextPlacement);
+    }
+
+    const nextPosition = {
+      left,
+      top,
+      connectorY: Math.max(20, nodeTop + (nodeBottom - nodeTop) / 2 - top),
+    };
+
+    if (
+      !position ||
+      position.left !== nextPosition.left ||
+      position.top !== nextPosition.top ||
+      position.connectorY !== nextPosition.connectorY
+    ) {
+      setPosition(nextPosition);
+    }
+  }, [
+    anchorNode,
+    flowWrapperRef,
+    placement,
+    position,
+    reactFlowInstance,
+    viewportRevision,
+  ]);
+
+  if (!anchorNode || !position) {
+    return null;
+  }
+
+  return (
+    <section
+      ref={cardRef}
+      className={`anchored-conversation ${placement}`}
+      style={{ left: position.left, top: position.top }}
+      aria-label={`Conversation for ${anchorTitle}`}
+    >
+      <span
+        className="anchored-conversation-connector"
+        style={{ top: position.connectorY }}
+      />
+
+      <header className="anchored-conversation-header">
+        <div className="anchored-conversation-copy">
+          <div className="drawer-eyebrow">{anchorType}</div>
+          <h2>{anchorTitle}</h2>
+          <div className="anchored-conversation-stage">
+            {episode.id} · {EPISODE_STAGES[thread?.stageIndex ?? stageIndex]?.name}
+          </div>
+
+          {orchestrationEligible && (
+            <button
+              type="button"
+              className="anchored-orchestration-action"
+              onClick={onOrchestrate}
+            >
+              {orchestrationApproved
+                ? `${orchestrationSummary.total} agents`
+                : "Orchestrate"}
+            </button>
+          )}
+        </div>
+
+        <div className="anchored-conversation-controls">
+          <button type="button" onClick={onExpand} aria-label="Expand conversation">
+            ↗
+          </button>
+          <button type="button" onClick={onFullscreen} aria-label="Open full-screen conversation">
+            ⛶
+          </button>
+          <button type="button" onClick={onMinimize} aria-label="Minimize node conversation">
+            —
+          </button>
+        </div>
+      </header>
+
+      <div className="anchored-conversation-thread">
+        {contextSummary ? (
+          <div className="anchored-context-summary">
+            <strong>{contextSummary.source}</strong>
+            <p>Full context is available in the drawer.</p>
+            <button type="button" onClick={onViewContext}>View context</button>
+          </div>
+        ) : (
+          <ConversationMessages thread={thread} compact />
+        )}
+      </div>
+
+      <ConversationComposer
+        key={`${anchorNodeId}:${thread?.id ?? ""}`}
+        thread={thread}
+        onSend={onSend}
+      />
+    </section>
+  );
+}
+
+function FullscreenConversation({
+  open,
+  onClose,
+  episode,
+  stageIndex,
+  anchorTitle,
+  anchorType,
+  thread,
+  onSend,
+}) {
+  if (!open || !episode) {
+    return null;
+  }
+
+  const resolvedStageIndex =
+    thread?.stageIndex ?? stageIndex ?? episode.currentStage;
+
+  return (
+    <div className="fullscreen-conversation-overlay">
+      <section className="fullscreen-conversation" role="dialog" aria-modal="true">
+        <header className="fullscreen-conversation-header">
+          <div>
+            <div className="drawer-eyebrow">Focused node conversation</div>
+            <h2>{anchorTitle}</h2>
+            <div className="drawer-anchor-meta">
+              <span>{episode.id}</span>
+              <span>{EPISODE_STAGES[resolvedStageIndex]?.name}</span>
+              <span>{anchorType}</span>
+            </div>
+          </div>
+
+          <button type="button" className="drawer-close" onClick={onClose} aria-label="Close full-screen conversation">
+            ×
+          </button>
+        </header>
+
+        <div className="fullscreen-conversation-thread">
+          <ConversationMessages thread={thread} />
+        </div>
+
+        <ConversationComposer
+          key={`${anchorTitle}:${thread?.id ?? ""}`}
+          thread={thread}
+          onSend={onSend}
+        />
+      </section>
+    </div>
+  );
+}
 
 function NodeChatDrawer({
   open,
@@ -1256,7 +2470,8 @@ function NodeChatDrawer({
   thread,
 
   onSend,
-  onFindMissingJudgment,
+  stageIndex,
+  contextContent,
 
   canRemoveNode,
   onRemoveNode,
@@ -1385,6 +2600,7 @@ function NodeChatDrawer({
               {
                 EPISODE_STAGES[
                   thread?.stageIndex ??
+                    stageIndex ??
                     episode.currentStage
                 ]?.name
               }
@@ -1403,6 +2619,18 @@ function NodeChatDrawer({
       </header>
 
       <div className="drawer-thread">
+        {anchorNodeId === "context" && (
+          <section className="drawer-context-detail">
+            <div className="drawer-eyebrow">Known context</div>
+            <h3>Source</h3>
+            <p>{anchorTitle}</p>
+            <h3>Full context</h3>
+            <p className="drawer-context-raw">
+              {contextContent || "No additional context was provided yet."}
+            </p>
+          </section>
+        )}
+
         {!thread && (
           <div className="drawer-empty">
             <div className="drawer-empty-icon">
@@ -1596,6 +2824,48 @@ export default function App() {
   ] = useState(false);
 
   const [
+    fullscreenOpen,
+    setFullscreenOpen,
+  ] = useState(false);
+
+  const [
+    anchoredConversationMinimized,
+    setAnchoredConversationMinimized,
+  ] = useState(false);
+
+  const [
+    orchestrationNodeId,
+    setOrchestrationNodeId,
+  ] = useState(null);
+
+  const [
+    orchestrationPreviews,
+    setOrchestrationPreviews,
+  ] = useState({});
+
+  const [
+    orchestrationExpanded,
+    setOrchestrationExpanded,
+  ] = useState(false);
+
+  const [
+    orchestrationMinimized,
+    setOrchestrationMinimized,
+  ] = useState(false);
+
+  const [
+    orchestrationDetailId,
+    setOrchestrationDetailId,
+  ] = useState(null);
+
+  const [
+    viewportRevision,
+    setViewportRevision,
+  ] = useState(0);
+
+  const flowWrapperRef = useRef(null);
+
+  const [
     activeThreadId,
     setActiveThreadId,
   ] = useState(null);
@@ -1641,27 +2911,6 @@ export default function App() {
       viewStage
     ];
 
-  const selectedAddition =
-    useMemo(() => {
-      if (
-        !activeEpisode ||
-        !selectedNodeId
-      ) {
-        return null;
-      }
-
-      return (
-        activeEpisode.additions?.find(
-          (item) =>
-            item.id ===
-            selectedNodeId
-        ) ?? null
-      );
-    }, [
-      activeEpisode,
-      selectedNodeId,
-    ]);
-
   const activeThread =
     useMemo(() => {
       if (
@@ -1684,6 +2933,26 @@ export default function App() {
       activeEpisode,
       activeThreadId,
     ]);
+
+  const visibleTopologyKey =
+    useMemo(() => {
+      if (!activeEpisode) {
+        return "";
+      }
+
+      const additionIds = (
+        activeEpisode.additions ?? []
+      )
+        .filter(
+          (item) =>
+            item.stageIndex ===
+            viewStage
+        )
+        .map((item) => item.id)
+        .join("|");
+
+      return `${activeEpisode.id}:${viewStage}:${additionIds}`;
+    }, [activeEpisode, viewStage]);
 
   /* ---------------------------------------------------------------------- */
   /* PERSISTENCE                                                            */
@@ -1718,6 +2987,13 @@ export default function App() {
     setDrawerOpen(
       false
     );
+
+    setAnchoredConversationMinimized(false);
+    setOrchestrationNodeId(null);
+    setOrchestrationExpanded(false);
+    setOrchestrationMinimized(false);
+    setOrchestrationDetailId(null);
+    setOrchestrationPreviews({});
   }, [activeEpisodeId]);
 
   /* ---------------------------------------------------------------------- */
@@ -1793,10 +3069,7 @@ export default function App() {
       if (
         nodeId === "context"
       ) {
-        return (
-          episode.context ||
-          "Known context"
-        );
+        return "Known context";
       }
 
       return base.title;
@@ -1965,6 +3238,171 @@ export default function App() {
     };
   }
 
+  function getOrchestrationNodeRecord(nodeId) {
+    const renderedNode = nodes.find(
+      (node) => node.id === nodeId
+    );
+
+    if (renderedNode) {
+      return renderedNode;
+    }
+
+    const baseNode = findBaseNode(
+      viewStage,
+      nodeId
+    );
+
+    return {
+      id: nodeId,
+      type: "card",
+      data: {
+        label: baseNode?.type ?? "Work node",
+        title: findNodeTitle(
+          activeEpisode,
+          viewStage,
+          nodeId
+        ),
+        body: baseNode?.body ?? "",
+      },
+    };
+  }
+
+  function getLocalOrchestrationRequest(nodeId) {
+    if (
+      !activeEpisode ||
+      !nodeId ||
+      !ORCHESTRATION_ELIGIBLE_NODES.has(nodeId)
+    ) {
+      return null;
+    }
+
+    return createOrchestrationRequest({
+      episode: activeEpisode,
+      node: getOrchestrationNodeRecord(nodeId),
+      threads: getThreadsForNode(
+        activeEpisode,
+        viewStage,
+        nodeId
+      ),
+      context: {
+        expectedOutcome: "A reviewed orchestration proposal.",
+      },
+    });
+  }
+
+  function getLocalOrchestrationPlan(nodeId) {
+    if (
+      !activeEpisode ||
+      !nodeId ||
+      !ORCHESTRATION_ELIGIBLE_NODES.has(nodeId)
+    ) {
+      return null;
+    }
+
+    const request = getLocalOrchestrationRequest(nodeId);
+    const plan = createOrchestrationPlan({
+      episode: activeEpisode,
+      node: getOrchestrationNodeRecord(nodeId),
+      threads: getThreadsForNode(
+        activeEpisode,
+        viewStage,
+        nodeId
+      ),
+      context: {
+        expectedOutcome: "A reviewed orchestration proposal.",
+      },
+    });
+
+    return {
+      ...plan,
+      request,
+    };
+  }
+
+  function openNodeOrchestration(nodeId) {
+    if (
+      !activeEpisode ||
+      !nodeId ||
+      !nodes.some((node) => node.id === nodeId) ||
+      !ORCHESTRATION_ELIGIBLE_NODES.has(nodeId)
+    ) {
+      return;
+    }
+
+    setSelectedNodeId(nodeId);
+    setOrchestrationNodeId(nodeId);
+    setOrchestrationMinimized(false);
+    setOrchestrationDetailId(null);
+    setOrchestrationExpanded(
+      orchestrationPreviews[nodeId]?.state ===
+        "preview-approved"
+    );
+  }
+
+  function previewFirstMate() {
+    if (!orchestrationNodeId) {
+      return;
+    }
+
+    setOrchestrationPreviews((current) => ({
+      ...current,
+      [orchestrationNodeId]: {
+        state: "proposed",
+        plan: getLocalOrchestrationPlan(orchestrationNodeId),
+      },
+    }));
+  }
+
+  function backToOrchestrationRequest() {
+    if (!orchestrationNodeId) {
+      return;
+    }
+
+    setOrchestrationPreviews((current) => ({
+      ...current,
+      [orchestrationNodeId]: {
+        state: "request",
+        plan:
+          current[orchestrationNodeId]?.plan ??
+          getLocalOrchestrationPlan(orchestrationNodeId),
+      },
+    }));
+  }
+
+  function approveOrchestrationPreview() {
+    if (!orchestrationNodeId) {
+      return;
+    }
+
+    setOrchestrationPreviews((current) => ({
+      ...current,
+      [orchestrationNodeId]: {
+        state: "preview-approved",
+        plan:
+          current[orchestrationNodeId]?.plan ??
+          getLocalOrchestrationPlan(orchestrationNodeId),
+      },
+    }));
+    setOrchestrationExpanded(true);
+    setOrchestrationMinimized(false);
+  }
+
+  function resetOrchestrationPreview() {
+    if (!orchestrationNodeId) {
+      return;
+    }
+
+    setOrchestrationPreviews((current) => {
+      const next = { ...current };
+      delete next[orchestrationNodeId];
+      return next;
+    });
+    setOrchestrationNodeId(null);
+    setOrchestrationExpanded(false);
+    setOrchestrationMinimized(false);
+    setOrchestrationDetailId(null);
+  }
+
   /* ---------------------------------------------------------------------- */
   /* OPEN CHAT                                                              */
   /* ---------------------------------------------------------------------- */
@@ -2003,9 +3441,9 @@ export default function App() {
         selected.id
       );
 
-      setDrawerOpen(
-        true
-      );
+      setAnchoredConversationMinimized(false);
+
+      setDrawerOpen(false);
 
       return;
     }
@@ -2026,14 +3464,14 @@ export default function App() {
       nodeId
     );
 
+    setAnchoredConversationMinimized(false);
+
     setActiveThreadId(
       stats.latestThread?.id ??
         null
     );
 
-    setDrawerOpen(
-      true
-    );
+    setDrawerOpen(false);
   }
 
   function closeDrawer() {
@@ -2477,6 +3915,11 @@ export default function App() {
     setDrawerOpen(
       false
     );
+
+    setOrchestrationNodeId(null);
+    setOrchestrationExpanded(false);
+    setOrchestrationMinimized(false);
+    setOrchestrationDetailId(null);
   }
 
   function recordDisposition(
@@ -2502,6 +3945,10 @@ export default function App() {
     _event,
     node
   ) {
+    if (node.data?.orchestrationPreview) {
+      return;
+    }
+
     updateActiveEpisode(
       (episode) => ({
         ...episode,
@@ -2698,6 +4145,8 @@ export default function App() {
           let body =
             node.body;
 
+          let contextSummary = null;
+
           if (
             viewStage ===
               0 &&
@@ -2717,14 +4166,11 @@ export default function App() {
             node.id ===
               "context"
           ) {
-            title =
-              activeEpisode.context ||
-              "No additional context was provided yet.";
+            title = "Known context";
 
             body =
-              activeEpisode.context
-                ? "Human-provided starting context."
-                : "Context can be recovered through evidence and node conversations.";
+              "Orientation summary for the episode context.";
+            contextSummary = getContextSummary(activeEpisode);
           }
 
           const position =
@@ -2741,6 +4187,9 @@ export default function App() {
               viewStage,
               node.id
             );
+
+          const orchestration =
+            orchestrationPreviews[node.id];
 
           let type =
             "card";
@@ -2773,6 +4222,40 @@ export default function App() {
               label:
                 node.type,
 
+              secondary:
+                false,
+
+              selected:
+                selectedNodeId === node.id,
+
+              isContext:
+                node.id === "context",
+
+              contextSummary,
+
+              onViewContext: () =>
+                openDrawerForNode(node.id),
+
+              orchestrationEligible:
+                ORCHESTRATION_ELIGIBLE_NODES.has(
+                  node.id
+                ),
+
+              orchestrationSummary:
+                getOrchestrationSummary(
+                  node.id,
+                  orchestration?.plan
+                ),
+
+              orchestrationApproved:
+                orchestration?.state ===
+                "preview-approved",
+
+                onOpenOrchestration: () =>
+                  openNodeOrchestration(
+                    node.id
+                  ),
+
               title,
 
               body,
@@ -2782,6 +4265,9 @@ export default function App() {
 
               threadMessageCount:
                 stats.messageCount,
+
+              threadCount:
+                stats.threads.length,
 
               threadPending:
                 stats.pending,
@@ -2873,6 +4359,9 @@ export default function App() {
                   item.status ===
                   "pending",
 
+                secondary:
+                  true,
+
                 onOpen: () => {
                   setSelectedNodeId(
                     item.parentNodeId
@@ -2910,6 +4399,9 @@ export default function App() {
               label:
                 item.label,
 
+              secondary:
+                true,
+
               title:
                 item.title,
 
@@ -2922,6 +4414,9 @@ export default function App() {
               threadMessageCount:
                 stats.messageCount,
 
+              threadCount:
+                stats.threads.length,
+
               threadPending:
                 stats.pending,
 
@@ -2933,9 +4428,32 @@ export default function App() {
           };
         });
 
+    const orchestrationPlan =
+      orchestrationPreviews[orchestrationNodeId]?.plan ??
+      getLocalOrchestrationPlan(orchestrationNodeId);
+
+    const orchestrationNodes =
+      orchestrationExpanded &&
+      orchestrationNodeId &&
+      ORCHESTRATION_ELIGIBLE_NODES.has(
+        orchestrationNodeId
+      ) &&
+      isValidOrchestrationPlan(orchestrationPlan)
+        ? buildOrchestrationPreviewNodes(
+            orchestrationNodeId,
+            getNodePosition(
+              activeEpisode,
+              viewStage,
+              orchestrationNodeId
+            ),
+            orchestrationPlan
+          )
+        : [];
+
     return [
       ...baseNodes,
       ...additions,
+      ...orchestrationNodes,
     ];
   }
 
@@ -2975,6 +4493,9 @@ export default function App() {
 
           type:
             "smoothstep",
+
+          className:
+            "governed-edge",
         })
       );
 
@@ -3007,11 +4528,32 @@ export default function App() {
 
           type:
             "smoothstep",
+
+          className:
+            "branch-edge",
         }));
+
+    const orchestrationPlan =
+      orchestrationPreviews[orchestrationNodeId]?.plan ??
+      getLocalOrchestrationPlan(orchestrationNodeId);
+
+    const orchestrationEdges =
+      orchestrationExpanded &&
+      orchestrationNodeId &&
+      ORCHESTRATION_ELIGIBLE_NODES.has(
+        orchestrationNodeId
+      ) &&
+      isValidOrchestrationPlan(orchestrationPlan)
+        ? buildOrchestrationPreviewEdges(
+            orchestrationNodeId,
+            orchestrationPlan
+          )
+        : [];
 
     return [
       ...baseEdges,
       ...additionEdges,
+      ...orchestrationEdges,
     ];
   }
 
@@ -3061,25 +4603,39 @@ export default function App() {
       );
     }
 
-    window.setTimeout(
-      () => {
-        reactFlowInstance?.fitView(
-          {
-            padding:
-              0.18,
-
-            duration:
-              250,
-          }
-        );
-      },
-      40
-    );
   }, [
     activeEpisodeId,
     viewStage,
     episodes,
+    selectedNodeId,
+    orchestrationExpanded,
+    orchestrationNodeId,
+    orchestrationPreviews,
+  ]);
+
+  useEffect(() => {
+    if (!reactFlowInstance) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(
+      () => {
+        reactFlowInstance.fitView({
+          padding: 0.18,
+          duration: 250,
+        });
+      },
+      60
+    );
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [
     reactFlowInstance,
+    activeEpisodeId,
+    viewStage,
+    visibleTopologyKey,
   ]);
 
   /* ---------------------------------------------------------------------- */
@@ -4393,6 +5949,12 @@ export default function App() {
                             setDrawerOpen(
                               false
                             );
+
+                            setOrchestrationNodeId(null);
+                            setOrchestrationExpanded(false);
+                            setOrchestrationMinimized(false);
+                            setOrchestrationDetailId(null);
+                            setOrchestrationPreviews({});
                           }}
                         >
                           <span>
@@ -4431,9 +5993,11 @@ export default function App() {
                                   }
                                   className="tree-node"
                                   onClick={() => {
-                                    setSelectedNodeId(
-                                      node.id
-                                    );
+    setSelectedNodeId(
+      node.id
+    );
+
+    setAnchoredConversationMinimized(false);
 
                                     setActiveThreadId(
                                       null
@@ -4506,7 +6070,10 @@ export default function App() {
 
             {/* CANVAS */}
 
-            <div className="flow-wrapper">
+            <div
+              ref={flowWrapperRef}
+              className="flow-wrapper"
+            >
               <ReactFlow
                 nodes={
                   nodes
@@ -4527,6 +6094,13 @@ export default function App() {
                   _event,
                   node
                 ) => {
+                  if (node.data?.orchestrationPreview) {
+                    setOrchestrationDetailId(
+                      node.data.detailId
+                    );
+                    return;
+                  }
+
                   const addition =
                     activeEpisode.additions?.find(
                       (item) =>
@@ -4551,16 +6125,18 @@ export default function App() {
                       addition.id
                     );
 
-                    setDrawerOpen(
-                      true
-                    );
+                    setAnchoredConversationMinimized(false);
+
+                    setDrawerOpen(false);
 
                     return;
                   }
 
-                  setSelectedNodeId(
-                    node.id
-                  );
+                            setSelectedNodeId(
+                              node.id
+                            );
+
+                            setAnchoredConversationMinimized(false);
 
                   const stats =
                     getThreadStats(
@@ -4576,6 +6152,11 @@ export default function App() {
                 }}
                 onNodeDragStop={
                   handleNodeDragStop
+                }
+                onMove={() =>
+                  setViewportRevision(
+                    (value) => value + 1
+                  )
                 }
                 onInit={
                   setReactFlowInstance
@@ -4613,69 +6194,133 @@ export default function App() {
                   }
                 />
               </ReactFlow>
-            </div>
 
-            {/* FLOATING CHAT BUBBLE */}
-
-            {!drawerOpen && (
-              <button
-                type="button"
-                className={`node-chat-launcher ${
-                  selectedNodeId
-                    ? ""
-                    : "disabled"
-                }`}
-                disabled={
-                  !selectedNodeId
-                }
-                onClick={() =>
-                  openDrawerForNode(
-                    selectedNodeId
-                  )
-                }
+              <OrchestrationErrorBoundary
+                key={orchestrationNodeId ?? "orchestration-idle"}
+                onClose={() => {
+                  setOrchestrationNodeId(null);
+                  setOrchestrationExpanded(false);
+                  setOrchestrationMinimized(false);
+                  setOrchestrationDetailId(null);
+                }}
               >
-                <span className="node-chat-launcher-icon">
-                  ◌
-                </span>
-
-                <span className="node-chat-launcher-copy">
-                  <small>
-                    {selectedNodeId
-                      ? "Node conversation"
-                      : "Select a node"}
-                  </small>
-
-                  <strong>
-                    {selectedNodeId
-                      ? findNodeTitle(
-                          activeEpisode,
-                          viewStage,
-                          selectedNodeId
-                        )
-                      : "Choose something on the canvas"}
-                  </strong>
-                </span>
-
-                {selectedNodeId &&
-                  getThreadStats(
+                <NodeOrchestrationWindow
+                  open={Boolean(orchestrationNodeId)}
+                  minimized={orchestrationMinimized}
+                  node={nodes.find(
+                    (node) => node.id === orchestrationNodeId
+                  )}
+                  nodeTitle={findNodeTitle(
                     activeEpisode,
                     viewStage,
-                    selectedNodeId
-                  )
-                    .messageCount >
-                    0 && (
-                    <span className="node-chat-launcher-count">
-                      {
-                        getThreadStats(
-                          activeEpisode,
-                          viewStage,
-                          selectedNodeId
-                        )
-                          .messageCount
-                      }
-                    </span>
+                    orchestrationNodeId
                   )}
-              </button>
+                  nodeType={getNodeTypeLabel(
+                    activeEpisode,
+                    viewStage,
+                    orchestrationNodeId
+                  )}
+                  nodeBody={nodes.find(
+                    (node) => node.id === orchestrationNodeId
+                  )?.data?.body ?? ""}
+                  summary={getOrchestrationPlanSummary(
+                    orchestrationPreviews[orchestrationNodeId]?.plan ??
+                    getLocalOrchestrationPlan(orchestrationNodeId)
+                  )}
+                  phase={
+                    orchestrationPreviews[orchestrationNodeId]?.state ??
+                    "request"
+                  }
+                  plan={
+                    orchestrationPreviews[orchestrationNodeId]?.plan ??
+                    getLocalOrchestrationPlan(orchestrationNodeId)
+                  }
+                  onMinimize={() =>
+                    setOrchestrationMinimized(true)
+                  }
+                  onClose={() => {
+                    setOrchestrationNodeId(null);
+                    setOrchestrationExpanded(false);
+                    setOrchestrationDetailId(null);
+                  }}
+                  onExpand={() => {
+                    setOrchestrationExpanded(true);
+                    setOrchestrationMinimized(false);
+                  }}
+                  onFullscreen={() =>
+                    setOrchestrationDetailId("first-mate")
+                  }
+                  onPreviewPlan={previewFirstMate}
+                  onBack={backToOrchestrationRequest}
+                  onApprove={approveOrchestrationPreview}
+                  onReset={resetOrchestrationPreview}
+                  flowWrapperRef={flowWrapperRef}
+                  reactFlowInstance={reactFlowInstance}
+                  viewportRevision={viewportRevision}
+                />
+
+                {orchestrationDetailId && (
+                  <OrchestrationDetailOverlay
+                    nodeTitle={findNodeTitle(
+                      activeEpisode,
+                      viewStage,
+                      orchestrationNodeId
+                    )}
+                    nodeType={getNodeTypeLabel(
+                      activeEpisode,
+                      viewStage,
+                      orchestrationNodeId
+                    )}
+                    detailId={orchestrationDetailId}
+                    plan={
+                      orchestrationPreviews[orchestrationNodeId]?.plan ??
+                      getLocalOrchestrationPlan(orchestrationNodeId)
+                    }
+                    onClose={() => setOrchestrationDetailId(null)}
+                  />
+                )}
+              </OrchestrationErrorBoundary>
+            </div>
+
+            {!drawerOpen &&
+              !anchoredConversationMinimized &&
+              selectedNodeId && (
+              <AnchoredConversationCard
+                episode={activeEpisode}
+                stageIndex={viewStage}
+                anchorNodeId={selectedNodeId}
+                anchorTitle={drawerAnchorTitle}
+                anchorType={drawerAnchorType}
+                thread={activeThread}
+                nodes={nodes}
+                flowWrapperRef={flowWrapperRef}
+                reactFlowInstance={reactFlowInstance}
+                viewportRevision={viewportRevision}
+                onSend={handleDrawerSend}
+                onExpand={() => setDrawerOpen(true)}
+                onFullscreen={() => setFullscreenOpen(true)}
+                onMinimize={() =>
+                  setAnchoredConversationMinimized(true)
+                }
+                orchestrationEligible={Boolean(
+                  ORCHESTRATION_ELIGIBLE_NODES.has(selectedNodeId)
+                )}
+                orchestrationApproved={
+                  orchestrationPreviews[selectedNodeId]?.state ===
+                  "preview-approved"
+                }
+                orchestrationSummary={getOrchestrationPlanSummary(
+                  orchestrationPreviews[selectedNodeId]?.plan ??
+                  getLocalOrchestrationPlan(selectedNodeId)
+                )}
+                onOrchestrate={() => openNodeOrchestration(selectedNodeId)}
+                contextSummary={
+                  selectedNodeId === "context"
+                    ? getContextSummary(activeEpisode)
+                    : null
+                }
+                onViewContext={() => openDrawerForNode("context")}
+              />
             )}
 
             {/* RIGHT DRAWER */}
@@ -4702,6 +6347,10 @@ export default function App() {
               thread={
                 activeThread
               }
+              stageIndex={
+                viewStage
+              }
+              contextContent={activeEpisode.context}
               onSend={
                 handleDrawerSend
               }
@@ -4713,6 +6362,17 @@ export default function App() {
                   drawerAnchorId
                 )
               }
+            />
+
+            <FullscreenConversation
+              open={fullscreenOpen}
+              onClose={() => setFullscreenOpen(false)}
+              episode={activeEpisode}
+              stageIndex={viewStage}
+              anchorTitle={drawerAnchorTitle}
+              anchorType={drawerAnchorType}
+              thread={activeThread}
+              onSend={handleDrawerSend}
             />
           </section>
         </div>

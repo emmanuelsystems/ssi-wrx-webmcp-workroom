@@ -1,14 +1,23 @@
 import { execFile } from "node:child_process";
 import { spawn } from "node:child_process";
 
-const host = "127.0.0.1";
+const host = "localhost";
 const port = 5173;
 const url = `http://${host}:${port}/`;
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 
 const server = spawn(
   npmCommand,
-  ["run", "dev", "--", "--host", host],
+  [
+    "run",
+    "dev",
+    "--",
+    "--host",
+    host,
+    "--port",
+    String(port),
+    "--strictPort",
+  ],
   {
     stdio: "inherit",
   },
