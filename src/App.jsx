@@ -47,6 +47,28 @@ import "./App.css";
 
 const STORAGE_KEY = "ssi-wrx-workroom-v4";
 
+const DURABLE_ARTIFACT_KINDS = new Set([
+  "evidence",
+  "gap",
+  "gaps",
+  "conflict",
+  "recommendation",
+  "action",
+  "evaluation",
+  "decision",
+  "human-required",
+]);
+
+function isDurableArtifact(item) {
+  return DURABLE_ARTIFACT_KINDS.has(item?.kind);
+}
+
+function compactArtifactSummary(value) {
+  const summary = value?.replace(/\s+/g, " ").trim() ?? "";
+  if (summary.length <= 120) return summary;
+  return `${summary.slice(0, 117).replace(/\s+$/, "")}…`;
+}
+
 function deriveEpisodeName(title) {
   const value = title?.replace(/\s+/g, " ").trim() ?? "";
   if (!value) return "Untitled episode";
@@ -351,29 +373,6 @@ function latestHumanMessage(
     if (
       messages[index].role ===
       "human"
-    ) {
-      return messages[index];
-    }
-  }
-
-  return null;
-}
-
-function latestAgentMessage(
-  thread
-) {
-  const messages =
-    thread.messages ?? [];
-
-  for (
-    let index =
-      messages.length - 1;
-    index >= 0;
-    index -= 1
-  ) {
-    if (
-      messages[index].role ===
-      "agent"
     ) {
       return messages[index];
     }
@@ -1071,7 +1070,7 @@ function CardNode({
         selected
           ? "selected"
           : ""
-      } ${data.proposed ? "proposed-node" : ""}`}
+      } ${data.proposed ? "proposed-node" : ""} ${data.compactNode ? "compact-node" : ""}`}
     >
       <MessageBadge
         count={
@@ -1127,7 +1126,9 @@ function CardNode({
 
       {data.body && (
         <div className="node-body">
-          {data.body}
+          {data.compactNode || data.durableArtifact
+            ? compactArtifactSummary(data.body)
+            : data.body}
         </div>
       )}
 
@@ -1147,6 +1148,19 @@ function CardNode({
           }}
         >
           View context
+        </button>
+      )}
+
+      {(data.durableArtifact || data.compactNode) && (
+        <button
+          type="button"
+          className="artifact-view-details nodrag"
+          onClick={(event) => {
+            event.stopPropagation();
+            data.onOpenThread();
+          }}
+        >
+          View details
         </button>
       )}
 
@@ -1717,12 +1731,12 @@ const ORCHESTRATION_ELIGIBLE_NODES = new Set([
 ]);
 
 function isOrchestrationEligibleNode(node) {
+  const workflowKind = node?.data?.workflowKind ?? node?.kind;
   return Boolean(
     node &&
+    node.data?.proposed !== true &&
     (ORCHESTRATION_ELIGIBLE_NODES.has(node.id) ||
-      ["inquiry", "evidence", "gap", "recommendation", "evaluation"].includes(
-        node.data?.workflowKind ?? node.kind
-      ))
+      ["inquiry", "evidence", "gap", "recommendation", "evaluation"].includes(workflowKind))
   );
 }
 
@@ -1962,16 +1976,17 @@ function EpisodeIntakePanel({
         <div className="episode-intake-panel-body">
           <div className="proposal-status">Agent proposed · Not accepted</div>
           <div className="intake-section"><span>Objective</span><strong>{proposal.objective}</strong></div>
-          <div className="intake-section"><span>Context summary</span><p>{proposal.context?.summary}</p></div>
-          <div className="intake-section">
-            <span>Work map</span>
-            {proposal.workNodes.map((node) => (
-              <p key={node.id}><strong>{node.title}</strong><br />{node.kind} · {node.description}</p>
-            ))}
+          <div className="intake-summary-grid">
+            <div><span>Work nodes</span><strong>{proposal.workNodes?.length ?? 0} proposed</strong></div>
+            <div><span>Human checkpoints</span><strong>{proposal.humanGates?.length ?? 0} proposed</strong></div>
+            <div><span>Assumptions</span><strong>{proposal.assumptions?.length ?? 0}</strong></div>
+            <div><span>Unresolved</span><strong>{proposal.unresolved?.length ?? 0}</strong></div>
           </div>
-          <div className="intake-section"><span>Assumptions</span><p>{proposal.assumptions?.join(" · ") || "None provided."}</p></div>
-          <div className="intake-section"><span>Unresolved questions</span><p>{proposal.unresolved?.join(" · ") || "None provided."}</p></div>
-          <div className="intake-section"><span>Human checkpoints</span>{proposal.humanGates.map((gate) => <p key={gate.id}>{gate.title}</p>)}</div>
+          <details className="intake-details">
+            <summary>Inspect proposed details</summary>
+            <div className="intake-section"><span>Context summary</span><p>{proposal.context?.summary || "No context summary provided."}</p></div>
+            <div className="intake-section"><span>Human checkpoints</span>{proposal.humanGates?.map((gate) => <p key={gate.id}>{gate.title}</p>)}</div>
+          </details>
         </div>
       )}
 
@@ -1980,7 +1995,7 @@ function EpisodeIntakePanel({
           <button type="button" onClick={onClose}>Close</button>
         ) : (
           <>
-            <button type="button" onClick={onRequestRevision}>Regenerate / Request revision</button>
+            <button type="button" onClick={onRequestRevision}>Request revision</button>
             <button type="button" onClick={onAccept} className="primary">Accept structure</button>
           </>
         )}
@@ -3580,8 +3595,24 @@ export default function App() {
     };
   }
 
+  function getOrchestrationSourceNode(nodeId) {
+    const renderedNode = nodes.find((node) => node.id === nodeId);
+    if (renderedNode) return renderedNode;
+    const workflowNode = getVisibleStageNodes().find((node) => node.id === nodeId);
+    return workflowNode
+      ? {
+          id: workflowNode.id,
+          kind: workflowNode.kind,
+          data: {
+            workflowKind: workflowNode.kind,
+            proposed: workflowNode.proposed === true,
+          },
+        }
+      : null;
+  }
+
   function getLocalOrchestrationRequest(nodeId) {
-    const node = nodes.find((item) => item.id === nodeId);
+    const node = getOrchestrationSourceNode(nodeId);
     if (
       !activeEpisode ||
       !nodeId ||
@@ -3605,7 +3636,7 @@ export default function App() {
   }
 
   function getLocalOrchestrationPlan(nodeId) {
-    const node = nodes.find((item) => item.id === nodeId);
+    const node = getOrchestrationSourceNode(nodeId);
     if (
       !activeEpisode ||
       !nodeId ||
@@ -3635,7 +3666,7 @@ export default function App() {
   }
 
   function openNodeOrchestration(nodeId) {
-    const node = nodes.find((item) => item.id === nodeId);
+    const node = getOrchestrationSourceNode(nodeId);
     if (
       !activeEpisode ||
       !nodeId ||
@@ -4785,6 +4816,14 @@ export default function App() {
               workflowKind:
                 node.kind,
 
+              compactNode:
+                Boolean(
+                  node.proposed ||
+                  activeEpisode.workflow?.nodes?.some(
+                    (workflowNode) => workflowNode.id === node.id
+                  )
+                ),
+
               selected:
                 selectedNodeId === node.id,
 
@@ -4800,6 +4839,10 @@ export default function App() {
                 isOrchestrationEligibleNode({
                   id: node.id,
                   kind: node.kind,
+                  data: {
+                    workflowKind: node.kind,
+                    proposed: node.proposed === true,
+                  },
                 }),
 
               orchestrationSummary:
@@ -4870,7 +4913,8 @@ export default function App() {
         .filter(
           (item) =>
             item.stageIndex ===
-            viewStage
+            viewStage &&
+            isDurableArtifact(item)
         )
         .map((item) => {
           const position =
@@ -4880,66 +4924,6 @@ export default function App() {
               item.id
             ] ??
             item.position;
-
-          if (
-            item.kind ===
-            "thread"
-          ) {
-            const first =
-              firstHumanMessage(
-                item
-              );
-
-            const latestAgent =
-              latestAgentMessage(
-                item
-              );
-
-            return {
-              id:
-                item.id,
-
-              type:
-                "thread",
-
-              position,
-
-              data: {
-                question:
-                  first?.content ??
-                  "Node conversation",
-
-                preview:
-                  latestAgent?.content ??
-                  "",
-
-                messageCount:
-                  item.messages
-                    ?.length ?? 0,
-
-                pending:
-                  item.status ===
-                  "pending",
-
-                secondary:
-                  true,
-
-                onOpen: () => {
-                  setSelectedNodeId(
-                    item.parentNodeId
-                  );
-
-                  setActiveThreadId(
-                    item.id
-                  );
-
-                  setDrawerOpen(
-                    true
-                  );
-                },
-              },
-            };
-          }
 
           const stats =
             getThreadStats(
@@ -4957,7 +4941,7 @@ export default function App() {
 
             position,
 
-            data: {
+              data: {
               label:
                 item.label,
 
@@ -4967,8 +4951,12 @@ export default function App() {
               title:
                 item.title,
 
-              body:
+                body:
                 item.body,
+
+                durableArtifact: true,
+
+                compactNode: true,
 
               meta:
                 item.meta,
@@ -4993,15 +4981,15 @@ export default function App() {
     const orchestrationPlan =
       orchestrationPreviews[orchestrationNodeId]?.plan ??
       getLocalOrchestrationPlan(orchestrationNodeId);
+    const orchestrationSourceNode = getOrchestrationSourceNode(orchestrationNodeId);
+    const orchestrationEligible = isOrchestrationEligibleNode(orchestrationSourceNode);
     const orchestrationExecutionState =
       orchestrationPreviews[orchestrationNodeId]?.executionState ?? {};
 
     const orchestrationNodes =
       orchestrationExpanded &&
       orchestrationNodeId &&
-      ORCHESTRATION_ELIGIBLE_NODES.has(
-        orchestrationNodeId
-      ) &&
+      orchestrationEligible &&
       isValidOrchestrationPlan(orchestrationPlan)
         ? buildOrchestrationPreviewNodes(
             orchestrationNodeId,
@@ -5069,8 +5057,20 @@ export default function App() {
       ];
     }
 
+    const primaryStageEdges = visibleStageEdges.filter(
+      ([source, target]) => viewStage !== 0 || source === "work" || target === "gate"
+    );
+    const focusedStageEdges = selectedNodeId
+      ? visibleStageEdges.filter(([source, target]) => source === selectedNodeId || target === selectedNodeId)
+      : [];
+    const stageEdges = Array.from(
+      new Map(
+        [...primaryStageEdges, ...focusedStageEdges].map((edge) => [edge.join("→"), edge])
+      ).values()
+    );
+
     const baseEdges =
-      visibleStageEdges.map(
+      stageEdges.map(
         (
           [
             source,
@@ -5097,7 +5097,9 @@ export default function App() {
           className:
             intake?.status === "proposed" && viewStage === 0
               ? "proposed-edge"
-              : "governed-edge",
+              : primaryStageEdges.some(([primarySource, primaryTarget]) => primarySource === source && primaryTarget === target)
+              ? "governed-edge"
+              : "dependency-edge",
         })
       );
 
@@ -5110,7 +5112,9 @@ export default function App() {
           (item) =>
             item.stageIndex ===
               viewStage &&
-            item.parentNodeId
+            item.parentNodeId &&
+            isDurableArtifact(item) &&
+            (item.parentNodeId === selectedNodeId || item.id === selectedNodeId)
         )
         .map((item) => ({
           id:
@@ -5138,13 +5142,13 @@ export default function App() {
     const orchestrationPlan =
       orchestrationPreviews[orchestrationNodeId]?.plan ??
       getLocalOrchestrationPlan(orchestrationNodeId);
+    const orchestrationSourceNode = getOrchestrationSourceNode(orchestrationNodeId);
+    const orchestrationEligible = isOrchestrationEligibleNode(orchestrationSourceNode);
 
     const orchestrationEdges =
       orchestrationExpanded &&
       orchestrationNodeId &&
-      ORCHESTRATION_ELIGIBLE_NODES.has(
-        orchestrationNodeId
-      ) &&
+      orchestrationEligible &&
       isValidOrchestrationPlan(orchestrationPlan)
         ? buildOrchestrationPreviewEdges(
             orchestrationNodeId,
@@ -7012,7 +7016,9 @@ export default function App() {
                   setAnchoredConversationMinimized(true)
                 }
                 orchestrationEligible={Boolean(
-                  ORCHESTRATION_ELIGIBLE_NODES.has(selectedNodeId)
+                  isOrchestrationEligibleNode(
+                    getOrchestrationSourceNode(selectedNodeId)
+                  )
                 )}
                 orchestrationApproved={
                   orchestrationPreviews[selectedNodeId]?.state ===
