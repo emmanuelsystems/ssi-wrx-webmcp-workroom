@@ -39,6 +39,8 @@ import {
   normalizeProjects,
 } from "./projects";
 
+import StatusIndicator from "./StatusIndicator";
+
 import "./App.css";
 
 /* -------------------------------------------------------------------------- */
@@ -67,6 +69,30 @@ function compactArtifactSummary(value) {
   const summary = value?.replace(/\s+/g, " ").trim() ?? "";
   if (summary.length <= 120) return summary;
   return `${summary.slice(0, 117).replace(/\s+$/, "")}…`;
+}
+
+function createActivityEvent({
+  episodeId,
+  type,
+  actor,
+  title,
+  summary = "",
+  metadata = {},
+  relatedNodeId = null,
+  authorityImpact = null,
+}) {
+  return {
+    id: `activity-${crypto.randomUUID()}`,
+    episodeId,
+    timestamp: new Date().toISOString(),
+    type,
+    actor: { kind: actor },
+    title,
+    summary,
+    metadata,
+    relatedNodeId,
+    authorityImpact,
+  };
 }
 
 function deriveEpisodeName(title) {
@@ -578,6 +604,16 @@ function normalizeEpisode(
     },
 
     projectId: episode.projectId ?? null,
+
+    runtime: {
+      codex: {
+        intakeThreadId: episode.runtime?.codex?.intakeThreadId ?? null,
+        lastRunAt: episode.runtime?.codex?.lastRunAt ?? null,
+        lastError: episode.runtime?.codex?.lastError ?? null,
+      },
+    },
+
+    activity: Array.isArray(episode.activity) ? episode.activity : [],
   };
 }
 
@@ -858,11 +894,11 @@ function NewEpisodeModal({
                 checked={setupMode === "agent-assisted"}
                 onChange={() => setSetupMode("agent-assisted")}
               />
-              <span>Analyze and propose structure</span>
+              <span>Analyze with Codex</span>
             </label>
 
             <p>
-              An agent can analyze the Episode and propose the context, work
+              Local Codex can analyze the Episode and propose context, work
               inquiries, action areas, and human checkpoints. Nothing is
               accepted until you review it.
             </p>
@@ -1056,6 +1092,25 @@ function MessageBadge({
 /* NODES                                                                      */
 /* -------------------------------------------------------------------------- */
 
+function AgentIcon() {
+  return (
+    <svg className="agent-icon" viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="3" y="4" width="10" height="9" rx="2" />
+      <path d="M8 2v2M5.5 8h.01M10.5 8h.01M6 10.5h4" />
+    </svg>
+  );
+}
+
+function ActivityIcon() {
+  return (
+    <svg className="activity-icon" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M2.5 4.5h2M2.5 8h3M2.5 11.5h2M7 4.5h6.5M8 8h5.5M7 11.5h6.5" />
+      <circle cx="6" cy="4.5" r="1" />
+      <circle cx="6" cy="11.5" r="1" />
+    </svg>
+  );
+}
+
 function CardNode({
   data,
   selected,
@@ -1151,17 +1206,33 @@ function CardNode({
         </button>
       )}
 
-      {(data.durableArtifact || data.compactNode) && (
-        <button
-          type="button"
-          className="artifact-view-details nodrag"
-          onClick={(event) => {
-            event.stopPropagation();
-            data.onOpenThread();
-          }}
-        >
-          View details
-        </button>
+      {(data.durableArtifact || data.compactNode || (data.orchestrationEligible && data.selected)) && (
+        <div className="node-action-row nodrag">
+          <button
+            type="button"
+            className="action-button action-button-secondary"
+            onClick={(event) => {
+              event.stopPropagation();
+              (data.onViewDetails ?? data.onOpenThread)?.();
+            }}
+          >
+            View details
+          </button>
+
+          {data.orchestrationEligible && data.selected && (
+            <button
+              type="button"
+              className="action-button action-button-primary node-orchestrate-button"
+              onClick={(event) => {
+                event.stopPropagation();
+                data.onOpenOrchestration?.();
+              }}
+            >
+              <AgentIcon />
+              {data.orchestrationApproved ? "View orchestration" : "Orchestrate"}
+            </button>
+          )}
+        </div>
       )}
 
       <Handle
@@ -1586,19 +1657,11 @@ function _OrchestrationPreviewLayer({
         <span className="preview-node-label">First Mate</span>
         <strong>Orchestrator</strong>
         <span>3 specialist agents · 4 assigned tasks</span>
-        <span className="orchestration-summary-status complete">
-          <span className="status-dot" /> 2 complete
-        </span>
-        <span className="orchestration-summary-status working">
-          <span className="status-dot" /> 1 working
-        </span>
-        <span className="orchestration-summary-status human-required">
-          <span className="status-dot" /> 1 human required
-        </span>
+        <StatusIndicator status="complete" label="2 complete" size="sm" className="orchestration-summary-status" />
+        <StatusIndicator status="working" label="1 working" size="sm" className="orchestration-summary-status" />
+        <StatusIndicator status="human-required" label="1 human required" size="sm" className="orchestration-summary-status" />
         {humanAttentionRequired && (
-          <span className="orchestration-attention">
-            <span className="status-dot" /> Human attention required
-          </span>
+          <StatusIndicator status="human-required" label="Human attention required" size="sm" className="orchestration-attention" />
         )}
       </button>
 
@@ -1614,14 +1677,7 @@ function _OrchestrationPreviewLayer({
           >
             <span className="preview-node-label">{agent.role}</span>
             <strong>{agent.task}</strong>
-            <span
-              className={`preview-agent-status ${orchestrationStatusClass(
-                agent.status
-              )}`}
-            >
-              <span className="status-dot" />
-              {agent.status}
-            </span>
+            <StatusIndicator status={agent.status} label={agent.status} size="sm" className="preview-agent-status" />
             <span>{agent.result}</span>
           </button>
         ))}
@@ -1694,14 +1750,7 @@ function OrchestrationDetailCard({
         <>
           <div className="orchestration-detail-section">
             <span>Status</span>
-            <p
-              className={`orchestration-detail-status ${orchestrationStatusClass(
-                selectedAgent?.status ?? "Waiting"
-              )}`}
-            >
-              <span className="status-dot" />
-              {selectedAgent?.status}
-            </p>
+            <StatusIndicator status={selectedAgent?.status ?? "Waiting"} label={selectedAgent?.status ?? "Waiting"} size="md" className="orchestration-detail-status" />
           </div>
           <div className="orchestration-detail-section">
             <span>Input</span>
@@ -1887,8 +1936,7 @@ function OrchestrationBadge({
       aria-label={`${summary.total} agents in orchestration preview`}
       title="Open node orchestration preview"
     >
-      <span className="status-dot" />
-      {summary.total} agents
+      <StatusIndicator status={status} label={`${summary.total} agents`} size="sm" />
     </button>
   );
 }
@@ -1899,10 +1947,7 @@ function OrchestrationPreviewNode({ data }) {
       <Handle type="target" position={Position.Top} id="flow-target" className="flow-handle" />
       <div className="node-label">{data.label}</div>
       <div className="node-title">{data.title}</div>
-      <div className={`orchestration-flow-status ${data.status}`}>
-        <span className="status-dot" />
-        {data.statusLabel}
-      </div>
+      <StatusIndicator status={data.status} label={data.statusLabel} size="sm" className="orchestration-flow-status" />
       <div className="node-meta">{data.result}</div>
       <Handle type="source" position={Position.Bottom} id="flow-source" className="flow-handle" />
     </div>
@@ -1940,13 +1985,21 @@ function EpisodeIntakePanel({
   onClose,
   onRequestRevision,
   onAccept,
+  codexRunning = false,
+  codexStatus,
+  codexRun,
+  onCancelAnalysis,
+  onRetryAnalysis,
 }) {
+  const [revisionInstruction, setRevisionInstruction] = useState("");
+
   if (!open || !episode || !intake || intake.status === "idle") {
     return null;
   }
 
   const request = intake.request ?? createEpisodeIntakeRequest({ episode });
   const proposal = intake.proposal;
+  const activity = (codexRun?.events ?? []).filter((event) => ["activity", "milestone", "phase"].includes(event.type)).slice(-8);
 
   return (
     <aside className="episode-intake-panel" aria-label="Episode intake">
@@ -1958,17 +2011,24 @@ function EpisodeIntakePanel({
               ? "Agent structuring"
               : "Proposed episode structure"}
           </h2>
+          {intake.status === "pending" && <div className="intake-live-status"><StatusIndicator status={codexRunning ? "working" : codexRun?.status === "error" ? "error" : "waiting"} label={codexRunning ? "Working" : codexRun?.status === "error" ? "Analysis failed" : "Awaiting analysis"} size="md" /></div>}
+          {intake.status === "proposed" && <div className="intake-live-status"><StatusIndicator status="complete" label="Complete · Review required" size="md" /></div>}
         </div>
         <button type="button" onClick={onClose} aria-label="Close intake">×</button>
       </header>
 
       {intake.status === "pending" && (
         <div className="episode-intake-panel-body">
-          <strong>Awaiting agent analysis</strong>
-          <p>The agent will propose a work map for human review. Nothing is accepted yet.</p>
+          <strong>{codexRunning ? "Codex analysis in progress" : "Awaiting agent analysis"}</strong>
+          <p>{codexRunning ? "Local Codex is analyzing this Episode in read-only mode." : "The Episode is pending analysis. Nothing is accepted yet."}</p>
+          {!codexRunning && codexStatus?.authenticated === false && <p>Codex sign-in required. Run Codex login in your terminal, then retry analysis.</p>}
           <div className="intake-request-list">
             {request.requestedAnalysis.map((item) => <span key={item}>• {item}</span>)}
           </div>
+          {codexRun?.todos?.length > 0 && <div className="intake-progress"><span>Progress</span>{codexRun.todos.map((item) => <div key={item.label}><StatusIndicator status={item.status} label={item.label} size="sm" /></div>)}</div>}
+          {activity.length > 0 && <div className="intake-activity"><span>Activity</span>{activity.map((event, index) => <div key={`${event.occurredAt ?? "event"}-${index}`}>{event.label}{event.detail ? ` · ${event.detail}` : ""}</div>)}</div>}
+          {codexRun?.status === "error" && <div className="intake-error">Codex analysis failed{codexRun.error ? `: ${codexRun.error}` : "."}</div>}
+          {codexRun?.status === "cancelled" && <div className="intake-error">Analysis cancelled. No proposal changes were applied.</div>}
         </div>
       )}
 
@@ -1987,15 +2047,19 @@ function EpisodeIntakePanel({
             <div className="intake-section"><span>Context summary</span><p>{proposal.context?.summary || "No context summary provided."}</p></div>
             <div className="intake-section"><span>Human checkpoints</span>{proposal.humanGates?.map((gate) => <p key={gate.id}>{gate.title}</p>)}</div>
           </details>
+          <label className="intake-revision-field">
+            <span>Revision instruction <em>Optional</em></span>
+            <textarea rows="2" value={revisionInstruction} onChange={(event) => setRevisionInstruction(event.target.value)} placeholder="e.g. Split evidence verification from context recovery." />
+          </label>
         </div>
       )}
 
       <footer>
         {intake.status === "pending" ? (
-          <button type="button" onClick={onClose}>Close</button>
+          codexRunning ? <button type="button" onClick={onCancelAnalysis}>Cancel analysis</button> : codexRun?.status === "error" ? <button type="button" onClick={onRetryAnalysis}>Retry analysis</button> : <button type="button" onClick={onClose}>Close</button>
         ) : (
           <>
-            <button type="button" onClick={onRequestRevision}>Request revision</button>
+            <button type="button" onClick={() => { onRequestRevision(revisionInstruction.trim()); setRevisionInstruction(""); }}>Request revision</button>
             <button type="button" onClick={onAccept} className="primary">Accept structure</button>
           </>
         )}
@@ -2063,9 +2127,7 @@ function OrchestrationDetailOverlay({
           </div>
           <div className="orchestration-detail-section">
             <span>Status</span>
-            <p className={`orchestration-detail-status ${orchestrationStatusClass(executionState[assignment?.id] ?? "Waiting")}`}>
-              <span className="status-dot" /> {executionState[assignment?.id] ?? "Waiting"}
-            </p>
+            <StatusIndicator status={executionState[assignment?.id] ?? "Waiting"} label={`Mock · ${executionState[assignment?.id] ?? "Waiting"}`} size="md" className="orchestration-detail-status" />
           </div>
           <div className="orchestration-detail-section">
             <span>Input · Expected output</span>
@@ -2372,14 +2434,11 @@ function NodeOrchestrationWindow({
                 <span>Coordinating {summary.total} agents · Preview approved</span>
                 <div className="node-orchestration-status-list">
                   {validPlan.assignments.map((assignment) => (
-                    <span key={assignment.id} className={orchestrationStatusClass(executionState[assignment.id] ?? "Waiting")}>
-                      <span className="status-dot" /> {assignment.role} · Mock {executionState[assignment.id] ?? "Waiting"}
-                    </span>
+                    <StatusIndicator key={assignment.id} status={executionState[assignment.id] ?? "Waiting"} label={`${assignment.role} · Mock ${executionState[assignment.id] ?? "Waiting"}`} size="sm" className="node-orchestration-status-list-item" />
                   ))}
                 </div>
                 <div className={`node-orchestration-human ${humanAttention ? "attention" : ""}`}>
-                  <span className="status-dot" />
-                  Human attention: {humanAttention ? "Required" : "None"}
+                  <StatusIndicator status={humanAttention ? "human-required" : "waiting"} label={`Human attention: ${humanAttention ? "Required" : "None"}`} size="sm" />
                 </div>
                 <span className="node-orchestration-mock-note">Mock execution state · Nothing has run.</span>
               </>
@@ -2755,6 +2814,8 @@ function NodeChatDrawer({
 
   canRemoveNode,
   onRemoveNode,
+  initialView = "conversation",
+  nodeDetails,
 }) {
   const [
     draft,
@@ -2771,6 +2832,9 @@ function NodeChatDrawer({
     thread?.status ===
     "pending";
 
+  const [view, setView] = useState(initialView);
+  const composerRef = useRef(null);
+
   useEffect(() => {
     if (!open) {
       return;
@@ -2782,6 +2846,16 @@ function NodeChatDrawer({
     anchorNodeId,
     thread?.id,
   ]);
+
+  useEffect(() => {
+    if (open) setView(initialView);
+  }, [open, initialView, anchorNodeId]);
+
+  useEffect(() => {
+    if (open && view === "conversation") {
+      composerRef.current?.focus();
+    }
+  }, [open, view]);
 
   useEffect(() => {
     if (!open) {
@@ -2860,7 +2934,7 @@ function NodeChatDrawer({
       <header className="drawer-header">
         <div className="drawer-header-copy">
           <div className="drawer-eyebrow">
-            Node conversation
+            {view === "details" ? "Branch node details" : "Node conversation"}
           </div>
 
           <h2>
@@ -2898,7 +2972,33 @@ function NodeChatDrawer({
         </button>
       </header>
 
-      <div className="drawer-thread">
+      <div className="drawer-tabs" role="tablist" aria-label="Node surface">
+        <button type="button" className={view === "details" ? "active" : ""} role="tab" aria-selected={view === "details"} onClick={() => setView("details")}>Details</button>
+        <button type="button" className={view === "conversation" ? "active" : ""} role="tab" aria-selected={view === "conversation"} onClick={() => setView("conversation")}>Conversation</button>
+      </div>
+
+      {view === "details" && (
+        <div className="drawer-node-details">
+          <div className="drawer-detail-eyebrow">{nodeDetails?.state ?? "Node details"} · {nodeDetails?.kind ?? anchorType}</div>
+          <h3>{anchorTitle}</h3>
+          {anchorNodeId === "context" && (
+            <section>
+              <span>Full context</span>
+              <p className="drawer-context-raw">{contextContent || "No additional context was provided yet."}</p>
+            </section>
+          )}
+          {nodeDetails?.description && <section><span>Purpose / Description</span><p>{nodeDetails.description}</p></section>}
+          {nodeDetails?.rationale && <section><span>Why this node exists</span><p>{nodeDetails.rationale}</p></section>}
+          {nodeDetails?.dependsOn?.length > 0 && <section><span>Dependencies</span>{nodeDetails.dependsOn.map((dependency) => <p key={dependency.id}>• {dependency.title}</p>)}</section>}
+          {nodeDetails?.expectedOutcome && <section><span>Expected outcome</span><p>{nodeDetails.expectedOutcome}</p></section>}
+          {nodeDetails?.provenance && <section><span>Source / Provenance</span><p>{nodeDetails.provenance}</p></section>}
+          {nodeDetails?.authority && <section><span>Authority</span><p>{nodeDetails.authority}</p></section>}
+          {nodeDetails?.acceptedAt && <section><span>Accepted by human</span><p>{new Date(nodeDetails.acceptedAt).toLocaleString()}</p></section>}
+          <button type="button" className="drawer-ask-agent-button" onClick={() => { setView("conversation"); window.setTimeout(() => composerRef.current?.focus(), 0); }}>Ask agent about this node</button>
+        </div>
+      )}
+
+      {view === "conversation" && <div className="drawer-thread">
         {anchorNodeId === "context" && (
           <section className="drawer-context-detail">
             <div className="drawer-eyebrow">Known context</div>
@@ -2972,14 +3072,15 @@ function NodeChatDrawer({
             bottomRef
           }
         />
-      </div>
+      </div>}
 
-      <form
+      {view === "conversation" && <form
         className="drawer-composer"
         onSubmit={submit}
       >
         <div className="drawer-composer-box">
           <textarea
+            ref={composerRef}
             value={draft}
             onChange={(
               event
@@ -3046,7 +3147,63 @@ function NodeChatDrawer({
             </button>
           )}
         </div>
-      </form>
+      </form>}
+    </aside>
+  );
+}
+
+function ActivityDrawer({ episode, open, onClose }) {
+  const [filter, setFilter] = useState("all");
+  const events = episode?.activity ?? [];
+  const filteredEvents = events.filter((event) => {
+    if (filter === "all") return true;
+    if (filter === "human") return event.actor?.kind === "human";
+    if (filter === "codex") return event.actor?.kind === "codex";
+    return ["proposal", "human-review", "accepted", "execution-preview"].includes(event.authorityImpact);
+  });
+  const interventions = events.filter((event) => event.actor?.kind === "human" && event.authorityImpact);
+
+  if (!open || !episode) return null;
+
+  return (
+    <aside id="episode-activity-drawer" className="activity-drawer" aria-label="Episode activity">
+      <header className="activity-header">
+        <div>
+          <div className="drawer-eyebrow">Episode activity</div>
+          <h2>{episode.id}</h2>
+          <p>{episode.name || episode.title}</p>
+        </div>
+        <button type="button" className="drawer-close" onClick={onClose} aria-label="Close Episode activity">×</button>
+      </header>
+
+      <div className="activity-body">
+        <section className="activity-snapshot">
+          <div className="activity-section-label">Current state</div>
+          <p><span>Stage</span>{EPISODE_STAGES[episode.currentStage]?.name}</p>
+          <p><span>Structure</span>{episode.intake?.status === "accepted" ? "Accepted" : episode.intake?.status === "proposed" ? "Proposed" : "Not accepted"}</p>
+          <p><span>Codex intake</span>{episode.runtime?.codex?.lastRunAt ? "Complete" : "Not run"}</p>
+          <p><span>Human disposition</span>{episode.disposition ?? "Not reached"}</p>
+        </section>
+
+        <section className="activity-interventions">
+          <div className="activity-section-label">Human interventions</div>
+          {interventions.length ? <><strong>{interventions.length} intervention{interventions.length === 1 ? "" : "s"}</strong>{interventions.slice(-3).map((event) => <p key={event.id}>{event.title}<small>{event.summary}</small></p>)}</> : <p>No explicit human intervention recorded yet.</p>}
+        </section>
+
+        <div className="activity-filters" role="tablist" aria-label="Activity filters">
+          {["all", "human", "codex", "governance"].map((value) => <button key={value} type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{value[0].toUpperCase() + value.slice(1)}</button>)}
+        </div>
+
+        <div className="activity-timeline">
+          {filteredEvents.length ? filteredEvents.map((event) => (
+            <article key={event.id} className={`activity-event ${event.authorityImpact ?? ""}`}>
+              <time>{new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
+              <div className="activity-event-marker" aria-hidden="true">{event.actor?.kind === "human" ? "♙" : event.actor?.kind === "codex" ? "●" : "•"}</div>
+              <div className="activity-event-copy"><strong>{event.title}</strong><span>{event.actor?.kind === "codex" ? "Codex" : event.actor?.kind === "human" ? "Human" : "System"}</span>{event.summary && <p>{event.summary}</p>}</div>
+            </article>
+          )) : <p className="activity-empty">No activity recorded for this filter.</p>}
+        </div>
+      </div>
     </aside>
   );
 }
@@ -3080,6 +3237,7 @@ export default function App() {
   const [episodeSearch, setEpisodeSearch] = useState("");
   const [expandedProjects, setExpandedProjects] = useState({});
   const [newEpisodeProjectId, setNewEpisodeProjectId] = useState(null);
+  const [workflowExpanded, setWorkflowExpanded] = useState(true);
 
   const [
     activeEpisodeId,
@@ -3113,6 +3271,18 @@ export default function App() {
     drawerOpen,
     setDrawerOpen,
   ] = useState(false);
+
+  const [
+    activityOpen,
+    setActivityOpen,
+  ] = useState(false);
+
+  const [activitySeenByEpisode, setActivitySeenByEpisode] = useState({});
+
+  const [
+    drawerView,
+    setDrawerView,
+  ] = useState("conversation");
 
   const [
     fullscreenOpen,
@@ -3153,6 +3323,17 @@ export default function App() {
     intakePanelOpen,
     setIntakePanelOpen,
   ] = useState(false);
+
+  const [codexStatus, setCodexStatus] = useState({
+    cliAvailable: false,
+    authenticated: false,
+    ready: false,
+    message: "Checking local Codex…",
+  });
+
+  const [codexRunningEpisodeId, setCodexRunningEpisodeId] = useState(null);
+  const [codexRun, setCodexRun] = useState(null);
+  const codexEventSourceRef = useRef(null);
 
   const [
     viewportRevision,
@@ -3272,6 +3453,17 @@ export default function App() {
   }, [projects]);
 
   useEffect(() => {
+    let cancelled = false;
+    fetch("/api/codex/status")
+      .then((response) => response.json())
+      .then((status) => { if (!cancelled) setCodexStatus(status); })
+      .catch(() => {
+        if (!cancelled) setCodexStatus({ cliAvailable: false, authenticated: false, ready: false, message: "Local Codex runtime unavailable" });
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useLayoutEffect(() => {
     if (!activeEpisode) {
       return;
     }
@@ -3279,6 +3471,8 @@ export default function App() {
     setViewStage(
       activeEpisode.currentStage
     );
+
+    setWorkflowExpanded(true);
 
     setSelectedNodeId(
       null
@@ -3291,6 +3485,10 @@ export default function App() {
     setDrawerOpen(
       false
     );
+
+    setFullscreenOpen(false);
+    setActivityOpen(false);
+    setDrawerView("details");
 
     setAnchoredConversationMinimized(false);
     setOrchestrationNodeId(null);
@@ -3323,6 +3521,13 @@ export default function App() {
               : episode
         )
     );
+  }
+
+  function appendActivity(episodeId, event) {
+    updateEpisode(episodeId, (episode) => ({
+      ...episode,
+      activity: [...(episode.activity ?? []), createActivityEvent({ episodeId, ...event })],
+    }));
   }
 
   function updateActiveEpisode(
@@ -3389,6 +3594,13 @@ export default function App() {
       return workflowNode.title;
     }
 
+    const proposalNode = episode.intake?.proposal?.workNodes?.find(
+      (node) => node.id === nodeId
+    );
+    if (proposalNode) {
+      return proposalNode.title;
+    }
+
     const addition =
       episode.additions?.find(
         (item) =>
@@ -3436,6 +3648,13 @@ export default function App() {
     );
     if (workflowNode) {
       return workflowNode.kind;
+    }
+
+    const proposalNode = episode.intake?.proposal?.workNodes?.find(
+      (node) => node.id === nodeId
+    );
+    if (proposalNode) {
+      return proposalNode.kind;
     }
 
     const addition =
@@ -3683,6 +3902,14 @@ export default function App() {
       orchestrationPreviews[nodeId]?.state ===
         "preview-approved"
     );
+    appendActivity(activeEpisode.id, {
+      type: "orchestration.requested",
+      actor: "human",
+      title: "Human requested orchestration preview",
+      summary: findNodeTitle(activeEpisode, viewStage, nodeId),
+      relatedNodeId: nodeId,
+      authorityImpact: "execution-preview",
+    });
   }
 
   function previewFirstMate() {
@@ -3697,6 +3924,14 @@ export default function App() {
         plan: getLocalOrchestrationPlan(orchestrationNodeId),
       },
     }));
+    appendActivity(activeEpisode.id, {
+      type: "orchestration.plan_created",
+      actor: "system",
+      title: "Local planner created orchestration proposal",
+      summary: "Preview only · no execution occurred.",
+      relatedNodeId: orchestrationNodeId,
+      authorityImpact: "execution-preview",
+    });
   }
 
   function backToOrchestrationRequest() {
@@ -3736,6 +3971,14 @@ export default function App() {
     });
     setOrchestrationExpanded(true);
     setOrchestrationMinimized(false);
+    appendActivity(activeEpisode.id, {
+      type: "orchestration.preview_approved",
+      actor: "human",
+      title: "Human approved orchestration preview",
+      summary: "Mock execution state · nothing has run.",
+      relatedNodeId: orchestrationNodeId,
+      authorityImpact: "execution-preview",
+    });
   }
 
   function resetOrchestrationPreview() {
@@ -3792,21 +4035,49 @@ export default function App() {
         proposal: normalizedProposal,
       },
     }));
+    appendActivity(episode.id, {
+      type: "proposal.created",
+      actor: "codex",
+      title: "Episode structure proposed",
+      summary: `${normalizedProposal.workNodes.length} work nodes · ${normalizedProposal.humanGates.length} human checkpoints`,
+      metadata: {
+        afterWorkNodeCount: normalizedProposal.workNodes.length,
+        afterHumanGateCount: normalizedProposal.humanGates.length,
+      },
+      authorityImpact: "proposal",
+    });
     setActiveEpisodeId(episode.id);
     setViewStage(0);
     setIntakePanelOpen(true);
     return normalizedProposal;
   }
 
-  function requestIntakeRevision() {
+  function requestIntakeRevision(revisionInstruction = "") {
     if (!activeEpisode) return;
+    const previousProposal = activeEpisode.intake?.proposal;
+    appendActivity(activeEpisode.id, {
+      type: "proposal.revision_requested",
+      actor: "human",
+      title: "Human requested revision",
+      summary: revisionInstruction.trim() || "Requested a revised Episode structure.",
+      metadata: {
+        beforeWorkNodeCount: previousProposal?.workNodes?.length ?? 0,
+        beforeHumanGateCount: previousProposal?.humanGates?.length ?? 0,
+        beforeProposalId: previousProposal?.id ?? null,
+      },
+      authorityImpact: "human-review",
+    });
     updateEpisode(activeEpisode.id, (episode) => ({
       ...episode,
       intake: {
         ...normalizeEpisodeIntake(episode.intake),
         status: "pending",
+        previousProposal: episode.intake?.proposal ?? null,
       },
     }));
+    if (activeEpisode.runtime?.codex?.intakeThreadId) {
+      void runNativeCodexIntake(activeEpisode, revisionInstruction);
+    }
   }
 
   function acceptEpisodeStructure() {
@@ -3822,6 +4093,10 @@ export default function App() {
       title: node.title,
       body: node.description,
       meta: node.rationale,
+      description: node.description,
+      rationale: node.rationale,
+      dependsOn: node.dependsOn ?? [],
+      expectedOutcome: node.expectedOutcome,
       position: {
         x: 120 + (index % 3) * 330,
         y: 300 + Math.floor(index / 3) * 240,
@@ -3851,12 +4126,84 @@ export default function App() {
         ],
       },
     }));
+    appendActivity(activeEpisode.id, {
+      type: "proposal.accepted",
+      actor: "human",
+      title: "Structure accepted",
+      summary: `${proposal.workNodes?.length ?? 0} work nodes · ${proposal.humanGates?.length ?? 0} human checkpoints`,
+      metadata: {
+        proposalId: proposal.id ?? null,
+        workNodeCount: proposal.workNodes?.length ?? 0,
+        humanGateCount: proposal.humanGates?.length ?? 0,
+      },
+      authorityImpact: "accepted",
+    });
     setIntakePanelOpen(false);
   }
 
   /* ---------------------------------------------------------------------- */
   /* OPEN CHAT                                                              */
   /* ---------------------------------------------------------------------- */
+
+  function getNodeDetails(nodeId) {
+    if (!activeEpisode || !nodeId) {
+      return null;
+    }
+
+    const workflowNode = activeEpisode.workflow?.nodes?.find(
+      (node) => node.id === nodeId
+    );
+    const proposalNode = activeEpisode.intake?.proposal?.workNodes?.find(
+      (node) => node.id === nodeId
+    );
+    const addition = activeEpisode.additions?.find(
+      (item) => item.id === nodeId
+    );
+    const baseNode = findBaseNode(viewStage, nodeId);
+    const source = workflowNode ?? proposalNode ?? addition ?? baseNode;
+
+    if (!source) {
+      return null;
+    }
+
+    const dependencies = source.dependsOn?.length
+      ? source.dependsOn
+      : workflowNode
+      ? (activeEpisode.workflow?.edges ?? [])
+          .filter((edge) => edge[1] === nodeId && edge[0] !== "work")
+          .map((edge) => edge[0])
+      : source.parentNodeId
+      ? [source.parentNodeId]
+      : [];
+    const dependencyTitles = dependencies.map((dependencyId) => ({
+      id: dependencyId,
+      title: findNodeTitle(activeEpisode, viewStage, dependencyId),
+    }));
+    const expectedOutcome =
+      source.expectedOutcome ?? source.output ?? source.expectedOutput;
+    const isProposal = Boolean(proposalNode) && !workflowNode;
+    const isAccepted = Boolean(workflowNode);
+
+    return {
+      state: isProposal
+        ? "Proposed · Not accepted"
+        : isAccepted
+        ? "Accepted work node"
+        : "Node details",
+      kind: source.workflowKind ?? source.kind ?? source.type ?? "work node",
+      description: source.description ?? source.body,
+      rationale: source.rationale ?? source.meta,
+      dependsOn: dependencyTitles,
+      expectedOutcome,
+      provenance: isProposal || isAccepted
+        ? `Codex Episode Intake · Episode ${activeEpisode.id}`
+        : null,
+      authority: isProposal || isAccepted
+        ? "Analysis / proposal only. No execution or stage advancement."
+        : null,
+      acceptedAt: isAccepted ? activeEpisode.intake?.acceptedAt : null,
+    };
+  }
 
   function openContextDrawer() {
     if (!activeEpisode) {
@@ -3866,6 +4213,20 @@ export default function App() {
     setSelectedNodeId("context");
     setActiveThreadId(null);
     setAnchoredConversationMinimized(false);
+    setDrawerView("details");
+    setDrawerOpen(true);
+  }
+
+  function openDetailsForNode(nodeId) {
+    if (!activeEpisode || !nodeId || !getNodeDetails(nodeId)) {
+      return;
+    }
+
+    const stats = getThreadStats(activeEpisode, viewStage, nodeId);
+    setSelectedNodeId(nodeId);
+    setActiveThreadId(stats.latestThread?.id ?? null);
+    setAnchoredConversationMinimized(false);
+    setDrawerView("details");
     setDrawerOpen(true);
   }
 
@@ -3905,6 +4266,7 @@ export default function App() {
 
       setAnchoredConversationMinimized(false);
 
+      setDrawerView("conversation");
       setDrawerOpen(false);
 
       return;
@@ -3933,6 +4295,7 @@ export default function App() {
         null
     );
 
+    setDrawerView("conversation");
     setDrawerOpen(false);
   }
 
@@ -4331,6 +4694,22 @@ export default function App() {
       },
 
       projectId: projectId ?? null,
+
+      runtime: {
+        codex: {
+          intakeThreadId: null,
+          lastRunAt: null,
+          lastError: null,
+        },
+      },
+
+      activity: [createActivityEvent({
+        episodeId: id,
+        type: "episode.created",
+        actor: "human",
+        title: "Episode created",
+        summary: name || deriveEpisodeName(title),
+      })],
     };
 
     if (setupMode === "agent-assisted") {
@@ -4362,6 +4741,125 @@ export default function App() {
       false
     );
     setNewEpisodeProjectId(null);
+
+    if (setupMode === "agent-assisted") {
+      void runNativeCodexIntake(episode);
+    }
+  }
+
+  async function runNativeCodexIntake(episode, revisionInstruction = "") {
+    if (!episode?.id || codexRunningEpisodeId) return;
+    const isRevision = Boolean(revisionInstruction.trim() || episode.runtime?.codex?.intakeThreadId);
+    appendActivity(episode.id, {
+      type: isRevision ? "codex.intake.revision_started" : "codex.intake.started",
+      actor: "codex",
+      title: isRevision ? "Codex revision started" : "Codex intake started",
+      summary: isRevision ? "Revising the proposed Episode structure." : "Analyzing the Episode in read-only mode.",
+      authorityImpact: "proposal",
+    });
+    setCodexRunningEpisodeId(episode.id);
+    setCodexRun({ episodeId: episode.id, status: "working", currentPhase: "Starting analysis", events: [], todos: [], runId: null, startedAt: new Date().toISOString() });
+    updateEpisode(episode.id, (current) => ({
+      ...current,
+      intake: { ...normalizeEpisodeIntake(current.intake), status: "pending" },
+      runtime: { codex: { ...(current.runtime?.codex ?? {}), lastError: null } },
+    }));
+    try {
+      const response = await fetch("/api/codex/episode-intake/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          episodeId: episode.id,
+          episodeName: episode.name,
+          objective: episode.title,
+          context: episode.context,
+          threadId: episode.runtime?.codex?.intakeThreadId ?? null,
+          revisionInstruction,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.runId) throw new Error(result.message || "Local Codex runtime unavailable.");
+      setCodexRun((current) => ({ ...current, runId: result.runId }));
+      const eventSource = new EventSource(`/api/codex/runs/${result.runId}/events`);
+      codexEventSourceRef.current = eventSource;
+      eventSource.onmessage = (event) => {
+        const normalized = JSON.parse(event.data);
+        setCodexRun((current) => {
+          if (!current || current.episodeId !== episode.id) return current;
+          const next = { ...current, events: [...(current.events ?? []), normalized].slice(-50) };
+          if (normalized.type === "phase") next.currentPhase = normalized.label;
+          if (normalized.type === "todo") next.todos = normalized.items ?? [];
+          if (normalized.type === "activity") next.currentPhase = normalized.label;
+          if (normalized.type === "completed") next.status = "complete";
+          if (normalized.type === "error") next.status = "error";
+          if (normalized.type === "cancelled") next.status = "cancelled";
+          return next;
+        });
+        if (normalized.type === "completed" && normalized.proposal) {
+          updateEpisode(episode.id, (current) => ({
+            ...current,
+            intake: { ...normalizeEpisodeIntake(current.intake), status: "proposed", proposal: normalized.proposal },
+            runtime: { codex: { intakeThreadId: normalized.threadId ?? current.runtime?.codex?.intakeThreadId ?? null, lastRunAt: new Date().toISOString(), lastError: null } },
+          }));
+          appendActivity(episode.id, {
+            type: isRevision ? "codex.intake.completed" : "codex.intake.completed",
+            actor: "codex",
+            title: "Codex intake completed",
+            summary: "Structured proposal returned for human review.",
+            metadata: { threadId: normalized.threadId ?? null },
+            authorityImpact: "proposal",
+          });
+          appendActivity(episode.id, {
+            type: isRevision ? "proposal.revised" : "proposal.created",
+            actor: "codex",
+            title: isRevision ? "Episode structure revised" : "Episode structure proposed",
+            summary: `${normalized.proposal.workNodes?.length ?? 0} work nodes · ${normalized.proposal.humanGates?.length ?? 0} human checkpoints`,
+            metadata: {
+              afterWorkNodeCount: normalized.proposal.workNodes?.length ?? 0,
+              afterHumanGateCount: normalized.proposal.humanGates?.length ?? 0,
+              previousProposalId: isRevision ? episode.intake?.proposal?.id ?? null : null,
+            },
+            authorityImpact: "proposal",
+          });
+          if (activeEpisodeId === episode.id) setIntakePanelOpen(true);
+          eventSource.close();
+          codexEventSourceRef.current = null;
+          setCodexRunningEpisodeId(null);
+        }
+        if (["error", "cancelled"].includes(normalized.type)) {
+          appendActivity(episode.id, {
+            type: "codex.intake.failed",
+            actor: "codex",
+            title: "Codex intake failed",
+            summary: normalized.message || "No proposal changes were applied.",
+          });
+          updateEpisode(episode.id, (current) => ({ ...current, runtime: { codex: { ...(current.runtime?.codex ?? {}), lastError: normalized.message } } }));
+          eventSource.close();
+          codexEventSourceRef.current = null;
+          setCodexRunningEpisodeId(null);
+        }
+      };
+      eventSource.onerror = () => {
+        setCodexRun((current) => current ? { ...current, status: "error", error: "Local Codex runtime unavailable." } : current);
+        eventSource.close();
+        codexEventSourceRef.current = null;
+        setCodexRunningEpisodeId(null);
+      };
+    } catch (error) {
+      updateEpisode(episode.id, (current) => ({ ...current, runtime: { codex: { ...(current.runtime?.codex ?? {}), lastError: error.message || "Local Codex runtime unavailable." } } }));
+      setCodexRun((current) => ({ ...current, status: "error", error: error.message || "Local Codex runtime unavailable." }));
+      if (activeEpisodeId === episode.id) setIntakePanelOpen(true);
+      setCodexRunningEpisodeId(null);
+    }
+  }
+
+  function cancelNativeCodexIntake() {
+    if (!codexRun?.runId) return;
+    void fetch(`/api/codex/runs/${codexRun.runId}`, { method: "DELETE" });
+    codexEventSourceRef.current?.close();
+    codexEventSourceRef.current = null;
+    setCodexRun((current) => current ? { ...current, status: "cancelled", error: "Analysis cancelled. No proposal changes were applied." } : current);
+    setCodexRunningEpisodeId(null);
   }
 
   function createProject({ name, description }) {
@@ -4444,6 +4942,14 @@ export default function App() {
       })
     );
 
+    appendActivity(activeEpisode.id, {
+      type: "stage.advanced",
+      actor: "human",
+      title: "Human advanced Episode stage",
+      summary: `${EPISODE_STAGES[activeEpisode.currentStage]?.name} → ${EPISODE_STAGES[nextStage]?.name}`,
+      authorityImpact: "accepted",
+    });
+
     setViewStage(
       nextStage
     );
@@ -4479,6 +4985,13 @@ export default function App() {
           "resolved",
       })
     );
+    appendActivity(activeEpisode.id, {
+      type: "human.disposition_recorded",
+      actor: "human",
+      title: "Human disposition recorded",
+      summary: disposition,
+      authorityImpact: "accepted",
+    });
   }
 
   /* ---------------------------------------------------------------------- */
@@ -4652,6 +5165,16 @@ export default function App() {
     ) {
       return;
     }
+
+    const nodeId = activeThread?.parentNodeId ?? selectedNodeId;
+    appendActivity(activeEpisode.id, {
+      type: "node.question_asked",
+      actor: "human",
+      title: "Human asked node question",
+      summary: compactArtifactSummary(content),
+      relatedNodeId: nodeId,
+      authorityImpact: "human-review",
+    });
 
     if (activeThread) {
       addThreadFollowUp(
@@ -4835,6 +5358,9 @@ export default function App() {
               onViewContext: () =>
                 openContextDrawer(),
 
+              onViewDetails: () =>
+                openDetailsForNode(node.id),
+
               orchestrationEligible:
                 isOrchestrationEligibleNode({
                   id: node.id,
@@ -4974,6 +5500,9 @@ export default function App() {
                 openDrawerForNode(
                   item.id
                 ),
+
+              onViewDetails: () =>
+                openDetailsForNode(item.id),
             },
           };
         });
@@ -5186,27 +5715,17 @@ export default function App() {
       nextEdges
     );
 
-    if (
-      !selectedNodeId ||
-      !nextNodes.find(
-        (node) =>
-          node.id ===
-          selectedNodeId
-      )
-    ) {
-      const firstSelectable =
-        nextNodes.find(
-          (node) =>
-            node.type !==
-            "gate" &&
-            node.type !==
-            "thread"
-        );
+    const selectedNodeStillExists = selectedNodeId && nextNodes.some(
+      (node) => node.id === selectedNodeId
+    );
 
-      setSelectedNodeId(
-        firstSelectable?.id ??
-          null
-      );
+    if (selectedNodeId && !selectedNodeStillExists) {
+      setSelectedNodeId(null);
+      setActiveThreadId(null);
+      setDrawerOpen(false);
+      setFullscreenOpen(false);
+      setAnchoredConversationMinimized(false);
+      return;
     }
 
   }, [
@@ -5746,13 +6265,17 @@ export default function App() {
         false,
     },
 
-    execute:
+      execute:
       async ({
         promptId,
         response,
       }) => {
         let found =
           false;
+
+        let responseEpisodeId = null;
+        let responseNodeId = null;
+        let responseNodeTitle = "Node";
 
         let pending =
           false;
@@ -5772,6 +6295,10 @@ export default function App() {
                 ) {
                   found =
                     true;
+
+                  responseEpisodeId = episode.id;
+                  responseNodeId = item.parentNodeId;
+                  responseNodeTitle = findNodeTitle(episode, item.stageIndex, item.parentNodeId);
 
                   pending =
                     item.status ===
@@ -5839,6 +6366,15 @@ export default function App() {
               })
             )
         );
+
+        appendActivity(responseEpisodeId, {
+          type: "node.agent_response_received",
+          actor: "codex",
+          title: "Agent responded to node question",
+          summary: `${responseNodeTitle}: ${compactArtifactSummary(response)}`,
+          relatedNodeId: responseNodeId,
+          authorityImpact: "proposal",
+        });
 
         return {
           success:
@@ -6403,6 +6939,13 @@ export default function App() {
       drawerAnchorAddition
     );
 
+  const selectedNodeIsValid = Boolean(
+    activeEpisode &&
+      selectedNodeId &&
+      (getVisibleStageNodes().some((node) => node.id === selectedNodeId) ||
+        activeEpisode.additions?.some((item) => item.id === selectedNodeId))
+  );
+
   /* ---------------------------------------------------------------------- */
   /* RENDER                                                                 */
   /* ---------------------------------------------------------------------- */
@@ -6523,14 +7066,65 @@ export default function App() {
                 </div>
               </div>
               <label className="episode-search">
-                <span className="sr-only">Search episodes</span>
-                <input value={episodeSearch} onChange={(event) => setEpisodeSearch(event.target.value)} placeholder="Search episodes..." />
+                <input aria-label="Search episodes" value={episodeSearch} onChange={(event) => setEpisodeSearch(event.target.value)} placeholder="Search episodes..." />
+                {episodeSearch && <button type="button" className="episode-search-clear" aria-label="Clear episode search" onClick={() => setEpisodeSearch("")}>×</button>}
               </label>
               <div className="project-tree">
                 {(() => {
                   const query = episodeSearch.trim().toLowerCase();
                   const projectMatches = (project) =>
                     !query || project.name.toLowerCase().includes(query) || episodes.some((episode) => episode.projectId === project.id && (episode.id.toLowerCase().includes(query) || episode.name.toLowerCase().includes(query) || episode.title.toLowerCase().includes(query)));
+                  const hasMatchingEpisode = episodes.some((episode) => {
+                    const projectName = projects.find((project) => project.id === episode.projectId)?.name ?? "Unassigned";
+                    return !query || episode.id.toLowerCase().includes(query) || episode.name.toLowerCase().includes(query) || episode.title.toLowerCase().includes(query) || projectName.toLowerCase().includes(query);
+                  });
+                  const renderWorkflow = (episode) => {
+                    if (episode.id !== activeEpisodeId) {
+                      return null;
+                    }
+
+                    return <div className="episode-workflow" aria-label="Episode workflow">
+                      <button type="button" className="episode-workflow-toggle" onClick={() => setWorkflowExpanded((current) => !current)} aria-expanded={workflowExpanded}>
+                        <span>{workflowExpanded ? "▾" : "▸"}</span>
+                        <strong>Workflow</strong>
+                      </button>
+                      {workflowExpanded && <div className="tree">
+                        {EPISODE_STAGES.map((stage, index) => {
+                          const unlocked = index <= episode.currentStage;
+                          const current = index === viewStage;
+                          const childNodes = index === 0 && episode.intake?.status === "accepted" && episode.workflow?.nodes?.length
+                            ? episode.workflow.nodes
+                            : stage.nodes;
+
+                          return <div key={stage.name}>
+                            <button type="button" disabled={!unlocked} className={`tree-stage ${current ? "active" : ""} ${!unlocked ? "locked" : ""}`} onClick={() => {
+                              if (!unlocked) return;
+                              setViewStage(index);
+                              setSelectedNodeId(null);
+                              setActiveThreadId(null);
+                              setDrawerOpen(false);
+                              setOrchestrationNodeId(null);
+                              setOrchestrationExpanded(false);
+                              setOrchestrationMinimized(false);
+                              setOrchestrationDetailId(null);
+                              setOrchestrationPreviews({});
+                            }}>
+                              <span>{index < episode.currentStage ? "✓" : index === episode.currentStage ? "▾" : "›"}</span>
+                              <span>{index + 1}. {stage.name}</span>
+                            </button>
+                            {current && childNodes.filter((node) => node.kind !== "gate").map((node) => <button type="button" key={node.id} className="tree-node" onClick={() => {
+                              setSelectedNodeId(node.id);
+                              setAnchoredConversationMinimized(false);
+                              setActiveThreadId(null);
+                            }}>
+                              <span className="tree-icon" />
+                              {node.type ?? node.title ?? node.kind}
+                            </button>)}
+                          </div>;
+                        })}
+                      </div>}
+                    </div>;
+                  };
                   const renderEpisode = (episode) => (
                     <div className="project-episode" key={episode.id}>
                       <button type="button" className={`episode ${episode.id === activeEpisodeId ? "active" : ""}`} onClick={() => setActiveEpisodeId(episode.id)}>
@@ -6548,6 +7142,7 @@ export default function App() {
                         </div>
                       </div>}
                       {openEpisodeMenuId !== episode.id && <button type="button" className="episode-menu-button" aria-label={`Episode options for ${episode.name}`} title="Episode options" onClick={(event) => { event.stopPropagation(); setOpenEpisodeMenuId(episode.id); setMovingEpisodeId(null); }}>⋮</button>}
+                      {renderWorkflow(episode)}
                     </div>
                   );
                   const renderGroup = (project, projectEpisodes) => {
@@ -6572,148 +7167,11 @@ export default function App() {
                   return <>
                     {projects.filter((project) => !project.archived && projectMatches(project)).map((project) => renderGroup(project, episodes.filter((episode) => episode.projectId === project.id && episode.status !== "archived")))}
                     {renderGroup({ id: "unassigned", name: "Unassigned" }, episodes.filter((episode) => !episode.projectId && episode.status !== "archived").filter((episode) => !query || episode.id.toLowerCase().includes(query) || episode.name.toLowerCase().includes(query) || episode.title.toLowerCase().includes(query)))}
+                    {query && !hasMatchingEpisode && <div className="episode-search-empty">No matching episodes</div>}
                   </>;
                 })()}
               </div>
 
-              <div className="sidebar-divider" />
-
-              <div className="sidebar-section-header">
-                <span>
-                  Episode tree
-                </span>
-
-                <small>
-                  Stage{" "}
-                  {activeEpisode.currentStage +
-                    1}
-                </small>
-              </div>
-
-              <div className="tree">
-                {EPISODE_STAGES.map(
-                  (
-                    stage,
-                    index
-                  ) => {
-                    const unlocked =
-                      index <=
-                      activeEpisode.currentStage;
-
-                    const current =
-                      index ===
-                      viewStage;
-
-                    return (
-                      <div
-                        key={
-                          stage.name
-                        }
-                      >
-                        <button
-                          type="button"
-                          disabled={
-                            !unlocked
-                          }
-                          className={`tree-stage ${
-                            current
-                              ? "active"
-                              : ""
-                          } ${
-                            !unlocked
-                              ? "locked"
-                              : ""
-                          }`}
-                          onClick={() => {
-                            if (
-                              !unlocked
-                            ) {
-                              return;
-                            }
-
-                            setViewStage(
-                              index
-                            );
-
-                            setSelectedNodeId(
-                              null
-                            );
-
-                            setActiveThreadId(
-                              null
-                            );
-
-                            setDrawerOpen(
-                              false
-                            );
-
-                            setOrchestrationNodeId(null);
-                            setOrchestrationExpanded(false);
-                            setOrchestrationMinimized(false);
-                            setOrchestrationDetailId(null);
-                            setOrchestrationPreviews({});
-                          }}
-                        >
-                          <span>
-                            {index <
-                            activeEpisode.currentStage
-                              ? "✓"
-                              : index ===
-                                activeEpisode.currentStage
-                              ? "▾"
-                              : "›"}
-                          </span>
-
-                          <span>
-                            {index +
-                              1}
-                            .{" "}
-                            {
-                              stage.name
-                            }
-                          </span>
-                        </button>
-
-                        {current &&
-                          stage.nodes
-                            .filter(
-                              (node) =>
-                                node.kind !==
-                                "gate"
-                            )
-                            .map(
-                              (node) => (
-                                <button
-                                  type="button"
-                                  key={
-                                    node.id
-                                  }
-                                  className="tree-node"
-                                  onClick={() => {
-    setSelectedNodeId(
-      node.id
-    );
-
-    setAnchoredConversationMinimized(false);
-
-                                    setActiveThreadId(
-                                      null
-                                    );
-                                  }}
-                                >
-                                  <span className="tree-icon" />
-
-                                  {
-                                    node.type
-                                  }
-                                </button>
-                              )
-                            )}
-                      </div>
-                    );
-                  }
-                )}
-              </div>
             </div>
           </aside>
 
@@ -6723,45 +7181,63 @@ export default function App() {
             <div className="canvas-header">
               <div>
                 <div className="breadcrumb">
-                  {
-                    activeEpisode.id
-                  }
-
-                  <span>
-                    ›
-                  </span>
-
-                  <strong>
-                    {
-                      activeStageTemplate.name
-                    }
-                  </strong>
+                  {activeEpisode.id} · Stage {viewStage + 1} of 3
                 </div>
 
                 <h1>
-                  {
-                    activeStageTemplate.title
-                  }
+                  {activeEpisode.name || deriveEpisodeName(activeEpisode.title)}
                 </h1>
 
-                <p>
-                  {
-                    activeStageTemplate.description
-                  }
+                <p className="episode-objective">
+                  {activeEpisode.title}
                 </p>
+
+                <div className="stage-guidance">
+                  <span>Stage {viewStage + 1} · {activeStageTemplate.name}</span>
+                  <p>{activeStageTemplate.description}</p>
+                </div>
               </div>
 
               <div className="canvas-badges">
-                <span className="badge">
-                  Episode
-                </span>
-
+                <button
+                  type="button"
+                  className={`action-button action-button-secondary activity-trigger ${activityOpen ? "active" : ""}`}
+                  aria-expanded={activityOpen}
+                  aria-controls="episode-activity-drawer"
+                  onClick={() => {
+                    if (activityOpen) {
+                      setActivityOpen(false);
+                      return;
+                    }
+                    const latestActivity = activeEpisode.activity?.at(-1);
+                    setActivitySeenByEpisode((current) => ({
+                      ...current,
+                      [activeEpisode.id]: latestActivity?.id ?? null,
+                    }));
+                    setActivityOpen(true);
+                    setDrawerOpen(false);
+                  }}
+                >
+                  <ActivityIcon />
+                  <span>Activity{activeEpisode.activity?.length ? ` · ${activeEpisode.activity.length}` : ""}</span>
+                  {activeEpisode.activity?.length > 0 && activitySeenByEpisode[activeEpisode.id] !== activeEpisode.activity.at(-1)?.id && <span className="activity-unseen-dot" aria-label="Unseen activity" />}
+                </button>
+                <div className="canvas-status-context">
                 <span className="badge">
                   Stage{" "}
                   {viewStage +
                     1}{" "}
                   of 3
                 </span>
+
+                <span className="badge codex-status-badge" title="Runtime: Local Codex · Mode: Analysis only">
+                  <StatusIndicator
+                    status={codexStatus.message === "Checking local Codex…" ? "waiting" : codexStatus.ready ? "ready" : codexStatus.authenticated === false && codexStatus.cliAvailable ? "human-required" : codexStatus.cliAvailable ? "waiting" : "error"}
+                    label={codexStatus.ready ? "Codex Ready" : codexStatus.message}
+                    size="sm"
+                  />
+                </span>
+                </div>
               </div>
             </div>
 
@@ -6899,6 +7375,17 @@ export default function App() {
                 onClose={() => setIntakePanelOpen(false)}
                 onRequestRevision={requestIntakeRevision}
                 onAccept={acceptEpisodeStructure}
+                codexRunning={codexRunningEpisodeId === activeEpisode.id}
+                codexStatus={codexStatus}
+                codexRun={codexRun?.episodeId === activeEpisode.id ? codexRun : null}
+                onCancelAnalysis={cancelNativeCodexIntake}
+                onRetryAnalysis={() => runNativeCodexIntake(activeEpisode)}
+              />
+
+              <ActivityDrawer
+                episode={activeEpisode}
+                open={activityOpen}
+                onClose={() => setActivityOpen(false)}
               />
 
               <OrchestrationErrorBoundary
@@ -6997,7 +7484,7 @@ export default function App() {
 
             {!drawerOpen &&
               !anchoredConversationMinimized &&
-              selectedNodeId && (
+              selectedNodeIsValid && (
               <AnchoredConversationCard
                 episode={activeEpisode}
                 stageIndex={viewStage}
@@ -7010,7 +7497,10 @@ export default function App() {
                 reactFlowInstance={reactFlowInstance}
                 viewportRevision={viewportRevision}
                 onSend={handleDrawerSend}
-                onExpand={() => setDrawerOpen(true)}
+                onExpand={() => {
+                  setDrawerView("conversation");
+                  setDrawerOpen(true);
+                }}
                 onFullscreen={() => setFullscreenOpen(true)}
                 onMinimize={() =>
                   setAnchoredConversationMinimized(true)
@@ -7042,9 +7532,7 @@ export default function App() {
             {/* RIGHT DRAWER */}
 
             <NodeChatDrawer
-              open={
-                drawerOpen
-              }
+              open={drawerOpen && selectedNodeIsValid}
               onClose={
                 closeDrawer
               }
@@ -7067,6 +7555,8 @@ export default function App() {
                 viewStage
               }
               contextContent={activeEpisode.context}
+              initialView={drawerView}
+              nodeDetails={getNodeDetails(drawerAnchorId)}
               onSend={
                 handleDrawerSend
               }
@@ -7081,7 +7571,7 @@ export default function App() {
             />
 
             <FullscreenConversation
-              open={fullscreenOpen}
+              open={fullscreenOpen && selectedNodeIsValid}
               onClose={() => setFullscreenOpen(false)}
               episode={activeEpisode}
               stageIndex={viewStage}

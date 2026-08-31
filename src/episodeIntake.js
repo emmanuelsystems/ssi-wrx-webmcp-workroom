@@ -16,6 +16,56 @@ const ALLOWED_NODE_KINDS = new Set([
   "evaluation",
 ]);
 
+export const EPISODE_STRUCTURE_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    episodeId: { type: "string" },
+    objective: { type: "string" },
+    context: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        summary: { type: "string" },
+        suggestedSources: { type: "array", items: { type: "string" } },
+      },
+      required: ["summary", "suggestedSources"],
+    },
+    workNodes: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "string" },
+          kind: { type: "string", enum: [...ALLOWED_NODE_KINDS] },
+          title: { type: "string" },
+          description: { type: "string" },
+          rationale: { type: "string" },
+          dependsOn: { type: "array", items: { type: "string" } },
+        },
+        required: ["id", "kind", "title", "description", "rationale", "dependsOn"],
+      },
+    },
+    humanGates: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          id: { type: "string" },
+          title: { type: "string" },
+          afterNodeIds: { type: "array", items: { type: "string" } },
+        },
+        required: ["id", "title", "afterNodeIds"],
+      },
+    },
+    assumptions: { type: "array", items: { type: "string" } },
+    unresolved: { type: "array", items: { type: "string" } },
+  },
+  required: ["episodeId", "objective", "context", "workNodes", "humanGates", "assumptions", "unresolved"],
+};
+
 export function createEpisodeIntakeRequest({ episode }) {
   return {
     episodeId: episode?.id,
@@ -97,6 +147,7 @@ export function normalizeEpisodeIntake(intake) {
       : "idle",
     request: intake?.request ?? null,
     proposal: intake?.proposal ?? null,
+    previousProposal: intake?.previousProposal ?? null,
     acceptedAt: intake?.acceptedAt ?? null,
   };
 }
