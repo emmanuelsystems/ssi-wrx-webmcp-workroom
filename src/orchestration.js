@@ -1,7 +1,29 @@
-/*
- * The Workroom currently treats First Mate as an orchestration role.
- * This local planner is replaceable by an external First Mate/runtime adapter later.
- */
+export const MAX_ORCHESTRATION_TURNS = 3;
+
+export const ORCHESTRATION_TASK_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    taskId: { type: "string" },
+    role: { type: "string" },
+    summary: { type: "string" },
+    findings: { type: "array", items: { type: "string" } },
+    evidenceSourceIds: { type: "array", items: { type: "string" } },
+    assumptions: { type: "array", items: { type: "string" } },
+    unresolvedQuestions: { type: "array", items: { type: "string" } },
+    recommendedNextStep: { type: "string" },
+  },
+  required: [
+    "taskId",
+    "role",
+    "summary",
+    "findings",
+    "evidenceSourceIds",
+    "assumptions",
+    "unresolvedQuestions",
+    "recommendedNextStep",
+  ],
+};
 
 const PLAN_TEMPLATES = {
   inquiry: [
@@ -233,6 +255,113 @@ export function createMockExecutionState(plan) {
       [assignment.id]: status,
     };
   }, {});
+}
+
+export function selectOrchestrationTasks(plan) {
+  const rolesByTaskId = new Map(
+    (plan?.assignments ?? []).map((assignment) => [
+      assignment.taskId ?? assignment.id,
+      assignment.role,
+    ])
+  );
+  const tasks = (plan?.tasks ?? []).map((task) => ({
+    ...task,
+    role: task.role ?? rolesByTaskId.get(task.id) ?? "Specialist",
+  }));
+  if (tasks.length <= 2) return tasks.slice(0, MAX_ORCHESTRATION_TURNS);
+  const reviewerIndex = tasks.findIndex((task) => /review/i.test(`${task.role ?? ""} ${task.title ?? ""}`));
+  const synthesisIndex = tasks.findIndex((task, index) => index > 0 && index !== reviewerIndex && /synth|evaluat|builder|compare|verify/i.test(`${task.role ?? ""} ${task.title ?? ""}`));
+  return [tasks[0], tasks[synthesisIndex >= 0 ? synthesisIndex : tasks.length - 2], tasks[reviewerIndex >= 0 ? reviewerIndex : tasks.length - 1]]
+    .filter((task, index, selected) => task && selected.indexOf(task) === index)
+    .slice(0, MAX_ORCHESTRATION_TURNS);
+}
+
+function boundedString(value, max = 1600) {
+  return typeof value === "string" && value.trim() && value.length <= max;
+}
+
+export function validateOrchestrationTaskOutput(output, taskId, sourceIds = []) {
+  if (!output || typeof output !== "object") return { valid: false, error: "Task output must be an object." };
+  const requiredStrings = ["taskId", "role", "summary", "recommendedNextStep"];
+  if (requiredStrings.some((field) => !boundedString(output[field]))) return { valid: false, error: "Task output is missing a bounded required field." };
+  if (output.taskId !== taskId) return { valid: false, error: "Task output has the wrong task ID." };
+  for (const field of ["findings", "evidenceSourceIds", "assumptions", "unresolvedQuestions"]) {
+    if (!Array.isArray(output[field]) || output[field].length > 12 || output[field].some((item) => typeof item !== "string" || item.length > 500)) {
+      return { valid: false, error: `Task output field ${field} is invalid.` };
+    }
+  }
+  const knownSourceIds = new Set(sourceIds);
+  if (output.evidenceSourceIds.some((sourceId) => !knownSourceIds.has(sourceId))) return { valid: false, error: "Task output cited an unknown source." };
+  return { valid: true };
+}
+
+export function applyOrchestrationEvent(state, event) {
+  const next = {
+    ...state,
+    events: [...(state.events ?? []), event].slice(-60),
+  };
+  if (event.type === "run") next.status = event.status;
+  if (event.type === "task") {
+    next.taskStates = {
+      ...(next.taskStates ?? {}),
+      [event.taskId]: event.status === "complete"
+        ? "Complete"
+        : event.status === "failed"
+        ? "Failed"
+        : event.status === "working"
+        ? "Working"
+        : "Queued",
+    };
+  }
+  if (event.output) next.taskOutputs = [...(next.taskOutputs ?? []).filter((output) => output.taskId !== event.output.taskId), event.output];
+  if (event.type === "completed") next.status = "complete";
+  if (event.type === "cancelled") next.status = "cancelled";
+  if (event.type === "error") {
+    next.status = "error";
+    next.error = event.message;
+    next.taskStates = Object.fromEntries(
+      Object.entries(next.taskStates ?? {}).map(([taskId, status]) => [
+        taskId,
+        status === "Working" ? "Failed" : status,
+      ])
+    );
+  }
+  return next;
+}
+
+export function mapOrchestrationArtifacts(outputs, { nodeId, nodeKind, runId, stageIndex = 0 } = {}) {
+  return outputs.map((output, index) => {
+    const isReview = index === outputs.length - 1;
+    const isSynthesis = !isReview && index > 0;
+    const kind = isReview
+      ? "evaluation"
+      : isSynthesis
+      ? nodeKind === "evaluation" ? "evaluation" : "recommendation"
+      : "evidence";
+    const title = isReview
+      ? "Independent orchestration review"
+      : isSynthesis
+      ? `${output.role} output`
+      : `${output.role} findings`;
+    return {
+      id: `orchestration-artifact-${runId}-${output.taskId}`,
+      kind,
+      type: kind,
+      stageIndex,
+      parentNodeId: nodeId,
+      title,
+      label: kind,
+      body: output.summary,
+      meta: `${output.role} · Orchestration run ${runId}`,
+      sourceIds: output.evidenceSourceIds,
+      taskRole: output.role,
+      orchestrationRunId: runId,
+      findings: output.findings,
+      assumptions: output.assumptions,
+      unresolvedQuestions: output.unresolvedQuestions,
+      recommendedNextStep: output.recommendedNextStep,
+    };
+  });
 }
 
 export function getOrchestrationPlanSummary(plan, executionState = {}) {

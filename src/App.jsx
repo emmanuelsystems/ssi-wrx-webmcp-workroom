@@ -11,6 +11,7 @@ import {
   Background,
   Controls,
   Handle,
+  MiniMap,
   Position,
   ReactFlow,
   useEdgesState,
@@ -19,20 +20,46 @@ import {
 
 import "@xyflow/react/dist/style.css";
 
+import {
+  getTraceGraph,
+  getWorkflowEdgeKey,
+  layoutWorkflowNodes,
+} from "./workflowLayout";
+
 import { useWebMCP } from "use-webmcp-tool";
 
 import {
-  createMockExecutionState,
   createOrchestrationPlan,
   createOrchestrationRequest,
   getOrchestrationPlanSummary,
+  applyOrchestrationEvent,
+  mapOrchestrationArtifacts,
+  selectOrchestrationTasks,
 } from "./orchestration";
 
 import {
+  MAX_AUTOPILOT_TURNS,
+  applyAutopilotEvent,
+  mapAutopilotArtifact,
+} from "./autopilot";
+
+import {
   createEpisodeIntakeRequest,
+  createWorkflowGateEdges,
+  createWorkflowGates,
   normalizeEpisodeIntake,
   validateEpisodeStructureProposal,
 } from "./episodeIntake";
+
+import {
+  MAX_SOURCE_FILES,
+  deleteEpisodeSources,
+  extractSourceFile,
+  getEpisodeSource,
+  saveEpisodeSources,
+  sourceManifestFromRecords,
+  validateSourceManifest,
+} from "./episodeSources";
 
 import {
   PROJECTS_STORAGE_KEY,
@@ -63,6 +90,15 @@ const DURABLE_ARTIFACT_KINDS = new Set([
 
 function isDurableArtifact(item) {
   return DURABLE_ARTIFACT_KINDS.has(item?.kind);
+}
+
+function isGeneratedRunArtifact(item) {
+  return item?.id?.startsWith("autopilot-") || item?.id?.startsWith("orchestration-artifact-");
+}
+
+function getArtifactTaskId(item) {
+  if (item?.metadata?.taskId) return item.metadata.taskId;
+  return null;
 }
 
 function compactArtifactSummary(value) {
@@ -517,6 +553,25 @@ function migrateAddition(
   return item;
 }
 
+function normalizeAutopilotRun(run) {
+  if (!run || typeof run !== "object") return null;
+  if (!['queued', 'working'].includes(run.status)) return run;
+
+  return {
+    ...run,
+    status: "cancelled",
+    activeTaskId: null,
+    activeNodeId: null,
+    taskStates: Object.fromEntries(
+      Object.entries(run.taskStates ?? {}).map(([taskId, status]) => [
+        taskId,
+        status === "working" ? "cancelled" : status,
+      ])
+    ),
+    error: "This local run was interrupted when the browser session changed. Retry to start a new bounded run.",
+  };
+}
+
 function normalizeEpisode(
   episode,
   index
@@ -559,6 +614,19 @@ function normalizeEpisode(
     context:
       legacyContext,
 
+    sources:
+      Array.isArray(episode.sources) ? episode.sources : [],
+
+    nodeSourceIds:
+      episode.nodeSourceIds && typeof episode.nodeSourceIds === "object"
+        ? episode.nodeSourceIds
+        : {},
+
+    template:
+      episode.template && typeof episode.template === "object"
+        ? episode.template
+        : null,
+
     currentStage:
       Math.min(
         2,
@@ -598,9 +666,12 @@ function normalizeEpisode(
 
     intake: normalizeEpisodeIntake(episode.intake),
 
+    autopilotRun: normalizeAutopilotRun(episode.autopilotRun),
+
     workflow: {
       nodes: episode.workflow?.nodes ?? [],
       edges: episode.workflow?.edges ?? [],
+      gates: episode.workflow?.gates ?? [],
     },
 
     projectId: episode.projectId ?? null,
@@ -610,6 +681,7 @@ function normalizeEpisode(
         intakeThreadId: episode.runtime?.codex?.intakeThreadId ?? null,
         lastRunAt: episode.runtime?.codex?.lastRunAt ?? null,
         lastError: episode.runtime?.codex?.lastError ?? null,
+        orchestration: episode.runtime?.codex?.orchestration ?? {},
       },
     },
 
@@ -676,6 +748,13 @@ function loadProjects() {
 /* NEW EPISODE MODAL                                                         */
 /* -------------------------------------------------------------------------- */
 
+const EPISODE_TEMPLATES = [
+  { id: "client-call-follow-up", version: 1, name: "Client-call follow-up", title: "Turn a client call into clear actions, owners, and a reviewable follow-up.", context: "Capture decisions, commitments, open questions, owners, deadlines, and anything that needs client confirmation. Draft only; a human reviews before anything is sent." },
+  { id: "client-onboarding", version: 1, name: "Client onboarding", title: "Validate a reliable and repeatable client onboarding workflow.", context: "Identify the required inputs, handoffs, constraints, evidence, and human approvals before this becomes a standard client process." },
+  { id: "research-decision-brief", version: 1, name: "Research and decision brief", title: "Produce an evidence-backed recommendation for a founder decision.", context: "Gather supplied evidence, distinguish facts from assumptions, record risks and gaps, and prepare a concise human-review package." },
+  { id: "reporting-deliverable", version: 1, name: "Reporting and deliverable preparation", title: "Draft and validate a recurring client deliverable without losing review control.", context: "Define the source evidence, required checks, output structure, quality bar, and the human approval needed before delivery." },
+];
+
 function NewEpisodeModal({
   open,
   onClose,
@@ -698,6 +777,13 @@ function NewEpisodeModal({
 
   const [projectId, setProjectId] =
     useState(initialProjectId ?? "");
+
+  const [sourceFiles, setSourceFiles] = useState([]);
+  const [sourceError, setSourceError] = useState("");
+  const [sourceConsent, setSourceConsent] = useState(false);
+  const [sourceBusy, setSourceBusy] = useState(false);
+  const [sourceEvents, setSourceEvents] = useState([]);
+  const [templateId, setTemplateId] = useState("");
 
   useEffect(() => {
     if (!open) {
@@ -734,6 +820,11 @@ function NewEpisodeModal({
       setContext("");
       setSetupMode("agent-assisted");
       setProjectId(initialProjectId ?? "");
+      setSourceFiles([]);
+      setSourceError("");
+      setSourceConsent(false);
+      setSourceEvents([]);
+      setTemplateId("");
     }
   }, [open, initialProjectId]);
 
@@ -760,7 +851,9 @@ function NewEpisodeModal({
       return;
     }
 
-    onCreate({
+    if (setupMode === "agent-assisted" && !sourceConsent) return;
+    setSourceBusy(true);
+    Promise.resolve(onCreate({
       title:
         cleanTitle,
 
@@ -772,10 +865,54 @@ function NewEpisodeModal({
 
       setupMode,
       projectId: projectId || null,
-    });
+      sources: sourceFiles,
+      sourceEvents,
+      sourceConsent,
+      sourceConsentRequired: setupMode === "agent-assisted",
+      template: EPISODE_TEMPLATES.find((template) => template.id === templateId) ?? null,
+    })).catch((error) => setSourceError(error.message || "Could not create the Episode.")).finally(() => setSourceBusy(false));
 
     setTitle("");
     setContext("");
+  }
+
+  async function handleFiles(event) {
+    const selected = [...event.target.files];
+    event.target.value = "";
+    setSourceError("");
+    if (sourceFiles.length + selected.length > 10) {
+      setSourceError("You can add up to 10 files.");
+      return;
+    }
+    for (const file of selected) {
+      try {
+        const extracted = await extractSourceFile(file);
+        setSourceFiles((current) => [...current, extracted]);
+      } catch (error) {
+        setSourceError(error.message);
+        setSourceEvents((current) => [...current, { type: "source.extraction_failed", fileName: file.name, message: error.message }]);
+        setSourceFiles((current) => [...current, {
+          sourceId: `failed-source-${crypto.randomUUID()}`,
+          fileName: file.name,
+          fileType: file.type || "unknown",
+          size: file.size,
+          extractionStatus: "failed",
+          charCount: 0,
+          error: error.message,
+        }]);
+      }
+    }
+  }
+
+  function selectTemplate(event) {
+    const nextTemplateId = event.target.value;
+    const template = EPISODE_TEMPLATES.find((item) => item.id === nextTemplateId);
+    setTemplateId(nextTemplateId);
+    if (!template) return;
+    setName(template.name);
+    setTitle(template.title);
+    setContext(template.context);
+    setSetupMode("agent-assisted");
   }
 
   return (
@@ -843,9 +980,38 @@ function NewEpisodeModal({
             <button type="button" className="text-button" onClick={onCreateProject}>+ Create new project</button>
           </label>
           <label className="episode-field">
+            <span>Start from a workflow <em>Optional</em></span>
+            <select value={templateId} onChange={selectTemplate}>
+              <option value="">Start from a blank episode</option>
+              {EPISODE_TEMPLATES.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}
+            </select>
+            <small>Templates prefill the brief only. Codex still proposes the workflow for your review.</small>
+          </label>
+          <label className="episode-field">
             <span>Episode name <em>Optional</em></span>
             <input value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Product huddle follow-up" />
           </label>
+
+          <label className="episode-field source-upload-field">
+            <span>Source material <em>Optional · up to 10 files, 10 MB each</em></span>
+            <input type="file" multiple accept=".txt,.md,.pdf,.docx,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={handleFiles} disabled={sourceFiles.length >= 10 || sourceBusy} />
+          </label>
+
+          {sourceFiles.length > 0 && <div className="source-file-list" aria-label="Selected source files">
+            {sourceFiles.map((source) => <div className="source-file-row" key={source.sourceId}>
+              <div><strong>{source.fileName}</strong><span>{source.fileType} · {(source.size / 1024).toFixed(1)} KB · {source.charCount.toLocaleString()} chars · {source.extractionStatus}{source.error ? ` · ${source.error}` : ""}</span></div>
+              <button type="button" onClick={() => { setSourceEvents((current) => [...current, { type: "source.removed", sourceId: source.sourceId, fileName: source.fileName }]); setSourceFiles((current) => current.filter((item) => item.sourceId !== source.sourceId)); }}>Remove</button>
+            </div>)}
+          </div>}
+
+          {sourceError && <div className="source-error" role="alert">{sourceError}</div>}
+
+          {setupMode === "agent-assisted" && <>
+          <div className="episode-modal-cost-guard">Autopilot uses a maximum of five local Codex turns: one planner, up to three specialists, and one final review.</div>
+          <label className="source-consent">
+            <input type="checkbox" checked={sourceConsent} onChange={(event) => setSourceConsent(event.target.checked)} />
+            <span>I consent to an automatic bounded Autopilot run sending this context and extracted source text to the local Codex runtime for read-only analysis. Originals remain in this browser.</span>
+          </label></>}
           <label className="episode-field">
             <span>
               What are we
@@ -952,7 +1118,7 @@ function NewEpisodeModal({
           </div>
 
           <div className="episode-modal-actions">
-            <button
+              <button
               type="button"
               className="episode-modal-button"
               onClick={onClose}
@@ -963,11 +1129,11 @@ function NewEpisodeModal({
             <button
               type="submit"
               className="episode-modal-button primary"
-              disabled={
-                !title.trim()
+                disabled={
+                !title.trim() || sourceBusy || (setupMode === "agent-assisted" && !sourceConsent)
               }
             >
-              {setupMode === "agent-assisted"
+              {sourceBusy ? "Preparing sources…" : setupMode === "agent-assisted"
                 ? "Create & Analyze"
                 : "Create Episode"}
             </button>
@@ -1125,7 +1291,7 @@ function CardNode({
         selected
           ? "selected"
           : ""
-      } ${data.proposed ? "proposed-node" : ""} ${data.compactNode ? "compact-node" : ""}`}
+      } ${data.proposed ? "proposed-node" : ""} ${data.compactNode ? "compact-node" : ""} ${data.traceActive ? "trace-active-node" : data.traceDimmed ? "trace-dimmed-node" : ""}`}
     >
       <MessageBadge
         count={
@@ -1167,6 +1333,14 @@ function CardNode({
       <div className="node-label">
         {data.label}
       </div>
+
+      {data.autopilotStatus && <div className="node-autopilot-status"><StatusIndicator status={data.autopilotStatus === "completed" ? "complete" : data.autopilotStatus === "working" ? "working" : data.autopilotStatus === "failed" ? "error" : "waiting"} label={`Autopilot · ${data.autopilotStatus}`} size="sm" /></div>}
+
+      {data.runArtifactCount > 0 && (
+        <div className="node-run-output-count" title="Generated run outputs are available in the Run inspector">
+          {data.runArtifactCount} run output{data.runArtifactCount === 1 ? "" : "s"}
+        </div>
+      )}
 
       <div className="node-title">
         {data.title}
@@ -1235,6 +1409,21 @@ function CardNode({
         </div>
       )}
 
+      {data.selected && (
+        <div className="node-action-row nodrag">
+          <button
+            type="button"
+            className="action-button action-button-secondary"
+            onClick={(event) => {
+              event.stopPropagation();
+              data.onTrace?.();
+            }}
+          >
+            {data.traceActive ? "Clear trace" : "Trace workflow"}
+          </button>
+        </div>
+      )}
+
       <Handle
         type="source"
         position={
@@ -1266,7 +1455,7 @@ function GateNode({
         selected
           ? "selected"
           : ""
-      }`}
+      } ${data.traceActive ? "trace-active-node" : data.traceDimmed ? "trace-dimmed-node" : ""}`}
     >
       <MessageBadge
         count={
@@ -1306,6 +1495,12 @@ function GateNode({
         {data.title}
       </div>
 
+      {data.checkpointDependencies?.length > 0 && (
+        <div className="node-meta">
+          After: {data.checkpointDependencies.join(", ")}
+        </div>
+      )}
+
       {data.completed ? (
         <div className="gate-complete">
           ✓ Completed
@@ -1326,6 +1521,19 @@ function GateNode({
           Inspecting
           completed stage
         </div>
+      )}
+
+      {data.selected && (
+        <button
+          type="button"
+          className="action-button action-button-secondary nodrag"
+          onClick={(event) => {
+            event.stopPropagation();
+            data.onTrace?.();
+          }}
+        >
+          {data.traceActive ? "Clear trace" : "Trace workflow"}
+        </button>
       )}
 
       <Handle
@@ -1619,7 +1827,7 @@ function _OrchestrationPreviewLayer({
       <div className="orchestration-preview-head">
         <div>
           <div className="concept-preview-label">Concept preview</div>
-          <strong>Future orchestration</strong>
+          <strong>Read-only orchestration</strong>
         </div>
 
         <button
@@ -1800,7 +2008,8 @@ function getOrchestrationSummary(nodeId, plan, executionState) {
   );
 }
 
-function orchestrationSummaryStatus(summary) {
+function orchestrationSummaryStatus(summary, runStatus = null) {
+  if (runStatus) return orchestrationStatusClass(runStatus);
   if (summary.humanRequired > 0) {
     return "human-required";
   }
@@ -1830,24 +2039,28 @@ function buildOrchestrationPreviewNodes(
   parentNodeId,
   parentPosition,
   plan,
-  executionState = {}
+  executionState = {},
+  runStatus = null,
+  savedPositions = {},
 ) {
   const baseX = parentPosition.x;
   const baseY = parentPosition.y;
+  const positionFor = (id, fallback) => savedPositions[id] ?? fallback;
   const preview = [
     {
       id: `orchestration-${parentNodeId}-first-mate`,
       type: "orchestration",
-      draggable: false,
-      position: { x: baseX + 330, y: baseY + 30 },
+      draggable: true,
+      position: positionFor(`orchestration-${parentNodeId}-first-mate`, { x: baseX + 330, y: baseY + 30 }),
       data: {
         label: "First Mate",
         title: `Coordinating ${plan.assignments?.length ?? 0} agents`,
         status: orchestrationSummaryStatus(
-          getOrchestrationPlanSummary(plan, executionState)
+          getOrchestrationPlanSummary(plan, executionState),
+          runStatus,
         ),
-        statusLabel: "Mock preview",
-        result: "Concept only · no execution",
+        statusLabel: runStatus ? `Run ${runStatus}` : "Ready for read-only run",
+        result: runStatus ? `Local Codex · ${runStatus}` : "Local Codex · read-only",
         orchestrationPreview: true,
         detailId: "first-mate",
       },
@@ -1857,16 +2070,16 @@ function buildOrchestrationPreviewNodes(
       return {
       id: `orchestration-${parentNodeId}-${assignment.id}`,
       type: "orchestration",
-      draggable: false,
-      position: {
+      draggable: true,
+      position: positionFor(`orchestration-${parentNodeId}-${assignment.id}`, {
         x: baseX + 650,
         y: baseY - 70 + index * 105,
-      },
+      }),
       data: {
         label: assignment.role,
         title: task.title,
-        status: orchestrationStatusClass(executionState[assignment.id] ?? "Waiting"),
-        statusLabel: `Mock · ${executionState[assignment.id] ?? "Waiting"}`,
+        status: orchestrationStatusClass(runStatus && !["Complete"].includes(executionState[assignment.id]) ? runStatus : executionState[assignment.id] ?? "Queued"),
+        statusLabel: runStatus && !["Complete"].includes(executionState[assignment.id]) ? runStatus : executionState[assignment.id] ?? "Queued",
         result: `Output: ${task.output}`,
         orchestrationPreview: true,
         detailId: assignment.id,
@@ -1876,8 +2089,8 @@ function buildOrchestrationPreviewNodes(
     {
       id: `orchestration-${parentNodeId}-output`,
       type: "orchestrationOutput",
-      draggable: false,
-      position: { x: baseX + 960, y: baseY + 245 },
+      draggable: true,
+      position: positionFor(`orchestration-${parentNodeId}-output`, { x: baseX + 960, y: baseY + 245 }),
       data: { orchestrationPreview: true },
     },
   ];
@@ -2021,7 +2234,9 @@ function EpisodeIntakePanel({
         <div className="episode-intake-panel-body">
           <strong>{codexRunning ? "Codex analysis in progress" : "Awaiting agent analysis"}</strong>
           <p>{codexRunning ? "Local Codex is analyzing this Episode in read-only mode." : "The Episode is pending analysis. Nothing is accepted yet."}</p>
-          {!codexRunning && codexStatus?.authenticated === false && <p>Codex sign-in required. Run Codex login in your terminal, then retry analysis.</p>}
+          {!codexRunning && codexStatus?.state === "authentication-required" && <p>Codex sign-in required. Run Codex login in your terminal, then retry analysis.</p>}
+          {!codexRunning && codexStatus?.state === "cli-unavailable" && <p>Codex CLI not found. Install Codex, then retry analysis.</p>}
+          {!codexRunning && codexStatus?.state === "runtime-unavailable" && <p>The local Codex runtime could not determine CLI status. Retry after checking the runtime terminal.</p>}
           <div className="intake-request-list">
             {request.requestedAnalysis.map((item) => <span key={item}>• {item}</span>)}
           </div>
@@ -2056,7 +2271,7 @@ function EpisodeIntakePanel({
 
       <footer>
         {intake.status === "pending" ? (
-          codexRunning ? <button type="button" onClick={onCancelAnalysis}>Cancel analysis</button> : codexRun?.status === "error" ? <button type="button" onClick={onRetryAnalysis}>Retry analysis</button> : <button type="button" onClick={onClose}>Close</button>
+          codexRunning ? <button type="button" onClick={onCancelAnalysis}>Cancel analysis</button> : ["error", "cancelled"].includes(codexRun?.status) ? <button type="button" onClick={onRetryAnalysis}>Retry analysis</button> : <button type="button" onClick={onClose}>Close</button>
         ) : (
           <>
             <button type="button" onClick={() => { onRequestRevision(revisionInstruction.trim()); setRevisionInstruction(""); }}>Request revision</button>
@@ -2065,6 +2280,114 @@ function EpisodeIntakePanel({
         )}
       </footer>
     </aside>
+  );
+}
+
+function AutopilotRunPanel({ run, onStop, onRetry, follow, onFollow, onPromote, onRevise, onPause, onReject, onInspectOutput, onToggleCanvasArtifacts, canvasArtifactsVisible, outputCount, onHide }) {
+  const [instruction, setInstruction] = useState("");
+  const [selectedTaskId, setSelectedTaskId] = useState(null);
+  if (!run) return null;
+  const taskEntries = Object.entries(run.taskStates ?? {});
+  const active = taskEntries.find(([, status]) => status === "working");
+  const completedTurns = (run.outputs ?? []).filter((output) => output.taskId !== "final-review").length + (run.draftPlan ? 1 : 0) + (run.finalPackage ? 1 : 0);
+  const outputs = (run.outputs ?? []).filter((output) => output.taskId !== "final-review");
+  const selectedOutput = outputs.find((output) => output.taskId === selectedTaskId);
+  return <aside className="autopilot-run-panel" aria-label="Autopilot run inspector">
+    <header><div><div className="concept-preview-label">Run inspector</div><h2>{run.status === "complete" ? "Human review required" : run.status === "working" ? "Live read-only run" : `Run ${run.status}`}</h2></div><div className="autopilot-panel-header-actions"><StatusIndicator status={run.status === "complete" ? "complete" : run.status === "working" ? "working" : run.status === "error" ? "error" : "waiting"} label={run.status} size="sm" /><button type="button" onClick={onHide} aria-label="Hide run inspector">×</button></div></header>
+    <div className="autopilot-progress"><span>Planning</span><span>Specialists</span><span>Synthesis / review</span><span>Human review</span></div>
+    <p className="autopilot-cost-guard">Maximum {MAX_AUTOPILOT_TURNS} Codex turns · read-only local runtime</p>
+    <div className="autopilot-turn-count">Turns: {completedTurns} / {MAX_AUTOPILOT_TURNS}</div>
+    {active && <p className="autopilot-active-agent">Active: {active[0]} · Reviewing source context</p>}
+    <div className="autopilot-task-list">{taskEntries.map(([taskId, status]) => <div key={taskId}><StatusIndicator status={["complete", "completed"].includes(status) ? "complete" : status === "working" ? "working" : status === "failed" ? "error" : "waiting"} label={`${taskId} · ${status}`} size="sm" /></div>)}</div>
+    <section className="run-inspector-outputs" aria-label="Run outputs">
+      <div className="run-inspector-heading"><strong>Outputs</strong><span>{outputCount} attached to workflow</span></div>
+      <p>Generated findings stay here so the decision map remains readable.</p>
+      {outputs.length === 0 ? <div className="run-inspector-empty">Completed findings will appear here, linked to the workflow step they support.</div> : outputs.map((output) => <button type="button" className={`run-inspector-output ${selectedTaskId === output.taskId ? "selected" : ""}`} key={output.taskId} onClick={() => { setSelectedTaskId(output.taskId); onInspectOutput?.(output.taskId); }}><span>{output.role || output.taskId}</span><strong>{output.summary || "Open output"}</strong><em>{output.taskId.replace("specialist-", "Step · ")}</em></button>)}
+      {selectedOutput && <div className="run-inspector-detail"><strong>{selectedOutput.role || selectedOutput.taskId}</strong><p><b>Findings:</b> {selectedOutput.findings?.join(" · ") || "No findings recorded."}</p>{selectedOutput.assumptions?.length > 0 && <p><b>Assumptions:</b> {selectedOutput.assumptions.join(" · ")}</p>}{selectedOutput.unresolvedQuestions?.length > 0 && <p><b>Unresolved:</b> {selectedOutput.unresolvedQuestions.join(" · ")}</p>}{selectedOutput.recommendedNextStep && <p><b>Recommended next step:</b> {selectedOutput.recommendedNextStep}</p>}</div>}
+      {run.finalPackage && <details className="run-inspector-final" open><summary><span>Final synthesis</span><strong>{run.finalPackage.summary || "Human-review package"}</strong><em>Human review package</em></summary><div>{run.finalPackage.findings?.length > 0 && <p><b>Findings:</b> {run.finalPackage.findings.join(" · ")}</p>}{run.finalPackage.risks?.length > 0 && <p><b>Risks:</b> {run.finalPackage.risks.join(" · ")}</p>}{run.finalPackage.recommendedNextStep && <p><b>Recommended next step:</b> {run.finalPackage.recommendedNextStep}</p>}<button type="button" onClick={() => onInspectOutput?.("final-review")}>Open full package</button></div></details>}
+      {outputCount > 0 && <button type="button" className="run-inspector-canvas-toggle" onClick={onToggleCanvasArtifacts}>{canvasArtifactsVisible ? "Hide run outputs on canvas" : "Show run outputs on canvas"}</button>}
+    </section>
+    {(run.events ?? []).slice(-4).map((event, index) => <div className="autopilot-event" key={`${event.occurredAt ?? "event"}-${index}`}>{event.label ?? event.message ?? event.type}</div>)}
+    <label className="autopilot-follow"><input type="checkbox" checked={follow} onChange={(event) => onFollow(event.target.checked)} /> Follow active work</label>
+    {run.status === "working" && <button type="button" onClick={onStop}>Stop run</button>}
+    {["error", "cancelled"].includes(run.status) && <div className="autopilot-human-actions"><strong>{run.status === "error" ? "Run failed before human review" : "Run stopped before human review"}</strong><button type="button" onClick={onRetry}>Retry run</button></div>}
+    {run.status === "complete" && run.finalPackage && <div className="autopilot-human-actions"><strong>Human review required</strong><button type="button" onClick={onPromote}>Promote as trusted context</button><textarea rows="2" value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="Optional revised-run instruction" /><button type="button" onClick={() => onRevise(instruction)}>Request revised run</button><button type="button" onClick={onPause}>Pause</button><button type="button" onClick={onReject}>Reject</button></div>}
+    {run.error && <div className="autopilot-error">{run.error}</div>}
+  </aside>;
+}
+
+function AgentNotificationTray({ notifications, onDismiss, onOpen }) {
+  if (notifications.length === 0) return null;
+
+  return (
+    <aside className="agent-notification-tray" aria-label="Agent run notifications" aria-live="polite">
+      {notifications.map((notification) => (
+        <section className="agent-notification" key={notification.id}>
+          <div>
+            <span>Agent update</span>
+            <strong>{notification.title}</strong>
+            <p>{notification.summary}</p>
+          </div>
+          <div className="agent-notification-actions">
+            <button type="button" onClick={() => onOpen(notification)}>Open run</button>
+            <button type="button" onClick={() => onDismiss(notification.id)} aria-label="Dismiss agent notification">×</button>
+          </div>
+        </section>
+      ))}
+    </aside>
+  );
+}
+
+function EpisodeProgressGuide({ episode, viewStage, liveOrchestrationRun, onSelectStage, onOpenIntake, onOpenActivity, onOpenOrchestration }) {
+  const autopilot = episode.autopilotRun;
+  const orchestrationRuns = Object.entries(episode.runtime?.codex?.orchestration ?? {});
+  const activeOrchestration = liveOrchestrationRun?.episodeId === episode.id && ["queued", "working"].includes(liveOrchestrationRun.status)
+    ? [liveOrchestrationRun.nodeId, liveOrchestrationRun]
+    : null;
+  const pendingThreads = (episode.additions ?? []).filter((item) => item.kind === "thread" && item.status === "pending").length;
+  const generatedOutputs = (episode.additions ?? []).filter(isGeneratedRunArtifact).length;
+  const completedAutopilotTasks = Object.values(autopilot?.taskStates ?? {}).filter((status) => ["complete", "completed"].includes(status)).length;
+  const autopilotTaskCount = Object.keys(autopilot?.taskStates ?? {}).length;
+  const setupNeedsReview = ["pending", "proposed"].includes(episode.intake?.status);
+  const finalReviewReady = autopilot?.status === "complete" && autopilot.finalPackage;
+
+  let nextTitle = "Review this stage and continue when it is justified.";
+  let nextDetail = "No additional prompt is required unless you need to clarify or challenge a specific finding.";
+  let nextAction = null;
+
+  if (setupNeedsReview) {
+    nextTitle = "Review the proposed episode structure.";
+    nextDetail = "Autopilot produced a draft. Accept it, ask for a revision, or leave it unaccepted—this is a human decision.";
+    nextAction = { label: "Review setup", onClick: onOpenIntake };
+  } else if (activeOrchestration) {
+    nextTitle = "First Mate is processing this workflow step.";
+    nextDetail = "No prompt is required while the read-only run is active. Its outputs will appear when each specialist finishes.";
+    nextAction = { label: "Open First Mate", onClick: () => onOpenOrchestration(activeOrchestration[0]) };
+  } else if (finalReviewReady) {
+    nextTitle = "Review the final Autopilot package.";
+    nextDetail = "The run is complete. You can promote trusted context, request a revised run, or keep the package as inspectable draft work.";
+    nextAction = { label: "Open activity", onClick: onOpenActivity };
+  } else if (viewStage === 2) {
+    nextTitle = "Record the human disposition.";
+    nextDetail = "Agents cannot complete this step. Review the retained evidence and make the final decision yourself.";
+  }
+
+  return (
+    <section className="episode-progress-guide" aria-label="Episode progress guide">
+      <header>
+        <div><span>Episode cockpit</span><h2>Where this episode stands</h2></div>
+        <div className="episode-progress-output-count">{generatedOutputs} retained output{generatedOutputs === 1 ? "" : "s"}</div>
+      </header>
+      <div className="episode-progress-stages">
+        {EPISODE_STAGES.map((stage, index) => <button type="button" key={stage.name} className={index === viewStage ? "active" : index < episode.currentStage ? "complete" : ""} disabled={index > episode.currentStage} onClick={() => onSelectStage(index)}><b>{index < episode.currentStage ? "✓" : index + 1}</b><span>{stage.name}</span></button>)}
+      </div>
+      <div className="episode-progress-grid">
+        <div><span>Autopilot</span><strong>{autopilot ? autopilot.status === "working" ? "Running" : autopilot.status === "complete" ? "Package ready" : `Run ${autopilot.status}` : "Not started"}</strong><small>{autopilot ? `${completedAutopilotTasks} of ${autopilotTaskCount} tasks completed` : "Optional agent-assisted analysis"}</small></div>
+        <div><span>First Mate</span><strong>{activeOrchestration ? "Working" : orchestrationRuns.length > 0 ? "Outputs retained" : "Not started"}</strong><small>{activeOrchestration ? "Read-only specialist work in progress" : "Optional targeted orchestration"}</small></div>
+        <div><span>Prompts</span><strong>{pendingThreads > 0 ? "Reply pending" : "Nothing required"}</strong><small>{pendingThreads > 0 ? `${pendingThreads} agent conversation${pendingThreads === 1 ? "" : "s"} awaiting a reply` : "Ask only when a finding needs clarification"}</small></div>
+      </div>
+      <div className="episode-progress-next"><div><span>Next for you</span><strong>{nextTitle}</strong><p>{nextDetail}</p></div>{nextAction && <button type="button" onClick={nextAction.onClick}>{nextAction.label}</button>}</div>
+    </section>
   );
 }
 
@@ -2127,7 +2450,7 @@ function OrchestrationDetailOverlay({
           </div>
           <div className="orchestration-detail-section">
             <span>Status</span>
-            <StatusIndicator status={executionState[assignment?.id] ?? "Waiting"} label={`Mock · ${executionState[assignment?.id] ?? "Waiting"}`} size="md" className="orchestration-detail-status" />
+            <StatusIndicator status={executionState[assignment?.id] ?? "Queued"} label={executionState[assignment?.id] ?? "Queued"} size="md" className="orchestration-detail-status" />
           </div>
           <div className="orchestration-detail-section">
             <span>Input · Expected output</span>
@@ -2184,9 +2507,11 @@ function NodeOrchestrationWindow({
   nodeTitle,
   nodeType,
   nodeBody,
-  summary,
+  summary: _summary,
   executionState = {},
+  orchestrationRun,
   phase,
+  clusterVisible,
   plan,
   onMinimize,
   onClose,
@@ -2196,6 +2521,9 @@ function NodeOrchestrationWindow({
   onBack,
   onApprove,
   onReset,
+  onRun,
+  onCancelRun,
+  onInspectArtifacts,
   flowWrapperRef,
   reactFlowInstance,
   viewportRevision,
@@ -2204,6 +2532,7 @@ function NodeOrchestrationWindow({
   const basePositionRef = useRef({ left: 0, top: 0 });
   const [position, setPosition] = useState(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  const [runConfirmed, setRunConfirmed] = useState(false);
   const dragRef = useRef(null);
 
   useLayoutEffect(() => {
@@ -2292,7 +2621,7 @@ function NodeOrchestrationWindow({
   const validPlan = isValidOrchestrationPlan(plan)
     ? plan
     : null;
-  const humanAttention = summary.humanRequired > 0;
+  const liveExecutionState = orchestrationRun?.taskStates ?? executionState;
 
   return (
     <aside
@@ -2328,7 +2657,7 @@ function NodeOrchestrationWindow({
         <div className="node-orchestration-controls">
           {phase === "preview-approved" && (
             <>
-              <button type="button" onClick={onExpand} aria-label="Expand orchestration">↗</button>
+              <button type="button" onClick={onExpand} aria-label={clusterVisible ? "Hide task cluster" : "Show task cluster"}>{clusterVisible ? "—" : "↗"}</button>
               <button type="button" onClick={onFullscreen} aria-label="Open full-screen orchestration">⛶</button>
             </>
           )}
@@ -2376,7 +2705,7 @@ function NodeOrchestrationWindow({
             ) : (
               <>
                 <strong>First Mate · Proposed orchestration</strong>
-                <span>Concept preview — nothing has run.</span>
+                <span>Preview only · requires human approval before any local run.</span>
                 <div className="request-field">
                   <span>Objective</span>
                   <strong>{validPlan.objective}</strong>
@@ -2430,22 +2759,30 @@ function NodeOrchestrationWindow({
               </>
             ) : (
               <>
-                <strong>First Mate</strong>
-                <span>Coordinating {summary.total} agents · Preview approved</span>
+                <strong>First Mate · Local Codex</strong>
+                <span>Read-only orchestration · Preview approved</span>
                 <div className="node-orchestration-status-list">
-                  {validPlan.assignments.map((assignment) => (
-                    <StatusIndicator key={assignment.id} status={executionState[assignment.id] ?? "Waiting"} label={`${assignment.role} · Mock ${executionState[assignment.id] ?? "Waiting"}`} size="sm" className="node-orchestration-status-list-item" />
-                  ))}
+                  {selectOrchestrationTasks(validPlan).map((task) => {
+                    const assignment = validPlan.assignments.find((item) => item.taskId === task.id);
+                    return (
+                    <StatusIndicator key={assignment.id} status={liveExecutionState[assignment.id] ?? "Queued"} label={`${assignment.role} · ${liveExecutionState[assignment.id] ?? "Queued"}`} size="sm" className="node-orchestration-status-list-item" />
+                    );
+                  })}
                 </div>
-                <div className={`node-orchestration-human ${humanAttention ? "attention" : ""}`}>
-                  <StatusIndicator status={humanAttention ? "human-required" : "waiting"} label={`Human attention: ${humanAttention ? "Required" : "None"}`} size="sm" />
+                <div className="orchestration-run-guard">
+                  <strong>Maximum 3 specialist turns</strong>
+                  <span>Local Codex runtime only · read-only · no stage advancement or decisions.</span>
+                  <label><input type="checkbox" checked={runConfirmed} onChange={(event) => setRunConfirmed(event.target.checked)} disabled={orchestrationRun?.status === "working" || orchestrationRun?.status === "queued"} /> I understand and approve this analysis run.</label>
                 </div>
-                <span className="node-orchestration-mock-note">Mock execution state · Nothing has run.</span>
+                {orchestrationRun?.status && <div className="orchestration-run-status"><StatusIndicator status={orchestrationRun.status} label={`Run ${orchestrationRun.status}`} size="sm" />{orchestrationRun.runId && <span>{orchestrationRun.runId}</span>}</div>}
+                {orchestrationRun?.error && <div className="intake-error">{orchestrationRun.error}</div>}
+                {(orchestrationRun?.taskOutputs ?? []).map((output) => <div className="orchestration-task-output" key={output.taskId}><strong>{output.role}</strong><span>{output.summary}</span><button type="button" onClick={() => onInspectArtifacts?.(output.taskId)}>Inspect artifacts</button></div>)}
               </>
             )}
           </div>
           <div className="node-orchestration-window-actions approved-actions">
-            <button type="button" onClick={onExpand} disabled={!validPlan}>Expand orchestration →</button>
+            <button type="button" onClick={onExpand} disabled={!validPlan}>{clusterVisible ? "Hide task cluster" : "Show task cluster"}</button>
+            {orchestrationRun?.status === "working" || orchestrationRun?.status === "queued" ? <button type="button" onClick={onCancelRun}>Cancel run</button> : <button type="button" className="primary" onClick={onRun} disabled={!validPlan || !runConfirmed}>Run orchestration</button>}
             <button type="button" onClick={onReset}>Reset preview</button>
           </div>
         </>
@@ -2796,6 +3133,23 @@ function FullscreenConversation({
   );
 }
 
+function SourceViewer({ sourceId, onClose }) {
+  const [source, setSource] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getEpisodeSource(sourceId).then((result) => { if (!cancelled) setSource(result); });
+    return () => { cancelled = true; };
+  }, [sourceId]);
+
+  return <div className="source-viewer-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="source-viewer" role="dialog" aria-modal="true" aria-label="Source material">
+      <header><div><div className="drawer-eyebrow">Local source</div><h2>{source?.fileName ?? "Loading source…"}</h2><span>{source?.fileType} · {source?.charCount?.toLocaleString() ?? "—"} chars</span></div><button type="button" onClick={onClose} aria-label="Close source viewer">×</button></header>
+      <pre>{source?.text ?? "Loading extracted text…"}</pre>
+    </section>
+  </div>;
+}
+
 function NodeChatDrawer({
   open,
   onClose,
@@ -2816,6 +3170,11 @@ function NodeChatDrawer({
   onRemoveNode,
   initialView = "conversation",
   nodeDetails,
+  sourceManifest = [],
+  nodeSourceManifest = [],
+  onOpenSource,
+  onAttachSources,
+  attachmentsBusy = false,
 }) {
   const [
     draft,
@@ -2985,6 +3344,7 @@ function NodeChatDrawer({
             <section>
               <span>Full context</span>
               <p className="drawer-context-raw">{contextContent || "No additional context was provided yet."}</p>
+              {sourceManifest.length > 0 && <div className="drawer-source-list"><span>Attached sources</span>{sourceManifest.map((source) => <button type="button" key={source.sourceId} onClick={() => onOpenSource(source.sourceId)}>{source.fileName} · {source.charCount.toLocaleString()} chars</button>)}</div>}
             </section>
           )}
           {nodeDetails?.description && <section><span>Purpose / Description</span><p>{nodeDetails.description}</p></section>}
@@ -2992,6 +3352,7 @@ function NodeChatDrawer({
           {nodeDetails?.dependsOn?.length > 0 && <section><span>Dependencies</span>{nodeDetails.dependsOn.map((dependency) => <p key={dependency.id}>• {dependency.title}</p>)}</section>}
           {nodeDetails?.expectedOutcome && <section><span>Expected outcome</span><p>{nodeDetails.expectedOutcome}</p></section>}
           {nodeDetails?.provenance && <section><span>Source / Provenance</span><p>{nodeDetails.provenance}</p></section>}
+          {nodeDetails?.sourceReferences?.length > 0 && <section><span>Source references</span>{nodeDetails.sourceReferences.map((source) => <button type="button" className="drawer-source-reference" key={source.sourceId} onClick={() => onOpenSource(source.sourceId)}>{source.fileName}</button>)}</section>}
           {nodeDetails?.authority && <section><span>Authority</span><p>{nodeDetails.authority}</p></section>}
           {nodeDetails?.acceptedAt && <section><span>Accepted by human</span><p>{new Date(nodeDetails.acceptedAt).toLocaleString()}</p></section>}
           <button type="button" className="drawer-ask-agent-button" onClick={() => { setView("conversation"); window.setTimeout(() => composerRef.current?.focus(), 0); }}>Ask agent about this node</button>
@@ -2999,6 +3360,18 @@ function NodeChatDrawer({
       )}
 
       {view === "conversation" && <div className="drawer-thread">
+        <section className="drawer-node-sources">
+          <div>
+            <span className="drawer-eyebrow">Node context</span>
+            <strong>{nodeSourceManifest.length ? `${nodeSourceManifest.length} attached source${nodeSourceManifest.length === 1 ? "" : "s"}` : "No node-specific sources"}</strong>
+          </div>
+          {nodeSourceManifest.length > 0 && <div className="drawer-source-list">{nodeSourceManifest.map((source) => <button type="button" key={source.sourceId} onClick={() => onOpenSource(source.sourceId)}>{source.fileName}</button>)}</div>}
+          <label className="drawer-node-source-upload">
+            <span>{attachmentsBusy ? "Preparing source…" : "Attach files to this node"}</span>
+            <input type="file" multiple accept=".txt,.md,.pdf,.docx,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(event) => { const files = [...event.target.files]; event.target.value = ""; if (files.length) onAttachSources?.(files); }} disabled={attachmentsBusy} />
+          </label>
+          <small>Only this node conversation will use these files automatically.</small>
+        </section>
         {anchorNodeId === "context" && (
           <section className="drawer-context-detail">
             <div className="drawer-eyebrow">Known context</div>
@@ -3008,6 +3381,7 @@ function NodeChatDrawer({
             <p className="drawer-context-raw">
               {contextContent || "No additional context was provided yet."}
             </p>
+            {sourceManifest.length > 0 && <div className="drawer-source-list"><span>Attached sources</span>{sourceManifest.map((source) => <button type="button" key={source.sourceId} onClick={() => onOpenSource(source.sourceId)}>{source.fileName}</button>)}</div>}
           </section>
         )}
 
@@ -3268,6 +3642,11 @@ export default function App() {
   ] = useState(null);
 
   const [
+    traceNodeId,
+    setTraceNodeId,
+  ] = useState(null);
+
+  const [
     drawerOpen,
     setDrawerOpen,
   ] = useState(false);
@@ -3334,6 +3713,17 @@ export default function App() {
   const [codexRunningEpisodeId, setCodexRunningEpisodeId] = useState(null);
   const [codexRun, setCodexRun] = useState(null);
   const codexEventSourceRef = useRef(null);
+  const orchestrationEventSourceRef = useRef(null);
+  const autopilotEventSourceRef = useRef(null);
+  const [orchestrationRun, setOrchestrationRun] = useState(null);
+  const [autopilotRun, setAutopilotRun] = useState(null);
+  const [followAutopilotWork, setFollowAutopilotWork] = useState(true);
+  const [showGeneratedArtifacts, setShowGeneratedArtifacts] = useState(false);
+  const [showAutopilotInspector, setShowAutopilotInspector] = useState(true);
+  const [showEpisodeCockpit, setShowEpisodeCockpit] = useState(false);
+  const [agentNotifications, setAgentNotifications] = useState([]);
+  const [sourceViewerId, setSourceViewerId] = useState(null);
+  const [nodeSourceBusy, setNodeSourceBusy] = useState(false);
 
   const [
     viewportRevision,
@@ -3478,6 +3868,8 @@ export default function App() {
       null
     );
 
+    setTraceNodeId(null);
+
     setActiveThreadId(
       null
     );
@@ -3495,7 +3887,10 @@ export default function App() {
     setOrchestrationExpanded(false);
     setOrchestrationMinimized(false);
     setOrchestrationDetailId(null);
-    setOrchestrationPreviews({});
+    setOrchestrationPreviews(activeEpisode.runtime?.codex?.orchestration ?? {});
+    setOrchestrationRun(null);
+    setAutopilotRun(activeEpisode.autopilotRun ?? null);
+    setFollowAutopilotWork(Boolean(activeEpisode.autopilotRun?.status === "working"));
     setIntakePanelOpen(
       ["pending", "proposed"].includes(activeEpisode.intake?.status)
     );
@@ -3543,6 +3938,78 @@ export default function App() {
       activeEpisodeId,
       updater
     );
+  }
+
+  async function attachNodeSources(nodeId, files) {
+    if (!activeEpisode || !nodeId || files.length === 0) return;
+    if ((activeEpisode.sources?.length ?? 0) + files.length > MAX_SOURCE_FILES) {
+      throw new Error(`An episode can contain up to ${MAX_SOURCE_FILES} files.`);
+    }
+    setNodeSourceBusy(true);
+    try {
+      const records = [];
+      for (const file of files) records.push(await extractSourceFile(file));
+      const manifest = sourceManifestFromRecords(records);
+      const validation = validateSourceManifest([...(activeEpisode.sources ?? []), ...manifest]);
+      if (!validation.valid) throw new Error(validation.error);
+      await saveEpisodeSources(records, activeEpisode.id);
+      updateEpisode(activeEpisode.id, (episode) => ({
+        ...episode,
+        sources: [...(episode.sources ?? []), ...manifest],
+        nodeSourceIds: {
+          ...(episode.nodeSourceIds ?? {}),
+          [nodeId]: [...new Set([...(episode.nodeSourceIds?.[nodeId] ?? []), ...manifest.map((source) => source.sourceId)])],
+        },
+      }));
+      appendActivity(activeEpisode.id, { type: "source.node_attached", actor: "human", title: "Source attached to node", summary: `${manifest.map((source) => source.fileName).join(", ")} · available only in this node conversation.`, relatedNodeId: nodeId, authorityImpact: "source-management" });
+    } finally {
+      setNodeSourceBusy(false);
+    }
+  }
+
+  function exportEpisodeReview(episode) {
+    if (!episode) return;
+    const run = episode.autopilotRun;
+    const lines = [
+      `# ${episode.name || deriveEpisodeName(episode.title)}`,
+      "",
+      `Episode: ${episode.id}`,
+      `Current stage: ${EPISODE_STAGES[episode.currentStage]?.name ?? "Unknown"}`,
+      `Workflow template: ${episode.template ? `${episode.template.name} v${episode.template.version}` : "Custom"}`,
+      "",
+      "## Objective",
+      episode.title,
+      "",
+      "## Context",
+      episode.context || "No additional context supplied.",
+      "",
+      "## Sources",
+      ...(episode.sources?.length ? episode.sources.map((source) => `- ${source.fileName} (${source.charCount.toLocaleString()} extracted characters)`) : ["- No source files attached."]),
+      "",
+      "## Autopilot review package",
+      run?.finalPackage?.summary ?? "No final Autopilot package is available.",
+      "",
+      "### Findings",
+      ...(run?.finalPackage?.findings?.length ? run.finalPackage.findings.map((item) => `- ${item}`) : ["- None recorded."]),
+      "",
+      "### Risks and unresolved questions",
+      ...(run?.finalPackage?.risks?.length ? run.finalPackage.risks.map((item) => `- ${item}`) : ["- None recorded."]),
+      ...(run?.finalPackage?.unresolvedQuestions?.length ? run.finalPackage.unresolvedQuestions.map((item) => `- Unresolved: ${item}`) : []),
+      "",
+      "## Human review",
+      `Status: ${run?.humanReviewStatus ?? "Not recorded"}`,
+      `Recommended next step: ${run?.finalPackage?.recommendedNextStep ?? "Review the episode evidence and decide the next human action."}`,
+      "",
+      "This package is a draft for human review. It does not authorize external action, stage advancement, or final disposition.",
+    ];
+    const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${episode.id.toLowerCase()}-review-package.md`;
+    link.click();
+    URL.revokeObjectURL(url);
+    appendActivity(episode.id, { type: "review.package_exported", actor: "human", title: "Review package exported", summary: "A Markdown review package was downloaded for sharing and review.", authorityImpact: "human-review" });
   }
 
   function findBaseNode(
@@ -3594,12 +4061,22 @@ export default function App() {
       return workflowNode.title;
     }
 
+    const workflowGate = episode.workflow?.gates?.find(
+      (gate) => gate.id === nodeId
+    );
+    if (workflowGate) return workflowGate.title;
+
     const proposalNode = episode.intake?.proposal?.workNodes?.find(
       (node) => node.id === nodeId
     );
     if (proposalNode) {
       return proposalNode.title;
     }
+
+    const proposalGate = episode.intake?.proposal?.humanGates?.find(
+      (gate) => gate.id === nodeId
+    );
+    if (proposalGate) return proposalGate.title;
 
     const addition =
       episode.additions?.find(
@@ -3650,11 +4127,19 @@ export default function App() {
       return workflowNode.kind;
     }
 
+    if (episode.workflow?.gates?.some((gate) => gate.id === nodeId)) {
+      return "Human checkpoint";
+    }
+
     const proposalNode = episode.intake?.proposal?.workNodes?.find(
       (node) => node.id === nodeId
     );
     if (proposalNode) {
       return proposalNode.kind;
+    }
+
+    if (episode.intake?.proposal?.humanGates?.some((gate) => gate.id === nodeId)) {
+      return "Human checkpoint";
     }
 
     const addition =
@@ -3703,6 +4188,11 @@ export default function App() {
     if (workflowNode) {
       return workflowNode.position;
     }
+
+    const workflowGate = episode.workflow?.gates?.find(
+      (gate) => gate.id === nodeId
+    );
+    if (workflowGate) return workflowGate.position;
 
     const addition =
       episode.additions?.find(
@@ -3884,6 +4374,11 @@ export default function App() {
     };
   }
 
+  function pushAgentNotification({ title, summary, nodeId }) {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setAgentNotifications((current) => [...current, { id, title, summary, nodeId }].slice(-4));
+  }
+
   function openNodeOrchestration(nodeId) {
     const node = getOrchestrationSourceNode(nodeId);
     if (
@@ -3898,10 +4393,7 @@ export default function App() {
     setOrchestrationNodeId(nodeId);
     setOrchestrationMinimized(false);
     setOrchestrationDetailId(null);
-    setOrchestrationExpanded(
-      orchestrationPreviews[nodeId]?.state ===
-        "preview-approved"
-    );
+    setOrchestrationExpanded(false);
     appendActivity(activeEpisode.id, {
       type: "orchestration.requested",
       actor: "human",
@@ -3934,6 +4426,24 @@ export default function App() {
     });
   }
 
+  function saveOrchestrationPreview(nodeId, nextValue) {
+    setOrchestrationPreviews((current) => ({ ...current, [nodeId]: nextValue }));
+    if (!activeEpisode) return;
+    updateEpisode(activeEpisode.id, (episode) => ({
+      ...episode,
+      runtime: {
+        ...(episode.runtime ?? {}),
+        codex: {
+          ...(episode.runtime?.codex ?? {}),
+          orchestration: {
+            ...(episode.runtime?.codex?.orchestration ?? {}),
+            [nodeId]: nextValue,
+          },
+        },
+      },
+    }));
+  }
+
   function backToOrchestrationRequest() {
     if (!orchestrationNodeId) {
       return;
@@ -3955,30 +4465,176 @@ export default function App() {
       return;
     }
 
-    setOrchestrationPreviews((current) => {
-      const plan =
-        current[orchestrationNodeId]?.plan ??
-        getLocalOrchestrationPlan(orchestrationNodeId);
-
-      return {
-        ...current,
-        [orchestrationNodeId]: {
-          state: "preview-approved",
-          plan,
-          executionState: createMockExecutionState(plan),
-        },
-      };
+    const plan = orchestrationPreviews[orchestrationNodeId]?.plan ?? getLocalOrchestrationPlan(orchestrationNodeId);
+    const executionState = selectOrchestrationTasks(plan).reduce(
+      (state, task) => ({ ...state, [task.id]: "Queued" }),
+      {}
+    );
+    saveOrchestrationPreview(orchestrationNodeId, {
+      state: "preview-approved",
+      plan,
+      executionState,
+      runStatus: "queued",
+      runId: null,
+      taskOutputs: [],
+      error: null,
     });
-    setOrchestrationExpanded(true);
+    setOrchestrationExpanded(false);
     setOrchestrationMinimized(false);
     appendActivity(activeEpisode.id, {
       type: "orchestration.preview_approved",
       actor: "human",
       title: "Human approved orchestration preview",
-      summary: "Mock execution state · nothing has run.",
+      summary: "Human approved a bounded read-only orchestration run.",
       relatedNodeId: orchestrationNodeId,
       authorityImpact: "execution-preview",
     });
+  }
+
+  async function runOrchestration() {
+    if (!activeEpisode || !orchestrationNodeId) return;
+    const preview = orchestrationPreviews[orchestrationNodeId];
+    const plan = preview?.plan ?? getLocalOrchestrationPlan(orchestrationNodeId);
+    if (!plan || preview?.state !== "preview-approved" || orchestrationRun?.status === "working" || preview?.runStatus === "working") return;
+    const node = getOrchestrationNodeRecord(orchestrationNodeId);
+    const sourceRecords = [];
+    const relevantSourceIds = node.data?.sourceIds ?? [];
+    try {
+      for (const source of activeEpisode.sources ?? []) {
+        if (relevantSourceIds.length > 0 && !relevantSourceIds.includes(source.sourceId)) continue;
+        const stored = await getEpisodeSource(source.sourceId);
+        if (!stored) throw new Error(`Source ${source.fileName} is missing from local storage.`);
+        sourceRecords.push({ ...source, text: stored.text });
+      }
+    } catch (error) {
+      appendActivity(activeEpisode.id, { type: "orchestration.run_failed", actor: "system", title: "Read-only orchestration failed", summary: error.message, relatedNodeId: orchestrationNodeId, authorityImpact: "analysis" });
+      return;
+    }
+    const tasks = selectOrchestrationTasks(plan);
+    const initialRun = {
+      episodeId: activeEpisode.id,
+      nodeId: orchestrationNodeId,
+      status: "queued",
+      runId: null,
+      taskStates: tasks.reduce((state, task) => ({ ...state, [task.id]: "Queued" }), {}),
+      taskOutputs: [],
+      events: [],
+      startedAt: new Date().toISOString(),
+    };
+    setOrchestrationRun(initialRun);
+    saveOrchestrationPreview(orchestrationNodeId, {
+      ...preview,
+      runStatus: "queued",
+      runId: null,
+      taskOutputs: [],
+      error: null,
+      startedAt: initialRun.startedAt,
+    });
+    appendActivity(activeEpisode.id, {
+      type: "orchestration.run_started",
+      actor: "human",
+      title: "Human started read-only orchestration",
+      summary: `Up to ${tasks.length} specialist turns using the local Codex runtime.`,
+      relatedNodeId: orchestrationNodeId,
+      authorityImpact: "analysis",
+    });
+    try {
+      const response = await fetch("/api/codex/orchestration/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          approved: true,
+          episodeId: activeEpisode.id,
+          nodeId: orchestrationNodeId,
+          episodeName: activeEpisode.name,
+          objective: activeEpisode.title,
+          context: activeEpisode.context,
+          node: { id: node.id, kind: node.data?.workflowKind, title: node.data?.title, body: node.data?.body, sourceIds: node.data?.sourceIds ?? [] },
+          threads: getThreadsForNode(activeEpisode, viewStage, orchestrationNodeId),
+          sources: sourceRecords,
+          plan,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.runId) throw new Error(result.message || "Local orchestration runtime unavailable.");
+      setOrchestrationRun((current) => current ? { ...current, status: "working", runId: result.runId } : current);
+      saveOrchestrationPreview(orchestrationNodeId, {
+        ...preview,
+        runStatus: "working",
+        runId: result.runId,
+        taskOutputs: [],
+        error: null,
+        startedAt: initialRun.startedAt,
+      });
+      const eventSource = new EventSource(`/api/codex/runs/${result.runId}/events`);
+      orchestrationEventSourceRef.current = eventSource;
+      eventSource.onmessage = (event) => {
+        const normalized = JSON.parse(event.data);
+        setOrchestrationRun((current) => current && current.nodeId === orchestrationNodeId ? applyOrchestrationEvent(current, normalized) : current);
+        if (normalized.type === "task" && normalized.status === "complete") {
+          const completedTask = tasks.find((task) => task.id === normalized.taskId);
+          pushAgentNotification({
+            title: `${completedTask?.role ?? "Specialist"} completed`,
+            summary: normalized.label ?? "A read-only output is ready to inspect.",
+            nodeId: orchestrationNodeId,
+          });
+          appendActivity(activeEpisode.id, {
+            type: "orchestration.task_completed",
+            actor: "codex",
+            title: "Orchestration specialist completed",
+            summary: normalized.label ?? normalized.taskId,
+            relatedNodeId: orchestrationNodeId,
+            authorityImpact: "analysis",
+          });
+        }
+        if (["completed", "cancelled", "error"].includes(normalized.type)) {
+          const outputs = normalized.outputs ?? [];
+          const status = normalized.type === "completed" ? "complete" : normalized.type;
+          setOrchestrationRun((current) => current && current.nodeId === orchestrationNodeId
+            ? { ...current, status, taskOutputs: outputs, finishedAt: new Date().toISOString() }
+            : current);
+          const artifacts = outputs.length > 0 ? mapOrchestrationArtifacts(outputs, { nodeId: orchestrationNodeId, nodeKind: node.data?.workflowKind, runId: result.runId, stageIndex: viewStage }) : [];
+          updateEpisode(activeEpisode.id, (episode) => ({
+            ...episode,
+            additions: artifacts.length > 0 ? [...(episode.additions ?? []), ...artifacts] : episode.additions,
+            runtime: { ...(episode.runtime ?? {}), codex: { ...(episode.runtime?.codex ?? {}), orchestration: { ...(episode.runtime?.codex?.orchestration ?? {}), [orchestrationNodeId]: { ...preview, state: "preview-approved", runStatus: status, runId: result.runId, taskOutputs: outputs, artifactIds: artifacts.map((artifact) => artifact.id), error: normalized.message ?? null, completedAt: new Date().toISOString() } } } },
+          }));
+          appendActivity(activeEpisode.id, { type: `orchestration.run_${status}`, actor: status === "complete" ? "codex" : "human", title: status === "complete" ? "Read-only orchestration completed" : status === "cancelled" ? "Read-only orchestration cancelled" : "Read-only orchestration failed", summary: normalized.message ?? `${outputs.length} specialist output${outputs.length === 1 ? "" : "s"} retained.`, relatedNodeId: orchestrationNodeId, authorityImpact: "analysis" });
+          pushAgentNotification({
+            title: status === "complete" ? "First Mate run completed" : `First Mate run ${status}`,
+            summary: normalized.message ?? `${outputs.length} specialist output${outputs.length === 1 ? "" : "s"} are ready to inspect.`,
+            nodeId: orchestrationNodeId,
+          });
+          eventSource.close();
+          orchestrationEventSourceRef.current = null;
+        }
+      };
+      eventSource.onerror = () => {
+        if (eventSource.readyState === EventSource.CLOSED || orchestrationEventSourceRef.current !== eventSource) return;
+        setOrchestrationRun((current) => current ? { ...current, status: "error", error: "Local orchestration runtime unavailable." } : current);
+        eventSource.close();
+        orchestrationEventSourceRef.current = null;
+      };
+    } catch (error) {
+      setOrchestrationRun((current) => current ? { ...current, status: "error", error: error.message } : current);
+      saveOrchestrationPreview(orchestrationNodeId, { ...preview, runStatus: "error", error: error.message });
+      appendActivity(activeEpisode.id, { type: "orchestration.run_failed", actor: "codex", title: "Read-only orchestration failed", summary: error.message, relatedNodeId: orchestrationNodeId, authorityImpact: "analysis" });
+    }
+  }
+
+  function cancelOrchestration() {
+    if (!orchestrationRun?.runId) return;
+    void fetch(`/api/codex/runs/${orchestrationRun.runId}`, { method: "DELETE" });
+    setOrchestrationRun((current) => current ? { ...current, status: "cancelled" } : current);
+    saveOrchestrationPreview(orchestrationNodeId, { ...(orchestrationPreviews[orchestrationNodeId] ?? {}), runStatus: "cancelled", runId: orchestrationRun.runId });
+  }
+
+  function inspectOrchestrationArtifacts(taskId) {
+    const preview = orchestrationPreviews[orchestrationNodeId];
+    const output = (orchestrationRun?.taskOutputs ?? preview?.taskOutputs ?? []).find((item) => item.taskId === taskId);
+    const runId = orchestrationRun?.runId ?? preview?.runId;
+    const artifact = activeEpisode?.additions?.find((item) => item.orchestrationRunId === runId && item.taskRole === output?.role);
+    if (artifact) openDetailsForNode(artifact.id);
   }
 
   function resetOrchestrationPreview() {
@@ -4017,12 +4673,12 @@ export default function App() {
         summary: proposal.context?.summary ?? proposal.context_summary ?? "",
         suggestedSources: proposal.context?.suggestedSources ?? proposal.suggested_sources ?? [],
       },
-      workNodes: proposal.workNodes ?? proposal.work_nodes ?? [],
+      workNodes: (proposal.workNodes ?? proposal.work_nodes ?? []).map((node) => ({ ...node, sourceIds: node.sourceIds ?? node.source_ids ?? [] })),
       humanGates: proposal.humanGates ?? proposal.human_gates ?? [],
       assumptions: proposal.assumptions ?? [],
       unresolved: proposal.unresolved ?? [],
     };
-    const validation = validateEpisodeStructureProposal(normalizedProposal, episode.id);
+    const validation = validateEpisodeStructureProposal(normalizedProposal, episode.id, episode.sources ?? []);
     if (!validation.valid) {
       throw new Error(validation.error);
     }
@@ -4084,7 +4740,7 @@ export default function App() {
     const proposal = activeEpisode?.intake?.proposal;
     if (!activeEpisode || !proposal) return;
 
-    const validation = validateEpisodeStructureProposal(proposal, activeEpisode.id);
+    const validation = validateEpisodeStructureProposal(proposal, activeEpisode.id, activeEpisode.sources ?? []);
     if (!validation.valid) return;
     const nodes = proposal.workNodes.map((node, index) => ({
       id: node.id,
@@ -4096,6 +4752,7 @@ export default function App() {
       description: node.description,
       rationale: node.rationale,
       dependsOn: node.dependsOn ?? [],
+      sourceIds: node.sourceIds ?? [],
       expectedOutcome: node.expectedOutcome,
       position: {
         x: 120 + (index % 3) * 330,
@@ -4110,6 +4767,7 @@ export default function App() {
     const terminalNodes = proposal.workNodes.filter(
       (node) => !proposal.workNodes.some((candidate) => candidate.dependsOn?.includes(node.id))
     );
+    const workflowGates = createWorkflowGates(proposal.humanGates);
 
     updateEpisode(activeEpisode.id, (episode) => ({
       ...episode,
@@ -4120,9 +4778,13 @@ export default function App() {
       },
       workflow: {
         nodes,
+        gates: workflowGates,
         edges: [
           ...dependencies,
-          ...terminalNodes.map((node) => [node.id, "gate"]),
+          ...createWorkflowGateEdges(
+            workflowGates,
+            terminalNodes.map((node) => node.id)
+          ),
         ],
       },
     }));
@@ -4166,6 +4828,10 @@ export default function App() {
       return null;
     }
 
+    const sourceReferences = (source.sourceIds ?? []).map((sourceId) =>
+      activeEpisode.sources?.find((item) => item.sourceId === sourceId) ?? { sourceId, fileName: "Unknown source" }
+    );
+
     const dependencies = source.dependsOn?.length
       ? source.dependsOn
       : workflowNode
@@ -4202,6 +4868,7 @@ export default function App() {
         ? "Analysis / proposal only. No execution or stage advancement."
         : null,
       acceptedAt: isAccepted ? activeEpisode.intake?.acceptedAt : null,
+      sourceReferences,
     };
   }
 
@@ -4626,12 +5293,15 @@ export default function App() {
   /* CREATE EPISODE                                                         */
   /* ---------------------------------------------------------------------- */
 
-  function createEpisode({
+  async function createEpisode({
     title,
     name,
     context,
     setupMode,
     projectId,
+    sources = [],
+    sourceEvents = [],
+    template = null,
   }) {
     const nextNumber =
       episodes.reduce(
@@ -4662,6 +5332,11 @@ export default function App() {
         "0"
       )}`;
 
+    const sourceManifest = sourceManifestFromRecords(sources);
+    const sourceValidation = validateSourceManifest(sourceManifest);
+    if (!sourceValidation.valid) throw new Error(sourceValidation.error);
+    await saveEpisodeSources(sources, id);
+
     const episode = {
       id,
 
@@ -4670,6 +5345,12 @@ export default function App() {
       name: name || deriveEpisodeName(title),
 
       context,
+
+      sources: sourceManifest,
+
+      nodeSourceIds: {},
+
+      template: template ? { id: template.id, name: template.name, version: template.version } : null,
 
       currentStage: 0,
 
@@ -4691,6 +5372,7 @@ export default function App() {
       workflow: {
         nodes: [],
         edges: [],
+        gates: [],
       },
 
       projectId: projectId ?? null,
@@ -4700,16 +5382,58 @@ export default function App() {
           intakeThreadId: null,
           lastRunAt: null,
           lastError: null,
+          orchestration: {},
         },
       },
 
-      activity: [createActivityEvent({
-        episodeId: id,
-        type: "episode.created",
-        actor: "human",
-        title: "Episode created",
-        summary: name || deriveEpisodeName(title),
-      })],
+      autopilotRun: setupMode === "agent-assisted" ? {
+        status: "queued",
+        runId: null,
+        startedAt: null,
+        draftPlan: null,
+        taskStates: { "intake-planner": "queued" },
+        outputs: [],
+        assumptions: [],
+        unresolvedItems: [],
+        errors: [],
+        finalPackage: null,
+        humanReviewStatus: "pending",
+      } : null,
+
+      activity: [
+        createActivityEvent({
+          episodeId: id,
+          type: "episode.created",
+          actor: "human",
+          title: "Episode created",
+          summary: name || deriveEpisodeName(title),
+        }),
+        ...(template ? [createActivityEvent({
+          episodeId: id,
+          type: "episode.template_applied",
+          actor: "human",
+          title: "Workflow template selected",
+          summary: `${template.name} v${template.version} prefilled the episode brief; the workflow remains subject to human review.`,
+          authorityImpact: "human-review",
+        })] : []),
+        ...(sourceManifest.length > 0 ? [createActivityEvent({
+          episodeId: id,
+          type: "source.ingested",
+          actor: "human",
+          title: "Source material ingested",
+          summary: `${sourceManifest.length} source${sourceManifest.length === 1 ? "" : "s"} extracted and stored locally.`,
+          metadata: { sourceIds: sourceManifest.map((source) => source.sourceId) },
+        })] : []),
+        ...sourceEvents.map((event) => createActivityEvent({
+          episodeId: id,
+          type: event.type,
+          actor: "human",
+          title: event.type === "source.extraction_failed" ? "Source extraction failed" : "Source removed before analysis",
+          summary: event.message ?? event.fileName,
+          metadata: { sourceId: event.sourceId ?? null, fileName: event.fileName ?? null },
+          authorityImpact: "source-management",
+        })),
+      ],
     };
 
     if (setupMode === "agent-assisted") {
@@ -4743,8 +5467,109 @@ export default function App() {
     setNewEpisodeProjectId(null);
 
     if (setupMode === "agent-assisted") {
-      void runNativeCodexIntake(episode);
+      void runAutopilotEpisode(episode);
     }
+  }
+
+  async function runAutopilotEpisode(episode, instruction = "") {
+    if (!episode?.id || autopilotEventSourceRef.current || episode.autopilotRun?.status === "working") return;
+    const startedAt = new Date().toISOString();
+    const initial = { ...(episode.autopilotRun ?? {}), episodeId: episode.id, status: "queued", runId: null, startedAt, finishedAt: null, instruction, activeTaskId: null, activeNodeId: null, taskStates: { "intake-planner": "queued" }, outputs: [], errors: [], error: null, finalPackage: null, humanReviewStatus: "pending", events: [] };
+    setAutopilotRun(initial);
+    updateEpisode(episode.id, (current) => ({ ...current, autopilotRun: initial, intake: { ...normalizeEpisodeIntake(current.intake), status: "pending" } }));
+    appendActivity(episode.id, { type: "autopilot.run_started", actor: "codex", title: "Autopilot episode run started", summary: `Bounded local run · maximum ${MAX_AUTOPILOT_TURNS} Codex turns.`, authorityImpact: "proposal" });
+    try {
+      const sources = [];
+      for (const source of episode.sources ?? []) {
+        const stored = await getEpisodeSource(source.sourceId);
+        if (!stored) throw new Error(`Source ${source.fileName} is missing from local storage.`);
+        sources.push({ ...source, text: stored.text });
+      }
+      const response = await fetch("/api/codex/autopilot/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ episodeId: episode.id, episodeName: episode.name, objective: episode.title, context: [episode.context, instruction].filter(Boolean).join("\n\n"), sources, consent: true }) });
+      const result = await response.json();
+      if (!response.ok || !result.runId) throw new Error(result.message || "Local Autopilot runtime unavailable.");
+      setAutopilotRun((current) => current ? { ...current, status: "working", runId: result.runId } : current);
+      updateEpisode(episode.id, (current) => ({ ...current, autopilotRun: { ...(current.autopilotRun ?? initial), status: "working", runId: result.runId } }));
+      const eventSource = new EventSource(`/api/codex/runs/${result.runId}/events`);
+      autopilotEventSourceRef.current = eventSource;
+      eventSource.onmessage = (event) => {
+        const normalized = JSON.parse(event.data);
+        setAutopilotRun((current) => current ? applyAutopilotEvent(current, normalized) : current);
+        updateEpisode(episode.id, (current) => ({ ...current, autopilotRun: applyAutopilotEvent(current.autopilotRun ?? initial, normalized) }));
+        if (normalized.type === "draft-plan" && normalized.plan) {
+          updateEpisode(episode.id, (current) => ({ ...current, intake: { ...normalizeEpisodeIntake(current.intake), status: "proposed", proposal: normalized.plan }, autopilotRun: { ...(current.autopilotRun ?? initial), draftPlan: normalized.plan, taskStates: { ...(current.autopilotRun?.taskStates ?? {}), "intake-planner": "completed" } } }));
+          appendActivity(episode.id, { type: "autopilot.plan_ready", actor: "codex", title: "Autopilot draft plan ready", summary: "Draft run plan is not accepted; specialist analysis may continue.", authorityImpact: "proposal" });
+        }
+        if (normalized.type === "task" && normalized.status === "complete" && normalized.output) {
+          const nodeId = normalized.nodeId ?? normalized.output.nodeId ?? normalized.output.taskId;
+          pushAgentNotification({
+            title: `${normalized.output.role ?? "Autopilot specialist"} completed`,
+            summary: normalized.output.summary ?? "A run output is ready to inspect.",
+            nodeId: nodeId === "final-review" ? "work" : nodeId,
+          });
+          updateEpisode(episode.id, (current) => {
+            const output = normalized.output;
+            const exists = (current.additions ?? []).some((item) => item.id === `autopilot-${result.runId}-${output.taskId}`);
+            const node = current.intake?.proposal?.workNodes?.find((candidate) => candidate.id === nodeId);
+            return { ...current, additions: exists ? current.additions : [...(current.additions ?? []), mapAutopilotArtifact(output, { nodeId: node?.id ?? "work", nodeKind: node?.kind, runId: result.runId })], autopilotRun: { ...(current.autopilotRun ?? initial), outputs: [...(current.autopilotRun?.outputs ?? []).filter((item) => item.taskId !== output.taskId), output], taskStates: { ...(current.autopilotRun?.taskStates ?? {}), [output.taskId]: "completed" } } };
+          });
+          appendActivity(episode.id, { type: "autopilot.task_completed", actor: "codex", title: "Autopilot specialist completed", summary: normalized.label ?? normalized.output.role, authorityImpact: "analysis" });
+        }
+        if (normalized.type === "completed") {
+          updateEpisode(episode.id, (current) => {
+            const finalPackage = normalized.finalPackage ?? null;
+            const runId = current.autopilotRun?.runId ?? result.runId;
+            const finalArtifactId = `autopilot-${runId}-final-review`;
+            const additions = finalPackage && !(current.additions ?? []).some((item) => item.id === finalArtifactId)
+              ? [...(current.additions ?? []), mapAutopilotArtifact(finalPackage, { nodeId: "work", nodeKind: "evaluation", runId })]
+              : current.additions;
+            return { ...current, additions, autopilotRun: { ...(current.autopilotRun ?? initial), status: "complete", draftPlan: normalized.draftPlan ?? current.autopilotRun?.draftPlan, outputs: normalized.outputs ?? current.autopilotRun?.outputs ?? [], finalPackage, finishedAt: new Date().toISOString(), humanReviewStatus: "pending" } };
+          });
+          appendActivity(episode.id, { type: "autopilot.final_package_ready", actor: "codex", title: "Autopilot final package ready", summary: "Human review required. No stage or disposition changed.", authorityImpact: "human-review" });
+          pushAgentNotification({
+            title: "Autopilot run completed",
+            summary: "The final package is ready for human review.",
+            nodeId: "work",
+          });
+          eventSource.close(); autopilotEventSourceRef.current = null;
+        }
+        if (["error", "cancelled"].includes(normalized.type)) {
+          updateEpisode(episode.id, (current) => ({ ...current, autopilotRun: { ...(current.autopilotRun ?? initial), status: normalized.type, error: normalized.message, finishedAt: new Date().toISOString() } }));
+          appendActivity(episode.id, { type: normalized.type === "cancelled" ? "autopilot.run_cancelled" : "autopilot.run_failed", actor: "codex", title: normalized.type === "cancelled" ? "Autopilot run cancelled" : "Autopilot run failed", summary: normalized.message ?? "No further work was completed.", authorityImpact: "analysis" });
+          eventSource.close(); autopilotEventSourceRef.current = null;
+        }
+      };
+      eventSource.onerror = () => {
+        if (eventSource.readyState === EventSource.CLOSED || autopilotEventSourceRef.current !== eventSource) return;
+        updateEpisode(episode.id, (current) => ({ ...current, autopilotRun: { ...(current.autopilotRun ?? initial), status: "error", error: "Local Autopilot runtime unavailable." } }));
+        eventSource.close(); autopilotEventSourceRef.current = null;
+      };
+    } catch (error) {
+      updateEpisode(episode.id, (current) => ({ ...current, autopilotRun: { ...(current.autopilotRun ?? initial), status: "error", error: error.message } }));
+      appendActivity(episode.id, { type: "autopilot.run_failed", actor: "system", title: "Autopilot run failed", summary: error.message, authorityImpact: "analysis" });
+    }
+  }
+
+  function cancelAutopilotEpisode() {
+    if (!autopilotRun?.runId) return;
+    void fetch(`/api/codex/runs/${autopilotRun.runId}`, { method: "DELETE" });
+    autopilotEventSourceRef.current?.close();
+    autopilotEventSourceRef.current = null;
+    setAutopilotRun((current) => current ? { ...current, status: "cancelled" } : current);
+    if (activeEpisode) updateEpisode(activeEpisode.id, (episode) => ({ ...episode, autopilotRun: { ...(episode.autopilotRun ?? {}), status: "cancelled", finishedAt: new Date().toISOString() } }));
+  }
+
+  function promoteAutopilotPackage() {
+    if (!activeEpisode?.autopilotRun?.finalPackage) return;
+    const packageValue = activeEpisode.autopilotRun.finalPackage;
+    updateEpisode(activeEpisode.id, (episode) => ({ ...episode, context: `${episode.context ?? ""}\n\nTrusted context package:\n${packageValue.summary}`, autopilotRun: { ...episode.autopilotRun, humanReviewStatus: "promoted" } }));
+    appendActivity(activeEpisode.id, { type: "autopilot.package_promoted", actor: "human", title: "Autopilot package promoted", summary: "Trusted context updated; stage and disposition unchanged.", authorityImpact: "human-review" });
+  }
+
+  function setAutopilotHumanStatus(status) {
+    if (!activeEpisode) return;
+    updateEpisode(activeEpisode.id, (episode) => ({ ...episode, autopilotRun: { ...episode.autopilotRun, humanReviewStatus: status } }));
+    appendActivity(activeEpisode.id, { type: `autopilot.package_${status}`, actor: "human", title: `Autopilot package ${status}`, summary: "Human review action recorded; stage and disposition unchanged.", authorityImpact: "human-review" });
   }
 
   async function runNativeCodexIntake(episode, revisionInstruction = "") {
@@ -4765,6 +5590,22 @@ export default function App() {
       runtime: { codex: { ...(current.runtime?.codex ?? {}), lastError: null } },
     }));
     try {
+      const sources = [];
+      for (const source of episode.sources ?? []) {
+        const stored = await getEpisodeSource(source.sourceId);
+        if (!stored) throw new Error(`Source ${source.fileName} is missing from local storage.`);
+        sources.push({ ...source, text: stored.text });
+      }
+      if (sources.length > 0) {
+        appendActivity(episode.id, {
+          type: "source.analysis_consented",
+          actor: "human",
+          title: "Source-informed Codex analysis consented",
+          summary: `${sources.length} local source${sources.length === 1 ? "" : "s"} will be analyzed in read-only mode.`,
+          metadata: { sourceIds: sources.map((source) => source.sourceId) },
+          authorityImpact: "proposal",
+        });
+      }
       const response = await fetch("/api/codex/episode-intake/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -4773,6 +5614,9 @@ export default function App() {
           episodeName: episode.name,
           objective: episode.title,
           context: episode.context,
+          sources,
+          sourceConsent: true,
+          sourceConsentRequired: sources.length > 0 || Boolean(episode.context?.trim()),
           threadId: episode.runtime?.codex?.intakeThreadId ?? null,
           revisionInstruction,
         }),
@@ -4809,6 +5653,14 @@ export default function App() {
             metadata: { threadId: normalized.threadId ?? null },
             authorityImpact: "proposal",
           });
+          if (sources.length > 0) appendActivity(episode.id, {
+            type: "source.proposal_completed",
+            actor: "codex",
+            title: "Source-informed proposal completed",
+            summary: `Proposal returned with source citations for ${sources.length} source${sources.length === 1 ? "" : "s"}.`,
+            metadata: { sourceIds: sources.map((source) => source.sourceId) },
+            authorityImpact: "proposal",
+          });
           appendActivity(episode.id, {
             type: isRevision ? "proposal.revised" : "proposal.created",
             actor: "codex",
@@ -4840,6 +5692,7 @@ export default function App() {
         }
       };
       eventSource.onerror = () => {
+        if (eventSource.readyState === EventSource.CLOSED || codexEventSourceRef.current !== eventSource) return;
         setCodexRun((current) => current ? { ...current, status: "error", error: "Local Codex runtime unavailable." } : current);
         eventSource.close();
         codexEventSourceRef.current = null;
@@ -4911,6 +5764,7 @@ export default function App() {
   function removeEpisode(episodeId) {
     const episode = episodes.find((item) => item.id === episodeId);
     if (!episode || !window.confirm(`Remove Episode “${episode.name}”?`)) return;
+    void deleteEpisodeSources(episodeId);
     setEpisodes((current) => current.filter((item) => item.id !== episodeId));
     if (activeEpisodeId === episodeId) setActiveEpisodeId(episodes.find((item) => item.id !== episodeId)?.id ?? null);
     setOpenEpisodeMenuId(null);
@@ -5002,10 +5856,6 @@ export default function App() {
     _event,
     node
   ) {
-    if (node.data?.orchestrationPreview) {
-      return;
-    }
-
     updateActiveEpisode(
       (episode) => ({
         ...episode,
@@ -5157,6 +6007,75 @@ export default function App() {
     );
   }
 
+  function resolveNodeConversation(episodeId, threadId, content, { codexThreadId = null, status = "complete" } = {}) {
+    updateEpisode(episodeId, (episode) => ({
+      ...episode,
+      additions: (episode.additions ?? []).map((item) => item.id === threadId && item.kind === "thread"
+        ? { ...item, messages: [...(item.messages ?? []), createMessage("agent", content)], status, codexThreadId: codexThreadId ?? item.codexThreadId ?? null }
+        : item),
+    }));
+  }
+
+  async function runNodeConversation({ threadId, nodeId, question, messages, codexThreadId = null }) {
+    if (!activeEpisode || !threadId || !nodeId) return;
+    const episodeId = activeEpisode.id;
+    const node = getOrchestrationNodeRecord(nodeId);
+    const details = getNodeDetails(nodeId);
+    const sourceIds = [...new Set([
+      ...(details?.sourceReferences?.map((source) => source.sourceId) ?? []),
+      ...(activeEpisode.nodeSourceIds?.[nodeId] ?? []),
+    ])];
+    const sourceRecords = [];
+    try {
+      for (const source of activeEpisode.sources ?? []) {
+        if (sourceIds.length > 0 && !sourceIds.includes(source.sourceId)) continue;
+        const stored = await getEpisodeSource(source.sourceId);
+        if (!stored) throw new Error(`Source ${source.fileName} is missing from local storage.`);
+        sourceRecords.push({ ...source, text: stored.text });
+      }
+      const response = await fetch("/api/codex/node-conversation/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          episodeId: activeEpisode.id,
+          episodeName: activeEpisode.name,
+          objective: activeEpisode.title,
+          context: activeEpisode.context,
+          nodeId,
+          node: { id: node.id, kind: node.data?.workflowKind ?? node.data?.label, title: node.data?.title, body: node.data?.body, sourceIds },
+          question,
+          messages,
+          codexThreadId,
+          sources: sourceRecords,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.runId) throw new Error(result.message || "Local Codex runtime unavailable.");
+      const eventSource = new EventSource(`/api/codex/runs/${result.runId}/events`);
+      eventSource.onmessage = (event) => {
+        const normalized = JSON.parse(event.data);
+        if (normalized.type === "completed") {
+          resolveNodeConversation(episodeId, threadId, normalized.response, { codexThreadId: normalized.threadId });
+          appendActivity(episodeId, { type: "node.agent_responded", actor: "codex", title: "Codex responded to node question", summary: compactArtifactSummary(normalized.response), relatedNodeId: nodeId, authorityImpact: "analysis" });
+          eventSource.close();
+        }
+        if (["error", "cancelled"].includes(normalized.type)) {
+          resolveNodeConversation(episodeId, threadId, normalized.message ?? "Codex could not complete this node response.", { status: normalized.type });
+          appendActivity(episodeId, { type: "node.agent_response_failed", actor: "system", title: "Codex node response unavailable", summary: normalized.message ?? "No response was returned.", relatedNodeId: nodeId, authorityImpact: "analysis" });
+          eventSource.close();
+        }
+      };
+      eventSource.onerror = () => {
+        if (eventSource.readyState === EventSource.CLOSED) return;
+        resolveNodeConversation(episodeId, threadId, "The local Codex connection ended before a response was returned.", { status: "error" });
+        eventSource.close();
+      };
+    } catch (error) {
+      resolveNodeConversation(episodeId, threadId, error.message || "Codex could not start this node response.", { status: "error" });
+      appendActivity(episodeId, { type: "node.agent_response_failed", actor: "system", title: "Codex node response unavailable", summary: error.message, relatedNodeId: nodeId, authorityImpact: "analysis" });
+    }
+  }
+
   function handleDrawerSend(
     content
   ) {
@@ -5182,13 +6101,27 @@ export default function App() {
         content
       );
 
+      void runNodeConversation({
+        threadId: activeThread.id,
+        nodeId,
+        question: content,
+        messages: [...(activeThread.messages ?? []), { role: "human", content }],
+        codexThreadId: activeThread.codexThreadId ?? null,
+      });
+
       return;
     }
 
-    createThread(
+    const threadId = createThread(
       selectedNodeId,
       content
     );
+    void runNodeConversation({
+      threadId,
+      nodeId,
+      question: content,
+      messages: [{ role: "human", content }],
+    });
   }
 
   /* ---------------------------------------------------------------------- */
@@ -5208,6 +6141,7 @@ export default function App() {
     }
 
     if (intake?.status === "proposed" && intake.proposal) {
+      const proposedGates = intake.proposal.humanGates ?? [];
       return [
         activeStageTemplate.nodes.find((node) => node.id === "work"),
         ...intake.proposal.workNodes.map((node, index) => ({
@@ -5220,7 +6154,19 @@ export default function App() {
           position: { x: 120 + (index % 3) * 330, y: 300 + Math.floor(index / 3) * 240 },
           proposed: true,
         })),
-        activeStageTemplate.nodes.find((node) => node.id === "gate"),
+        ...(proposedGates.length > 0
+          ? proposedGates.map((gate, index) => ({
+              ...gate,
+              id: gate.id,
+              type: "Human checkpoint",
+              kind: "gate",
+              title: gate.title,
+              meta: `Proposed · after ${(gate.afterNodeIds ?? []).join(", ") || "work nodes"}`,
+              dependsOn: gate.afterNodeIds ?? [],
+              position: { x: 120 + (index % 3) * 330, y: 620 + Math.floor(index / 3) * 220 },
+              proposed: true,
+            }))
+          : [activeStageTemplate.nodes.find((node) => node.id === "gate")]),
       ].filter(Boolean);
     }
 
@@ -5228,11 +6174,79 @@ export default function App() {
       return [
         activeStageTemplate.nodes.find((node) => node.id === "work"),
         ...activeEpisode.workflow.nodes,
-        activeStageTemplate.nodes.find((node) => node.id === "gate"),
+        ...(activeEpisode.workflow.gates?.length
+          ? activeEpisode.workflow.gates.map((gate) => ({
+              ...gate,
+              type: "Human checkpoint",
+              kind: "gate",
+              title: gate.title,
+              meta: `After ${(gate.afterNodeIds ?? []).join(", ") || "work nodes"}`,
+            }))
+          : [activeStageTemplate.nodes.find((node) => node.id === "gate")]),
       ].filter(Boolean);
     }
 
     return activeStageTemplate.nodes;
+  }
+
+  function getWorkflowCanvasEdges(visibleStageNodes = getVisibleStageNodes()) {
+    if (viewStage !== 0) {
+      return activeStageTemplate?.edges ?? [];
+    }
+
+    const intake = activeEpisode?.intake;
+    if (intake?.status === "accepted" && activeEpisode.workflow?.edges?.length) {
+      return activeEpisode.workflow.edges;
+    }
+
+    const workflowNodes = visibleStageNodes.filter((node) => node.id !== "work" && node.kind !== "gate");
+    const dependencies = workflowNodes.flatMap((node) =>
+      node.dependsOn?.length
+        ? node.dependsOn.map((dependency) => [dependency, node.id])
+        : [["work", node.id]]
+    );
+    const terminalNodes = workflowNodes.filter(
+      (node) => !workflowNodes.some((candidate) => candidate.dependsOn?.includes(node.id))
+    );
+    const gates = visibleStageNodes.filter((node) => node.kind === "gate");
+    const gateEdges = gates.flatMap((gate) =>
+      gate.afterNodeIds?.length
+        ? gate.afterNodeIds.map((nodeId) => [nodeId, gate.id])
+        : (terminalNodes.length > 0 ? terminalNodes : [{ id: "work" }]).map((node) => [node.id, gate.id])
+    );
+
+    return [...dependencies, ...gateEdges];
+  }
+
+  function getWorkflowCanvasTraceEdges(visibleStageNodes = getVisibleStageNodes()) {
+    const durableEdges = (activeEpisode?.additions ?? [])
+      .filter((item) => item.stageIndex === viewStage && item.parentNodeId && isDurableArtifact(item) && (showGeneratedArtifacts || !isGeneratedRunArtifact(item)))
+      .map((item) => [item.parentNodeId, item.id]);
+    return [...getWorkflowCanvasEdges(visibleStageNodes), ...durableEdges];
+  }
+
+  function organizeVisibleWorkflow() {
+    if (!activeEpisode || viewStage !== 0 || !["accepted", "proposed"].includes(activeEpisode.intake?.status)) {
+      return;
+    }
+
+    const visibleStageNodes = getVisibleStageNodes();
+    const positions = layoutWorkflowNodes(
+      visibleStageNodes,
+      getWorkflowCanvasEdges(visibleStageNodes)
+    );
+    const savedPositions = Object.fromEntries(positions);
+
+    updateActiveEpisode((episode) => ({
+      ...episode,
+      layouts: {
+        ...(episode.layouts ?? {}),
+        [viewStage]: {
+          ...(episode.layouts?.[viewStage] ?? {}),
+          ...savedPositions,
+        },
+      },
+    }));
   }
 
   function buildFlowNodes() {
@@ -5244,6 +6258,17 @@ export default function App() {
     }
 
     const visibleStageNodes = getVisibleStageNodes();
+    const workflowMode = viewStage === 0 && ["accepted", "proposed"].includes(activeEpisode.intake?.status);
+    const savedWorkflowPositions = activeEpisode.layouts?.[viewStage] ?? {};
+    const hasSavedWorkflowPositions = visibleStageNodes.some((node) => savedWorkflowPositions[node.id]);
+    const automaticPositions = workflowMode && !hasSavedWorkflowPositions
+      ? layoutWorkflowNodes(visibleStageNodes, getWorkflowCanvasEdges(visibleStageNodes))
+      : new Map();
+    const trace = getTraceGraph(traceNodeId, getWorkflowCanvasTraceEdges(visibleStageNodes));
+    const runArtifactCounts = new Map();
+    (activeEpisode.additions ?? []).filter((item) => item.stageIndex === viewStage && item.parentNodeId && isGeneratedRunArtifact(item)).forEach((item) => {
+      runArtifactCounts.set(item.parentNodeId, (runArtifactCounts.get(item.parentNodeId) ?? 0) + 1);
+    });
     const baseNodes =
       visibleStageNodes.map(
         (node) => {
@@ -5282,11 +6307,8 @@ export default function App() {
           }
 
           const position =
-            activeEpisode.layouts?.[
-              viewStage
-            ]?.[
-              node.id
-            ] ??
+            savedWorkflowPositions[node.id] ??
+            automaticPositions.get(node.id) ??
             node.position;
 
           const stats =
@@ -5339,6 +6361,9 @@ export default function App() {
               workflowKind:
                 node.kind,
 
+              sourceIds:
+                node.sourceIds ?? [],
+
               compactNode:
                 Boolean(
                   node.proposed ||
@@ -5349,6 +6374,18 @@ export default function App() {
 
               selected:
                 selectedNodeId === node.id,
+
+              autopilotStatus: activeEpisode.autopilotRun?.taskStates?.[`specialist-${node.id}`] ?? null,
+
+              autopilotActive: activeEpisode.autopilotRun?.activeNodeId === node.id,
+
+              runArtifactCount: runArtifactCounts.get(node.id) ?? 0,
+
+              traceActive: trace.nodeIds.has(node.id),
+
+              traceDimmed: Boolean(traceNodeId && !trace.nodeIds.has(node.id)),
+
+              onTrace: () => setTraceNodeId(traceNodeId === node.id ? null : node.id),
 
               isContext:
                 node.id === "context",
@@ -5393,6 +6430,11 @@ export default function App() {
 
               meta:
                 node.meta,
+
+              checkpointDependencies:
+                node.kind === "gate"
+                  ? node.afterNodeIds ?? node.dependsOn ?? []
+                  : [],
 
               threadMessageCount:
                 stats.messageCount,
@@ -5440,16 +6482,19 @@ export default function App() {
           (item) =>
             item.stageIndex ===
             viewStage &&
-            isDurableArtifact(item)
+            isDurableArtifact(item) &&
+            (showGeneratedArtifacts || !isGeneratedRunArtifact(item))
         )
         .map((item) => {
           const position =
-            activeEpisode.layouts?.[
-              viewStage
-            ]?.[
-              item.id
-            ] ??
-            item.position;
+            savedWorkflowPositions[item.id] ??
+            automaticPositions.get(item.id) ??
+            item.position ??
+            makeAdditionPosition(
+              activeEpisode,
+              viewStage,
+              item.parentNodeId
+            );
 
           const stats =
             getThreadStats(
@@ -5496,6 +6541,14 @@ export default function App() {
               threadPending:
                 stats.pending,
 
+              traceActive: trace.nodeIds.has(item.id),
+
+              traceDimmed: Boolean(traceNodeId && !trace.nodeIds.has(item.id)),
+
+              selected: selectedNodeId === item.id,
+
+              onTrace: () => setTraceNodeId(traceNodeId === item.id ? null : item.id),
+
               onOpenThread: () =>
                 openDrawerForNode(
                   item.id
@@ -5513,7 +6566,9 @@ export default function App() {
     const orchestrationSourceNode = getOrchestrationSourceNode(orchestrationNodeId);
     const orchestrationEligible = isOrchestrationEligibleNode(orchestrationSourceNode);
     const orchestrationExecutionState =
-      orchestrationPreviews[orchestrationNodeId]?.executionState ?? {};
+      orchestrationRun?.nodeId === orchestrationNodeId
+        ? orchestrationRun.taskStates
+        : orchestrationPreviews[orchestrationNodeId]?.executionState ?? {};
 
     const orchestrationNodes =
       orchestrationExpanded &&
@@ -5528,7 +6583,9 @@ export default function App() {
               orchestrationNodeId
             ),
             orchestrationPlan,
-            orchestrationExecutionState
+            orchestrationExecutionState,
+            orchestrationRun?.status ?? orchestrationPreviews[orchestrationNodeId]?.runStatus ?? null,
+            savedWorkflowPositions,
           )
         : [];
 
@@ -5543,11 +6600,33 @@ export default function App() {
         }]
       : [];
 
+    const activeAutopilotNodeId = activeEpisode.autopilotRun?.activeNodeId;
+    const activeAutopilotTaskId = activeEpisode.autopilotRun?.activeTaskId;
+    const activeAutopilotTask = activeAutopilotTaskId && activeEpisode.autopilotRun?.taskStates?.[activeAutopilotTaskId] === "working";
+    const autopilotAgentNodes = activeAutopilotNodeId && activeAutopilotTask
+      ? [{
+          id: `autopilot-agent-${activeAutopilotTaskId}`,
+          type: "orchestration",
+          position: { x: getNodePosition(activeEpisode, viewStage, activeAutopilotNodeId).x + 340, y: getNodePosition(activeEpisode, viewStage, activeAutopilotNodeId).y - 30 },
+          data: {
+            orchestrationPreview: true,
+            temporaryAgent: true,
+            detailId: "first-mate",
+            label: "Live specialist",
+            title: activeAutopilotTaskId,
+            body: "Read-only analysis in progress",
+            status: "working",
+            statusLabel: "Reviewing source context",
+          },
+        }]
+      : [];
+
     return [
       ...baseNodes,
       ...intakeNodes,
       ...additions,
       ...orchestrationNodes,
+      ...autopilotAgentNodes,
     ];
   }
 
@@ -5564,6 +6643,7 @@ export default function App() {
     }
 
     let visibleStageEdges = activeStageTemplate.edges;
+    const visibleStageNodes = getVisibleStageNodes();
     const intake = activeEpisode.intake;
 
     if (viewStage === 0 && intake?.status === "pending") {
@@ -5572,6 +6652,7 @@ export default function App() {
       visibleStageEdges = activeEpisode.workflow.edges;
     } else if (viewStage === 0 && intake?.status === "proposed" && intake.proposal) {
       const proposedNodes = intake.proposal.workNodes;
+      const proposedGates = intake.proposal.humanGates ?? [];
       const dependencies = proposedNodes.flatMap((node) =>
         node.dependsOn?.length
           ? node.dependsOn.map((dependency) => [dependency, node.id])
@@ -5582,21 +6663,20 @@ export default function App() {
       );
       visibleStageEdges = [
         ...dependencies,
-        ...terminalNodes.map((node) => [node.id, "gate"]),
+        ...(proposedGates.length > 0
+          ? proposedGates.flatMap((gate) =>
+              gate.afterNodeIds.length
+                ? gate.afterNodeIds.map((nodeId) => [nodeId, gate.id])
+                : terminalNodes.map((node) => [node.id, gate.id])
+            )
+          : terminalNodes.map((node) => [node.id, "gate"])),
       ];
     }
 
-    const primaryStageEdges = visibleStageEdges.filter(
-      ([source, target]) => viewStage !== 0 || source === "work" || target === "gate"
-    );
-    const focusedStageEdges = selectedNodeId
-      ? visibleStageEdges.filter(([source, target]) => source === selectedNodeId || target === selectedNodeId)
-      : [];
     const stageEdges = Array.from(
-      new Map(
-        [...primaryStageEdges, ...focusedStageEdges].map((edge) => [edge.join("→"), edge])
-      ).values()
+      new Map(visibleStageEdges.map((edge) => [edge.join("→"), edge])).values()
     );
+    const trace = getTraceGraph(traceNodeId, getWorkflowCanvasTraceEdges(visibleStageNodes));
 
     const baseEdges =
       stageEdges.map(
@@ -5623,12 +6703,18 @@ export default function App() {
           type:
             "smoothstep",
 
-          className:
-            intake?.status === "proposed" && viewStage === 0
-              ? "proposed-edge"
-              : primaryStageEdges.some(([primarySource, primaryTarget]) => primarySource === source && primaryTarget === target)
-              ? "governed-edge"
-              : "dependency-edge",
+          className: [
+            intake?.status === "proposed" && viewStage === 0 ? "proposed-edge" : "dependency-edge",
+            visibleStageNodes.some((node) => node.kind === "gate" && node.id === target) ? "checkpoint-edge" : "",
+            activeEpisode.autopilotRun?.status === "working" && target !== "work"
+              ? (activeEpisode.autopilotRun?.taskStates?.[`specialist-${source}`] === "completed" ? "autopilot-dependency-active" : "autopilot-dependency-waiting")
+              : "",
+            traceNodeId
+              ? trace.edgeKeys.has(getWorkflowEdgeKey(source, target))
+                ? "trace-active-edge"
+                : "trace-dimmed-edge"
+              : "",
+          ].filter(Boolean).join(" "),
         })
       );
 
@@ -5643,7 +6729,7 @@ export default function App() {
               viewStage &&
             item.parentNodeId &&
             isDurableArtifact(item) &&
-            (item.parentNodeId === selectedNodeId || item.id === selectedNodeId)
+            (showGeneratedArtifacts || !isGeneratedRunArtifact(item))
         )
         .map((item) => ({
           id:
@@ -5664,8 +6750,14 @@ export default function App() {
           type:
             "smoothstep",
 
-          className:
+          className: [
             "branch-edge",
+            traceNodeId
+              ? trace.edgeKeys.has(getWorkflowEdgeKey(item.parentNodeId, item.id))
+                ? "trace-active-edge"
+                : "trace-dimmed-edge"
+              : "",
+          ].filter(Boolean).join(" "),
         }));
 
     const orchestrationPlan =
@@ -5715,8 +6807,14 @@ export default function App() {
       nextEdges
     );
 
-    const selectedNodeStillExists = selectedNodeId && nextNodes.some(
-      (node) => node.id === selectedNodeId
+    const selectedArtifact = activeEpisode.additions?.find((item) => item.id === selectedNodeId);
+    const selectedNodeStillExists = selectedNodeId && (
+      nextNodes.some((node) => node.id === selectedNodeId) ||
+      (!showGeneratedArtifacts && isGeneratedRunArtifact(selectedArtifact))
+    );
+
+    const traceNodeStillExists = traceNodeId && nextNodes.some(
+      (node) => node.id === traceNodeId
     );
 
     if (selectedNodeId && !selectedNodeStillExists) {
@@ -5728,14 +6826,21 @@ export default function App() {
       return;
     }
 
+    if (traceNodeId && !traceNodeStillExists) {
+      setTraceNodeId(null);
+    }
+
   }, [
     activeEpisodeId,
     viewStage,
     episodes,
     selectedNodeId,
+    traceNodeId,
     orchestrationExpanded,
     orchestrationNodeId,
     orchestrationPreviews,
+    orchestrationRun,
+    showGeneratedArtifacts,
   ]);
 
   useEffect(() => {
@@ -5762,6 +6867,13 @@ export default function App() {
     viewStage,
     visibleTopologyKey,
   ]);
+
+  useEffect(() => {
+    if (!followAutopilotWork || !reactFlowInstance || autopilotRun?.status !== "working" || !autopilotRun.activeTaskId) return;
+    const target = nodes.find((node) => node.id === `autopilot-agent-${autopilotRun.activeTaskId}`) ?? nodes.find((node) => node.id === autopilotRun.activeNodeId);
+    if (!target) return;
+    reactFlowInstance.setCenter(target.position.x + 140, target.position.y + 90, { zoom: 0.82, duration: 300 });
+  }, [autopilotRun?.activeTaskId, autopilotRun?.activeNodeId, autopilotRun?.status, followAutopilotWork, nodes, reactFlowInstance]);
 
   /* ---------------------------------------------------------------------- */
   /* WEBMCP — LIST EPISODES                                                 */
@@ -6985,6 +8097,8 @@ export default function App() {
         project={editingProject}
       />
 
+      {sourceViewerId && <SourceViewer sourceId={sourceViewerId} onClose={() => setSourceViewerId(null)} />}
+
       <RenameEpisodeModal
         key={renamingEpisode?.id ?? "rename-episode"}
         open={Boolean(renamingEpisode)}
@@ -7040,6 +8154,36 @@ export default function App() {
             >
               Fit canvas
             </button>
+
+            {viewStage === 0 && ["accepted", "proposed"].includes(activeEpisode.intake?.status) && (
+              <button
+                type="button"
+                className="button"
+                onClick={organizeVisibleWorkflow}
+              >
+                Organize workflow
+              </button>
+            )}
+
+            {traceNodeId && (
+              <button
+                type="button"
+                className="button"
+                onClick={() => setTraceNodeId(null)}
+              >
+                Clear trace
+              </button>
+            )}
+
+            {(activeEpisode.additions ?? []).some((item) => item.stageIndex === viewStage && isGeneratedRunArtifact(item)) && (
+              <button
+                type="button"
+                className="button"
+                onClick={() => setShowGeneratedArtifacts((value) => !value)}
+              >
+                {showGeneratedArtifacts ? "Hide run outputs" : "Show run outputs"}
+              </button>
+            )}
 
             <span className="badge">
               Human authority
@@ -7135,6 +8279,7 @@ export default function App() {
                         <button type="button" className="episode-menu-button" aria-label={`Episode options for ${episode.name}`} aria-expanded="true" onClick={(event) => { event.stopPropagation(); setOpenEpisodeMenuId(null); setMovingEpisodeId(null); }}>⋮</button>
                         <div className="episode-menu" role="menu">
                           <button type="button" role="menuitem" onClick={() => { setRenamingEpisode(episode); setOpenEpisodeMenuId(null); }}>Rename episode</button>
+                          <button type="button" role="menuitem" onClick={() => { exportEpisodeReview(episode); setOpenEpisodeMenuId(null); }}>Export review package</button>
                           <button type="button" role="menuitem" onClick={() => setMovingEpisodeId(episode.id)}>Move to project</button>
                           {movingEpisodeId === episode.id && <select autoFocus className="episode-menu-select" aria-label={`Move ${episode.name} to project`} value={episode.projectId ?? ""} onChange={(event) => { moveEpisode(episode.id, event.target.value); setOpenEpisodeMenuId(null); setMovingEpisodeId(null); }}><option value="">Unassigned</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select>}
                           <button type="button" role="menuitem" onClick={() => archiveEpisode(episode.id)}>Archive</button>
@@ -7181,7 +8326,7 @@ export default function App() {
             <div className="canvas-header">
               <div>
                 <div className="breadcrumb">
-                  {activeEpisode.id} · Stage {viewStage + 1} of 3
+                  {activeEpisode.id} · {viewStage === activeEpisode.currentStage ? `Stage ${activeEpisode.currentStage + 1} of 3` : `Viewing Stage ${viewStage + 1} · Episode at Stage ${activeEpisode.currentStage + 1} of 3`}
                 </div>
 
                 <h1>
@@ -7223,12 +8368,16 @@ export default function App() {
                   {activeEpisode.activity?.length > 0 && activitySeenByEpisode[activeEpisode.id] !== activeEpisode.activity.at(-1)?.id && <span className="activity-unseen-dot" aria-label="Unseen activity" />}
                 </button>
                 <div className="canvas-status-context">
-                <span className="badge">
-                  Stage{" "}
-                  {viewStage +
-                    1}{" "}
-                  of 3
-                </span>
+                <button
+                  type="button"
+                  className={`badge episode-cockpit-trigger ${showEpisodeCockpit ? "active" : ""}`}
+                  aria-expanded={showEpisodeCockpit}
+                  aria-label={showEpisodeCockpit ? "Hide episode status" : "Show episode status"}
+                  onClick={() => setShowEpisodeCockpit((value) => !value)}
+                >
+                  <span className="episode-cockpit-stage"><strong>{activeEpisode.currentStage + 1}</strong><span>Stage</span></span>
+                  <span className="episode-cockpit-label">{showEpisodeCockpit ? "Hide status" : "Status"}</span>
+                </button>
 
                 <span className="badge codex-status-badge" title="Runtime: Local Codex · Mode: Analysis only">
                   <StatusIndicator
@@ -7240,6 +8389,25 @@ export default function App() {
                 </div>
               </div>
             </div>
+
+            {showEpisodeCockpit && <EpisodeProgressGuide
+              episode={activeEpisode}
+              viewStage={viewStage}
+              liveOrchestrationRun={orchestrationRun}
+              onSelectStage={(stageIndex) => {
+                setViewStage(stageIndex);
+                setSelectedNodeId(null);
+                setTraceNodeId(null);
+              }}
+              onOpenIntake={() => setIntakePanelOpen(true)}
+              onOpenActivity={() => {
+                const latestActivity = activeEpisode.activity?.at(-1);
+                setActivitySeenByEpisode((current) => ({ ...current, [activeEpisode.id]: latestActivity?.id ?? null }));
+                setActivityOpen(true);
+                setDrawerOpen(false);
+              }}
+              onOpenOrchestration={openNodeOrchestration}
+            />}
 
             {/* CANVAS */}
 
@@ -7352,6 +8520,13 @@ export default function App() {
                     0.18,
                 }}
               >
+                <MiniMap
+                  className="workflow-minimap"
+                  pannable
+                  zoomable
+                  nodeColor={(node) => node.data?.traceDimmed ? "#e5e5e5" : node.data?.workflowKind === "gate" ? "#d8d8d8" : node.data?.proposed ? "#f3f3f1" : "#bdbdbd"}
+                />
+
                 <Background
                   gap={
                     22
@@ -7367,6 +8542,49 @@ export default function App() {
                   }
                 />
               </ReactFlow>
+
+              <div className="canvas-legend" aria-label="Workflow edge legend">
+                <span className="canvas-legend-title">Workflow edges</span>
+                <span><i className="legend-swatch dependency" />Dependency</span>
+                <span><i className="legend-swatch branch" />Branch / evidence</span>
+                <span><i className="legend-swatch proposed" />Proposed</span>
+                <span><i className="legend-swatch checkpoint" />Human checkpoint</span>
+              </div>
+
+              <AgentNotificationTray
+                notifications={agentNotifications}
+                onDismiss={(id) => setAgentNotifications((current) => current.filter((notification) => notification.id !== id))}
+                onOpen={(notification) => {
+                  setAgentNotifications((current) => current.filter((item) => item.id !== notification.id));
+                  if (isOrchestrationEligibleNode(getOrchestrationSourceNode(notification.nodeId))) {
+                    openNodeOrchestration(notification.nodeId);
+                  } else {
+                    openDetailsForNode(notification.nodeId);
+                  }
+                }}
+              />
+
+              {!showAutopilotInspector && (autopilotRun?.episodeId === activeEpisode.id || activeEpisode.autopilotRun) && <button type="button" className="autopilot-inspector-reopen" onClick={() => setShowAutopilotInspector(true)}>Show run inspector</button>}
+
+              {showAutopilotInspector && <AutopilotRunPanel
+                run={autopilotRun?.episodeId === activeEpisode.id ? autopilotRun : activeEpisode.autopilotRun}
+                onStop={cancelAutopilotEpisode}
+                onRetry={() => runAutopilotEpisode(activeEpisode)}
+                follow={followAutopilotWork}
+                onFollow={setFollowAutopilotWork}
+                onPromote={promoteAutopilotPackage}
+                onRevise={(instruction) => runAutopilotEpisode(activeEpisode, instruction.trim())}
+                onPause={() => setAutopilotHumanStatus("paused")}
+                onReject={() => setAutopilotHumanStatus("rejected")}
+                outputCount={(activeEpisode.additions ?? []).filter((item) => item.stageIndex === viewStage && isGeneratedRunArtifact(item)).length}
+                canvasArtifactsVisible={showGeneratedArtifacts}
+                onToggleCanvasArtifacts={() => setShowGeneratedArtifacts((value) => !value)}
+                onInspectOutput={(taskId) => {
+                  const artifact = (activeEpisode.additions ?? []).find((item) => isGeneratedRunArtifact(item) && (getArtifactTaskId(item) === taskId || item.id?.endsWith(`-${taskId}`)));
+                  if (artifact) openDetailsForNode(artifact.id);
+                }}
+                onHide={() => setShowAutopilotInspector(false)}
+              />}
 
               <EpisodeIntakePanel
                 open={intakePanelOpen}
@@ -7389,7 +8607,7 @@ export default function App() {
               />
 
               <OrchestrationErrorBoundary
-                key={orchestrationNodeId ?? "orchestration-idle"}
+                key={`${orchestrationNodeId ?? "orchestration-idle"}-${orchestrationPreviews[orchestrationNodeId]?.state ?? "request"}`}
                 onClose={() => {
                   setOrchestrationNodeId(null);
                   setOrchestrationExpanded(false);
@@ -7424,10 +8642,12 @@ export default function App() {
                   executionState={
                     orchestrationPreviews[orchestrationNodeId]?.executionState
                   }
+                  orchestrationRun={orchestrationRun?.nodeId === orchestrationNodeId ? orchestrationRun : null}
                   phase={
                     orchestrationPreviews[orchestrationNodeId]?.state ??
                     "request"
                   }
+                  clusterVisible={orchestrationExpanded}
                   plan={
                     orchestrationPreviews[orchestrationNodeId]?.plan ??
                     getLocalOrchestrationPlan(orchestrationNodeId)
@@ -7441,7 +8661,7 @@ export default function App() {
                     setOrchestrationDetailId(null);
                   }}
                   onExpand={() => {
-                    setOrchestrationExpanded(true);
+                    setOrchestrationExpanded((value) => !value);
                     setOrchestrationMinimized(false);
                   }}
                   onFullscreen={() =>
@@ -7451,6 +8671,9 @@ export default function App() {
                   onBack={backToOrchestrationRequest}
                   onApprove={approveOrchestrationPreview}
                   onReset={resetOrchestrationPreview}
+                  onRun={runOrchestration}
+                  onCancelRun={cancelOrchestration}
+                  onInspectArtifacts={inspectOrchestrationArtifacts}
                   flowWrapperRef={flowWrapperRef}
                   reactFlowInstance={reactFlowInstance}
                   viewportRevision={viewportRevision}
@@ -7555,6 +8778,11 @@ export default function App() {
                 viewStage
               }
               contextContent={activeEpisode.context}
+              sourceManifest={activeEpisode.sources ?? []}
+              nodeSourceManifest={(activeEpisode.sources ?? []).filter((source) => (activeEpisode.nodeSourceIds?.[drawerAnchorId] ?? []).includes(source.sourceId))}
+              onOpenSource={setSourceViewerId}
+              onAttachSources={(files) => { void attachNodeSources(drawerAnchorId, files).catch((error) => window.alert(error.message || "Could not attach those files.")); }}
+              attachmentsBusy={nodeSourceBusy}
               initialView={drawerView}
               nodeDetails={getNodeDetails(drawerAnchorId)}
               onSend={

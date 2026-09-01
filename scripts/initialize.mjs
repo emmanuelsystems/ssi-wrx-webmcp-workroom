@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 
 const host = "localhost";
 const port = 5173;
+const runtimeUrl = "http://127.0.0.1:8787/api/codex/status";
 const url = `http://${host}:${port}/`;
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 
@@ -22,6 +23,8 @@ const server = spawn(
     stdio: "inherit",
   },
 );
+
+const runtime = spawn(npmCommand, ["run", "runtime"], { stdio: "inherit" });
 
 function openBrowser(targetUrl) {
   if (process.platform === "darwin") {
@@ -52,19 +55,37 @@ async function waitForServer(timeoutMs = 30000) {
   throw new Error(`Timed out waiting for Vite at ${url}`);
 }
 
+async function waitForRuntime(timeoutMs = 30000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const response = await fetch(runtimeUrl);
+      if (response.ok) return;
+    } catch {
+      // The runtime may still be starting.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`Timed out waiting for the local Codex runtime at ${runtimeUrl}`);
+}
+
 try {
   await waitForServer();
+  await waitForRuntime();
   openBrowser(url);
   console.log(`\nSSI-WRX Workroom is ready at ${url}`);
+  console.log("Local Codex runtime is ready at http://127.0.0.1:8787.");
   console.log("Keep this terminal open while using the workroom.");
 } catch (error) {
   console.error(error.message);
   server.kill();
+  runtime.kill();
   process.exitCode = 1;
 }
 
 function stop() {
   server.kill("SIGTERM");
+  runtime.kill("SIGTERM");
 }
 
 process.on("SIGINT", stop);

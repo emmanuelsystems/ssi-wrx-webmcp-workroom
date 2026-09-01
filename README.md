@@ -26,9 +26,11 @@ The agent can add evidence, recommendations, evaluations, and questions for a hu
 - **Node conversations** — ask or answer questions attached to a node. Pending questions are shown as thread nodes.
 - **Stage gates** — advance the active episode manually when the current stage is ready.
 - **Human disposition** — record the final human-owned outcome from the last stage.
-- **Local orchestration planner** — create a deterministic concept-testing plan for eligible work nodes. It proposes tasks, specialist roles, dependencies, expected outputs, review, and human gates; it does not execute agents, call an external First Mate runtime, or persist mock execution as real episode state.
+- **Local orchestration planner** — create a deterministic concept-testing plan for eligible work nodes, then optionally run a human-approved, read-only local Codex analysis with inspectable artifacts.
+- **Autopilot Episode Runs** — consented agent-assisted episodes automatically run one bounded local Codex pipeline: draft planner, up to three dependency-aware specialists, and final synthesis/review. The draft remains unaccepted and the final package always requires human review.
+- **Source-informed Episode creation** — paste transcript/context and attach up to 10 `.txt`, `.md`, `.pdf`, or `.docx` sources (10 MB each). Text is extracted in the browser, originals and full extracted text stay in IndexedDB, and only source metadata is kept in the Episode's localStorage record. Explicit consent is required before source text is sent to the local Codex runtime.
 
-“First Mate” is currently a UI/conceptual orchestration role. The local planner is replaceable by a future external runtime adapter.
+“First Mate” remains a planning/display role. Autopilot and node orchestration use only the loopback runtime with read-only sandboxing, disabled approvals, disabled network access, and disabled web search.
 
 ## WebMCP tools
 
@@ -55,7 +57,11 @@ Episode data is stored in the browser under the `localStorage` key `ssi-wrx-work
 - saved node positions in `layouts`; and
 - agent or human additions in `additions`, including evidence, proposals, evaluations, and threaded conversations.
 
-There is no backend, database, authentication, or server API in this repository. Data is therefore specific to the current browser profile and origin. The app loads the bundled example episodes when no saved data exists and includes compatibility loading for older `v3` and `ssi-wrx-multi-episode-v1` storage keys.
+The workroom remains local-first: there is no database, authentication, multi-user sync, or remote persistence. Source originals and extracted text are stored in the browser's IndexedDB under source IDs; the episode's existing localStorage record stores only a source manifest. Deleting an Episode removes its associated IndexedDB sources. The local Codex runtime is a loopback-only HTTP/SSE adapter for intake, node orchestration, and bounded Autopilot runs; it does not persist episode or source text and retains only a bounded, short-lived in-memory run history. Episode data is specific to the current browser profile and origin. The app loads the bundled example episodes when no saved data exists and includes compatibility loading for older `v3` and `ssi-wrx-multi-episode-v1` storage keys.
+
+Agent-assisted intake produces a proposal only. Source preparation generates bounded per-source summaries and a combined context package before the existing proposal pass; source-informed work nodes cite the source IDs they rely on. Human checkpoints are retained as explicit workflow gate records with their titles and dependencies when a human accepts the proposal. Humans remain solely responsible for accepting structure, advancing stages, and recording final disposition.
+
+Autopilot adds an episode-local `autopilotRun` record to compatible episodes. It stores run metadata, draft plan, task states, bounded outputs, assumptions, unresolved questions, errors, and the final package in localStorage. Source text is loaded from IndexedDB only for the active run and is never retained by the server. Promotion of a final package updates trusted context only; it does not accept workflow structure, advance a stage, or record disposition. Revised runs are explicit human actions and are never retried automatically.
 
 ## Getting started
 
@@ -86,7 +92,7 @@ For the usual next-start workflow, run:
 npm run initialize
 ```
 
-This starts Vite on `http://localhost:5173/` with an explicit port and `strictPort`, waits for the app to respond, and opens the workroom in the system browser. Keep that terminal open while working; press `Ctrl+C` to stop the server. Codex can work in parallel with the running app: leave this process active, then ask Codex to inspect or interact with the open browser session.
+This starts Vite on `http://localhost:5173/` and the local Codex runtime on `http://127.0.0.1:8787`, waits for both services to respond, and opens the workroom in the system browser. Keep that terminal open while working; press `Ctrl+C` to stop both processes cleanly. The runtime checks local Codex status and exposes read-only intake, node orchestration, and Autopilot SSE endpoints; it requires a local Codex CLI login for analysis. Source text is sent only after the user explicitly consents in the modal. Agent-assisted creation shows a maximum-five-turn guard and starts one bounded Autopilot run after consent.
 
 ### Other commands
 
@@ -94,6 +100,7 @@ This starts Vite on `http://localhost:5173/` with an explicit port and `strictPo
 npm run build    # Create a production build in dist/
 npm run preview  # Serve the production build locally
 npm run lint     # Run Oxlint
+npm run test:intake # Run intake validation and checkpoint tests
 npm run initialize # Start Vite and open the workroom in the browser
 ```
 
@@ -103,7 +110,10 @@ npm run initialize # Start Vite and open the workroom in the browser
 .
 ├── src/
 │   ├── App.jsx              # Workflow model, UI, persistence, and WebMCP tools
-│   ├── orchestration.js     # Local deterministic orchestration planning contract
+│   ├── episodeIntake.js     # Intake schema, proposal validation, and checkpoint graph helpers
+│   ├── episodeSources.js     # Browser extraction, source manifest, and IndexedDB helpers
+│   ├── orchestration.js     # Local deterministic node orchestration planning contract
+│   ├── autopilot.js         # Five-turn scheduling, state, output, and authority contracts
 │   ├── App.css              # Workroom and React Flow styling
 │   ├── NewEpisodeModal.jsx  # New episode form
 │   ├── NewEpisodemodal.css  # New episode modal styles
@@ -112,6 +122,9 @@ npm run initialize # Start Vite and open the workroom in the browser
 ├── public/                  # Static icons and favicon
 ├── index.html               # HTML shell and document title
 ├── vite.config.js            # Vite React configuration
+├── server/                   # Loopback Codex intake runtime
+├── scripts/initialize.mjs    # Starts/stops Vite and the local runtime
+├── test/                     # Lightweight node:test coverage
 └── package.json              # Scripts and dependencies
 ```
 
@@ -125,4 +138,4 @@ npm run initialize # Start Vite and open the workroom in the browser
 
 ## Current scope
 
-This repository is a frontend workroom/prototype. It does not currently provide multi-user synchronization, server-side persistence, account management, automated stage advancement, real agent orchestration, external First Mate integration, or a deployment configuration. Orchestration is currently local planning UI only and is not exposed through WebMCP.
+This repository is a local-first workroom/prototype. It does not provide multi-user synchronization, server-side episode persistence, account management, automated stage advancement, external communications, remote deployment, authentication, file editing, browser actions, web access, or external tool execution. The local Codex runtime is limited to read-only intake, bounded node analysis, and bounded Autopilot proposal/final-package streaming; it does not accept structure, execute operational work, advance the workflow, or record disposition. Autopilot is not exposed as a WebMCP action.
