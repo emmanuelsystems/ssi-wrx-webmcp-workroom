@@ -1,9 +1,9 @@
 import dagre from "@dagrejs/dagre";
 
-export const WORKFLOW_NODE_WIDTH = 276;
-export const WORKFLOW_NODE_HEIGHT = 168;
-export const WORKFLOW_NODE_SEPARATION = 72;
-export const WORKFLOW_RANK_SEPARATION = 112;
+export const WORKFLOW_NODE_WIDTH = 318;
+export const WORKFLOW_NODE_HEIGHT = 270;
+export const WORKFLOW_NODE_SEPARATION = 96;
+export const WORKFLOW_RANK_SEPARATION = 156;
 
 function edgeKey(source, target) {
   return `${source}→${target}`;

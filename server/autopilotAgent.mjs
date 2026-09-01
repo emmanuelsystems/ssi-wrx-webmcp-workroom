@@ -51,10 +51,13 @@ function outputSchemaForTask(schema, task) {
 async function runTurn(codex, prompt, schema, signal, onEvent, task, repoRoot) {
   const thread = codex.startThread({ workingDirectory: repoRoot, sandboxMode: "read-only", approvalPolicy: "never", networkAccessEnabled: false, webSearchMode: "disabled" });
   onEvent?.({ type: "task", taskId: task.id, nodeId: task.nodeId, status: "working", role: task.role, label: task.role === "Intake planner" ? "Preparing draft run plan" : task.role === "Final synthesis and reviewer" ? "Preparing human-review package" : "Reviewing source context" });
+  onEvent?.({ type: "activity", taskId: task.id, nodeId: task.nodeId, role: task.role, label: `${task.role} is reviewing the approved run context`, detail: "Read-only local analysis · no network, browser, file edits, or external actions." });
   const { events } = await thread.runStreamed(prompt, { outputSchema: outputSchemaForTask(schema, task), signal });
   let finalText = "";
   for await (const event of events) {
     if (event.type === "item.completed" && event.item?.type === "agent_message") finalText = event.item.text;
+    if (event.item?.type === "reasoning") onEvent?.({ type: "activity", taskId: task.id, nodeId: task.nodeId, role: task.role, label: `${task.role} is analyzing the supplied material`, detail: "Private reasoning is not displayed; inspect the retained output when this turn completes." });
+    if (event.type === "turn.completed") onEvent?.({ type: "activity", taskId: task.id, nodeId: task.nodeId, role: task.role, label: `${task.role} returned a structured response`, detail: "Validating the response before it becomes an inspectable output." });
     if (event.type === "turn.failed" || event.type === "error") throw new Error(event.error?.message ?? event.message ?? `${task.role} failed.`);
   }
   return finalText;
