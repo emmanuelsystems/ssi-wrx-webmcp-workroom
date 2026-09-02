@@ -29,7 +29,7 @@ export function validateOrchestrationInput(input) {
     sourceIds.add(source.sourceId);
   }
   if (!input.baseline?.id) throw new Error("Episode baseline is required for an authorized run.");
-  const leaseValidation = validateWorkLease({ lease: input.workLease, episodeId: input.episodeId, baselineId: input.baseline.id, action: "orchestration" });
+  const leaseValidation = validateWorkLease({ lease: input.workLease, episodeId: input.episodeId, baselineId: input.baseline.id, action: "orchestration", projectStateId: input.projectState?.id ?? null });
   if (!leaseValidation.valid) throw new Error(leaseValidation.error);
   return { tasks, sourceIds: [...sourceIds] };
 }

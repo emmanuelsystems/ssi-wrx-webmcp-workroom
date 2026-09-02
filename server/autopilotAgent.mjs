@@ -24,7 +24,7 @@ export function validateAutopilotInput(input) {
     sourceIds.add(source.sourceId);
   }
   if (!input.baseline?.id) throw new Error("Episode baseline is required for an authorized run.");
-  const leaseValidation = validateWorkLease({ lease: input.workLease, episodeId: input.episodeId, baselineId: input.baseline.id, action: "analysis" });
+  const leaseValidation = validateWorkLease({ lease: input.workLease, episodeId: input.episodeId, baselineId: input.baseline.id, action: "analysis", projectStateId: input.projectState?.id ?? null });
   if (!leaseValidation.valid) throw new Error(leaseValidation.error);
   return { sourceIds: [...sourceIds] };
 }

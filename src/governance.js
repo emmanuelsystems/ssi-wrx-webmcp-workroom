@@ -1,4 +1,4 @@
-export const GOVERNANCE_STORAGE_VERSION = 1;
+export const GOVERNANCE_STORAGE_VERSION = 2;
 
 export const AUTHORITY_STATES = {
   AUTHORITATIVE: "authoritative",
@@ -41,15 +41,25 @@ export function createEpisodeBaseline(project) {
   };
 }
 
-export function createReadback(episode) {
+export function validateEpisodeBaseline({ baseline, projectState }) {
+  if (!baseline?.id || !baseline?.projectStateId) return { valid: false, error: "Episode baseline is required before work can be authorized." };
+  if (!projectState?.id) return { valid: false, error: "Current authoritative Project State is unavailable." };
+  if (baseline.projectStateId !== projectState.id) return { valid: false, error: "Episode baseline is stale. Re-baseline the Episode before authorizing work." };
+  return { valid: true };
+}
+
+export function createReadback(episode, { revisionOf = null, revisionInstruction = "" } = {}) {
   return {
     id: `readback-${crypto.randomUUID()}`,
     status: "proposed",
+    provenance: "system",
+    revisionOf,
+    revisionInstruction: revisionInstruction.trim(),
     objective: episode.title,
     sources: (episode.sources ?? []).map((source) => source.fileName),
     baseline: episode.governance?.baseline?.summary ?? "No project baseline was recorded.",
     conflicts: episode.governance?.baseline ? [] : ["No authoritative project state was captured for this Episode."],
-    proposedWork: "Prepare a bounded read-only analysis package for human review.",
+    proposedWork: revisionInstruction.trim() || "Prepare a bounded read-only analysis package for human review.",
     prohibited: ["Change authoritative state", "Advance stages", "Record disposition", "Edit files", "Use network or external tools"],
     authorityEffect: "none",
     createdAt: new Date().toISOString(),
@@ -61,7 +71,9 @@ export function createWorkLease({ episode, agentRoute, objective, action = "anal
   return {
     id: `lease-${crypto.randomUUID()}`,
     episodeId: episode.id,
+    projectId: episode.projectId ?? null,
     baselineId: episode.governance?.baseline?.id ?? null,
+    projectStateId: episode.governance?.baseline?.projectStateId ?? null,
     owner: episode.governance?.ownerName ?? "Owner",
     agentRouteId: agentRoute.id,
     objective,
@@ -84,7 +96,7 @@ export function createAgentRoute({ lease, role, provider = "Codex", conversation
     capabilities: ["local read-only analysis"],
     leaseId: lease?.id ?? null,
     conversationId,
-    status: "authorized",
+    status: lease?.id ? "authorized" : "proposed",
     authority: lease?.id ? AUTHORITY_STATES.AUTHORIZED : AUTHORITY_STATES.PROPOSED,
     createdAt: new Date().toISOString(),
   };
@@ -106,6 +118,7 @@ export function createReturnPacket({ runId, lease, route, packageValue, outputs 
     recommendation: packageValue?.recommendedNextStep ?? "Review the returned work.",
     acceptedEvidence: [],
     acceptedClaims: [],
+    reconciliationStatus: "pending",
     createdAt: new Date().toISOString(),
     reconciledAt: null,
   };
@@ -118,17 +131,21 @@ export function normalizeEpisodeGovernance(episode, project) {
     ownerName: governance.ownerName ?? project?.ownerName ?? "Owner",
     baseline: governance.baseline ?? null,
     readback: governance.readback ?? null,
+    readbackHistory: Array.isArray(governance.readbackHistory) ? governance.readbackHistory : [],
     workLeases: Array.isArray(governance.workLeases) ? governance.workLeases : [],
     agentRoutes: Array.isArray(governance.agentRoutes) ? governance.agentRoutes : [],
     returns: Array.isArray(governance.returns) ? governance.returns : [],
   };
 }
 
-export function validateWorkLease({ lease, episodeId, baselineId, action }) {
+export function validateWorkLease({ lease, episodeId, baselineId, action, projectStateId }) {
   if (!lease || typeof lease !== "object") return { valid: false, error: "An active Work Lease is required." };
   if (!lease.id || lease.status !== "active") return { valid: false, error: "Work Lease is not active." };
+  if (!baselineId || !lease.baselineId || !lease.projectStateId) return { valid: false, error: "Episode baseline is required before work can run." };
   if (lease.episodeId !== episodeId) return { valid: false, error: "Work Lease does not belong to this Episode." };
   if (lease.baselineId !== baselineId) return { valid: false, error: "Work Lease does not match the Episode baseline." };
+  if (!projectStateId) return { valid: false, error: "Current authoritative Project State is required before work can run." };
+  if (lease.projectStateId !== projectStateId) return { valid: false, error: "Episode baseline is stale. Re-baseline the Episode before running work." };
   if (lease.action !== action) return { valid: false, error: "Work Lease does not permit this run." };
   if (!Array.isArray(lease.permitted) || !lease.permitted.includes("run bounded local analysis")) return { valid: false, error: "Work Lease does not permit local analysis." };
   return { valid: true };

@@ -2372,7 +2372,7 @@ function AutopilotRunPanel({ run, onStop, onRetry, follow, onFollow, onPromote, 
     <label className="autopilot-follow"><input type="checkbox" checked={follow} onChange={(event) => onFollow(event.target.checked)} /> Follow active work</label>
     {run.status === "working" && <button type="button" onClick={onStop}>Stop run</button>}
     {["error", "cancelled"].includes(run.status) && <div className="autopilot-human-actions"><strong>{run.status === "error" ? "Run failed before human review" : "Run stopped before human review"}</strong><button type="button" onClick={onRetry}>Retry run</button></div>}
-    {run.status === "complete" && run.finalPackage && <div className="autopilot-human-actions"><strong>Human review required</strong><button type="button" onClick={onPromote}>Promote as trusted context</button><textarea rows="2" value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="Optional revised-run instruction" /><button type="button" onClick={() => onRevise(instruction)}>Request revised run</button><button type="button" onClick={onPause}>Pause</button><button type="button" onClick={onReject}>Reject</button></div>}
+    {run.status === "complete" && run.finalPackage && <div className="autopilot-human-actions"><strong>Human review required</strong><button type="button" onClick={onPromote}>Stage for reconciliation</button><textarea rows="2" value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="Optional revised-run instruction" /><button type="button" onClick={() => onRevise(instruction)}>Request revised run</button><button type="button" onClick={onPause}>Pause</button><button type="button" onClick={onReject}>Reject</button></div>}
     {run.error && <div className="autopilot-error">{run.error}</div>}
   </aside>;
 }
@@ -2466,7 +2466,7 @@ function EpisodeProgressGuide({ episode, viewStage, liveOrchestrationRun, onSele
     nextAction = { label: "Open First Mate", onClick: () => onOpenOrchestration(activeOrchestration[0]) };
   } else if (finalReviewReady) {
     nextTitle = "Review the final Autopilot package.";
-    nextDetail = "The run is complete. You can promote trusted context, request a revised run, or keep the package as inspectable draft work.";
+    nextDetail = "The run is complete. You can stage its Return Packet for reconciliation, request a revised run, or keep the package as inspectable draft work.";
     nextAction = { label: "Open activity", onClick: onOpenActivity };
   } else if (viewStage === 2) {
     nextTitle = "Record the human disposition.";
@@ -2495,14 +2495,17 @@ function EpisodeProgressGuide({ episode, viewStage, liveOrchestrationRun, onSele
   );
 }
 
-function GovernancePanel({ episode, project, onAcceptReadback, onRequestReadbackRevision, onAuthorize, onRecordState, onAcceptReturnItem, onRejectReturn }) {
+function GovernancePanel({ episode, project, onAcceptReadback, onRequestReadbackRevision, onAuthorize, onRecordState, onAcceptReturnItem, onCommitReturn, onRejectReturn }) {
   const governance = episode.governance ?? {};
   const readback = governance.readback;
   const activeLease = (governance.workLeases ?? []).find((lease) => lease.status === "active");
   const route = (governance.agentRoutes ?? []).find((item) => item.leaseId === activeLease?.id);
   const returned = (governance.returns ?? []).at(-1);
   const stateSummary = project?.state?.summary ?? "No authoritative project state has been recorded.";
-  const canAuthorize = readback?.status === "accepted" && !activeLease;
+  const baselineCurrent = Boolean(governance.baseline?.projectStateId && project?.state?.id && governance.baseline.projectStateId === project.state.id);
+  const stagedCount = (returned?.acceptedEvidence?.length ?? 0) + (returned?.acceptedClaims?.length ?? 0);
+  const returnPending = returned?.status === "returned";
+  const canAuthorize = readback?.status === "accepted" && baselineCurrent && !activeLease;
 
   return (
     <section className="governance-panel" aria-label="Workroom governance">
@@ -2512,21 +2515,22 @@ function GovernancePanel({ episode, project, onAcceptReadback, onRequestReadback
       </header>
       <div className="governance-grid">
         <article><span>Authoritative state</span><strong>{project?.state ? "Recorded" : "Not recorded"}</strong><p>{stateSummary}</p>{project && !project.state && <button type="button" onClick={onRecordState}>Record current state</button>}</article>
-        <article><span>Episode baseline</span><strong>{governance.baseline ? "Frozen" : "Not recorded"}</strong><p>{governance.baseline?.summary ?? "This legacy or unassigned Episode has no project snapshot."}</p></article>
-        <article><span>Readback</span><strong>{readback?.status ?? "Not proposed"}</strong><p>{readback?.proposedWork ?? "Create or revise an agent readback before authorizing work."}</p>
+        <article><span>Episode baseline</span><strong>{!governance.baseline ? "Not recorded" : baselineCurrent ? "Frozen · current" : "Stale · re-baseline required"}</strong><p>{governance.baseline?.summary ?? "This legacy or unassigned Episode has no project snapshot."}</p></article>
+        <article><span>Readback</span><strong>{readback?.status ?? "Not proposed"}</strong><p>{readback?.proposedWork ?? "Create or revise a system readback before authorizing work."}</p>
           {readback?.status === "proposed" && <div className="governance-actions"><button type="button" onClick={onAcceptReadback}>Accept context</button><button type="button" onClick={onRequestReadbackRevision}>Request revision</button></div>}
         </article>
-        <article><span>Work Lease</span><strong>{activeLease ? "Authorized · one run" : "Not authorized"}</strong><p>{activeLease ? `${route?.role ?? "Codex analyst"} may run bounded local analysis.` : "Readback acceptance is required before work can begin."}</p>
+        <article><span>Work Lease</span><strong>{activeLease ? "Authorized · one run" : "Not authorized"}</strong><p>{activeLease ? `${route?.role ?? "Codex analyst"} may run bounded local analysis.` : !baselineCurrent ? "Current Project State must match the Episode baseline before work can be authorized." : "Readback acceptance is required before work can begin."}</p>
           {canAuthorize && <button type="button" onClick={onAuthorize}>Authorize read-only analysis</button>}
         </article>
       </div>
       {returned && <section className="return-packet">
-        <div><span>Returned · authority effect: none</span><strong>Human reconciliation required</strong><p>{returned.recommendation}</p></div>
+        <div><span>{returned.status === "accepted" ? "Reconciled" : returned.status === "rejected" ? "Rejected" : "Returned"} · authority effect: none</span><strong>{returnPending ? "Human reconciliation required" : "Human reconciliation recorded"}</strong><p>{returned.recommendation}</p></div>
         <div className="return-packet-items">
-          {returned.evidence.map((item) => <button type="button" key={`evidence-${item}`} disabled={returned.acceptedEvidence.includes(item)} onClick={() => onAcceptReturnItem(returned.id, "evidence", item)}>{returned.acceptedEvidence.includes(item) ? "✓ Evidence accepted" : "Accept evidence"} · {item}</button>)}
-          {returned.claims.map((item) => <button type="button" key={`claim-${item}`} disabled={returned.acceptedClaims.includes(item)} onClick={() => onAcceptReturnItem(returned.id, "claim", item)}>{returned.acceptedClaims.includes(item) ? "✓ Claim accepted" : "Accept claim"} · {compactArtifactSummary(item)}</button>)}
+          {returned.evidence.map((item) => <button type="button" key={`evidence-${item}`} disabled={!returnPending || returned.acceptedEvidence.includes(item)} onClick={() => onAcceptReturnItem(returned.id, "evidence", item)}>{returned.acceptedEvidence.includes(item) ? "✓ Evidence staged" : "Stage evidence"} · {item}</button>)}
+          {returned.claims.map((item) => <button type="button" key={`claim-${item}`} disabled={!returnPending || returned.acceptedClaims.includes(item)} onClick={() => onAcceptReturnItem(returned.id, "claim", item)}>{returned.acceptedClaims.includes(item) ? "✓ Claim staged" : "Stage claim"} · {compactArtifactSummary(item)}</button>)}
         </div>
-        <button type="button" className="governance-reject" onClick={() => onRejectReturn(returned.id)}>Reject return</button>
+        {returnPending && stagedCount > 0 && <button type="button" onClick={() => onCommitReturn(returned.id)}>Accept reconciliation · {stagedCount} staged</button>}
+        {returnPending && <button type="button" className="governance-reject" onClick={() => onRejectReturn(returned.id)}>Reject return</button>}
       </section>}
     </section>
   );
@@ -4099,23 +4103,31 @@ export default function App() {
         readback: { ...episode.governance.readback, status: "accepted", acceptedAt: new Date().toISOString() },
       },
     }));
-    appendActivity(activeEpisode.id, { type: "readback.accepted", actor: "human", title: "Context accepted", summary: "The owner accepted the agent’s understanding. Work is still not authorized.", authorityImpact: "accepted" });
+    appendActivity(activeEpisode.id, { type: "readback.accepted", actor: "human", title: "Context accepted", summary: "The owner accepted the system readback. Work is still not authorized.", authorityImpact: "accepted" });
   }
 
   function requestReadbackRevision() {
     if (!activeEpisode?.governance?.readback) return;
+    const instruction = window.prompt("What should the revised Readback change or clarify?", "Clarify the current context, conflicts, or proposed bounded work.");
+    if (!instruction?.trim()) return;
+    const previous = activeEpisode.governance.readback;
     updateEpisode(activeEpisode.id, (episode) => ({
       ...episode,
       governance: {
         ...episode.governance,
-        readback: { ...episode.governance.readback, status: "proposed", acceptedAt: null, createdAt: new Date().toISOString() },
+        readbackHistory: [...(episode.governance.readbackHistory ?? []), previous],
+        readback: createReadback(episode, { revisionOf: previous.id, revisionInstruction: instruction.trim() }),
       },
     }));
-    appendActivity(activeEpisode.id, { type: "readback.revision_requested", actor: "human", title: "Readback revision requested", summary: "No work is authorized until the revised context is accepted.", authorityImpact: "human-review" });
+    appendActivity(activeEpisode.id, { type: "readback.revision_requested", actor: "human", title: "Readback revision requested", summary: instruction.trim(), authorityImpact: "human-review" });
   }
 
   function authorizeAutopilotAnalysis() {
     if (!activeEpisode?.governance?.readback || activeEpisode.governance.readback.status !== "accepted") return;
+    if (!activeProject?.state?.id || activeEpisode.governance?.baseline?.projectStateId !== activeProject.state.id) {
+      appendActivity(activeEpisode.id, { type: "lease.authorization_blocked", actor: "system", title: "Work Lease not authorized", summary: "Episode baseline is stale or missing. Re-baseline the Episode before authorizing work.", authorityImpact: "prohibited" });
+      return;
+    }
     const provisionalRoute = createAgentRoute({ role: "Read-only technical analyst" });
     const lease = createWorkLease({ episode: activeEpisode, agentRoute: provisionalRoute, objective: activeEpisode.title });
     const route = { ...provisionalRoute, leaseId: lease.id, authority: AUTHORITY_STATES.AUTHORIZED };
@@ -4133,31 +4145,46 @@ export default function App() {
   }
 
   function acceptReturnItem(returnId, kind, item) {
-    if (!activeEpisode || !activeProject) return;
+    if (!activeEpisode) return;
     const returnPacket = activeEpisode.governance?.returns?.find((entry) => entry.id === returnId);
-    if (!returnPacket) return;
+    if (!returnPacket || returnPacket.status !== "returned") return;
     const key = kind === "evidence" ? "acceptedEvidence" : "acceptedClaims";
     if (returnPacket[key]?.includes(item)) return;
     updateEpisode(activeEpisode.id, (episode) => ({
       ...episode,
       governance: {
         ...episode.governance,
-        returns: episode.governance.returns.map((entry) => entry.id === returnId ? { ...entry, [key]: [...(entry[key] ?? []), item], reconciledAt: new Date().toISOString() } : entry),
+        returns: episode.governance.returns.map((entry) => entry.id === returnId ? { ...entry, [key]: [...(entry[key] ?? []), item], reconciliationStatus: "staged" } : entry),
       },
     }));
-    const change = { id: `state-change-${crypto.randomUUID()}`, type: kind, value: item, returnId, episodeId: activeEpisode.id, owner: activeProject.ownerName, createdAt: new Date().toISOString(), authority: AUTHORITY_STATES.AUTHORITATIVE };
+    appendActivity(activeEpisode.id, { type: `return.${kind}_staged`, actor: "human", title: `${kind === "claim" ? "Claim" : "Evidence"} staged for reconciliation`, summary: item, authorityImpact: "human-review" });
+  }
+
+  function commitReturnReconciliation(returnId) {
+    if (!activeEpisode || !activeProject) return;
+    const returnPacket = activeEpisode.governance?.returns?.find((entry) => entry.id === returnId);
+    if (!returnPacket || returnPacket.status !== "returned") return;
+    const evidence = returnPacket.acceptedEvidence ?? [];
+    const claims = returnPacket.acceptedClaims ?? [];
+    if (evidence.length === 0 && claims.length === 0) return;
+    const now = new Date().toISOString();
+    const summary = claims.at(-1) ?? activeProject.state?.summary ?? "Evidence accepted from a Return Packet.";
+    const change = { id: `state-change-${crypto.randomUUID()}`, type: "reconciliation", value: summary, evidence, claims, returnId, episodeId: activeEpisode.id, owner: activeProject.ownerName, createdAt: now, authority: AUTHORITY_STATES.AUTHORITATIVE };
     updateProject(activeProject.id, (project) => ({
       ...project,
-      state: { id: `state-${crypto.randomUUID()}`, summary: kind === "claim" ? item : project.state?.summary ?? "Evidence accepted from a Return Packet.", sourceIds: kind === "evidence" ? [...new Set([...(project.state?.sourceIds ?? []), item])] : project.state?.sourceIds ?? [], authority: AUTHORITY_STATES.AUTHORITATIVE, createdAt: change.createdAt },
+      state: { id: `state-${crypto.randomUUID()}`, summary, sourceIds: [...new Set([...(project.state?.sourceIds ?? []), ...evidence])], authority: AUTHORITY_STATES.AUTHORITATIVE, createdAt: now },
       stateHistory: [...(project.stateHistory ?? []), change],
     }));
-    appendActivity(activeEpisode.id, { type: `return.${kind}_accepted`, actor: "human", title: `${kind === "claim" ? "Claim" : "Evidence"} accepted into Project State`, summary: item, authorityImpact: "accepted" });
+    updateEpisode(activeEpisode.id, (episode) => ({ ...episode, governance: { ...episode.governance, returns: episode.governance.returns.map((entry) => entry.id === returnId ? { ...entry, status: "accepted", reconciliationStatus: "committed", reconciledAt: now } : entry) } }));
+    appendActivity(activeEpisode.id, { type: "return.reconciliation_committed", actor: "human", title: "Return reconciliation accepted", summary: `${evidence.length} evidence item${evidence.length === 1 ? "" : "s"} and ${claims.length} claim${claims.length === 1 ? "" : "s"} committed atomically to Project State.`, authorityImpact: "accepted" });
   }
 
   function rejectReturn(returnId) {
     if (!activeEpisode) return;
-    updateEpisode(activeEpisode.id, (episode) => ({ ...episode, governance: { ...episode.governance, returns: episode.governance.returns.map((entry) => entry.id === returnId ? { ...entry, status: "rejected", reconciledAt: new Date().toISOString() } : entry) } }));
-    appendActivity(activeEpisode.id, { type: "return.rejected", actor: "human", title: "Return rejected", summary: "No returned evidence or claims changed Project State.", authorityImpact: "human-review" });
+    const returnPacket = activeEpisode.governance?.returns?.find((entry) => entry.id === returnId);
+    if (!returnPacket || returnPacket.status !== "returned") return;
+    updateEpisode(activeEpisode.id, (episode) => ({ ...episode, governance: { ...episode.governance, returns: episode.governance.returns.map((entry) => entry.id === returnId ? { ...entry, status: "rejected", acceptedEvidence: [], acceptedClaims: [], reconciliationStatus: "rejected", reconciledAt: new Date().toISOString() } : entry) } }));
+    appendActivity(activeEpisode.id, { type: "return.rejected", actor: "human", title: "Return rejected", summary: "The staged reconciliation was discarded. Project State was not changed by this Return Packet.", authorityImpact: "human-review" });
   }
 
   function recordProjectState() {
@@ -4751,8 +4778,8 @@ export default function App() {
     if (!orchestrationNodeId) {
       return;
     }
-    if (activeEpisode.governance?.readback?.status !== "accepted" || !activeEpisode.governance?.baseline) {
-      appendActivity(activeEpisode.id, { type: "orchestration.authorization_blocked", actor: "system", title: "Orchestration not authorized", summary: "Accept the Readback and capture an Episode baseline before authorizing this run.", relatedNodeId: orchestrationNodeId, authorityImpact: "prohibited" });
+    if (activeEpisode.governance?.readback?.status !== "accepted" || !activeEpisode.governance?.baseline || !activeProject?.state?.id || activeEpisode.governance.baseline.projectStateId !== activeProject.state.id) {
+      appendActivity(activeEpisode.id, { type: "orchestration.authorization_blocked", actor: "system", title: "Orchestration not authorized", summary: "Accept the Readback and ensure the Episode baseline matches current Project State before authorizing this run.", relatedNodeId: orchestrationNodeId, authorityImpact: "prohibited" });
       return;
     }
 
@@ -4793,7 +4820,7 @@ export default function App() {
     const plan = preview?.plan ?? getLocalOrchestrationPlan(orchestrationNodeId);
     if (!plan || preview?.state !== "preview-approved" || orchestrationRun?.status === "working" || preview?.runStatus === "working") return;
     const lease = (activeEpisode.governance?.workLeases ?? []).find((item) => item.id === preview.workLeaseId);
-    const leaseValidation = validateWorkLease({ lease, episodeId: activeEpisode.id, baselineId: activeEpisode.governance?.baseline?.id ?? null, action: "orchestration" });
+    const leaseValidation = validateWorkLease({ lease, episodeId: activeEpisode.id, baselineId: activeEpisode.governance?.baseline?.id ?? null, action: "orchestration", projectStateId: activeProject?.state?.id ?? null });
     if (!leaseValidation.valid) {
       appendActivity(activeEpisode.id, { type: "orchestration.authorization_blocked", actor: "system", title: "Orchestration not authorized", summary: leaseValidation.error, relatedNodeId: orchestrationNodeId, authorityImpact: "prohibited" });
       return;
@@ -4857,6 +4884,7 @@ export default function App() {
           sources: sourceRecords,
           plan,
           baseline: activeEpisode.governance.baseline,
+          projectState: activeProject?.state ?? null,
           workLease: lease,
           agentRoute: route,
         }),
@@ -4935,12 +4963,14 @@ export default function App() {
       eventSource.onerror = () => {
         if (eventSource.readyState === EventSource.CLOSED || orchestrationEventSourceRef.current !== eventSource) return;
         setOrchestrationRun((current) => current ? { ...current, status: "error", error: "Local orchestration runtime unavailable." } : current);
+        updateEpisode(activeEpisode.id, (episode) => ({ ...episode, governance: { ...episode.governance, workLeases: episode.governance.workLeases.map((item) => item.id === lease.id ? { ...item, status: "expired", completedAt: new Date().toISOString() } : item), agentRoutes: episode.governance.agentRoutes.map((item) => item.leaseId === lease.id ? { ...item, status: "expired" } : item) } }));
         eventSource.close();
         orchestrationEventSourceRef.current = null;
       };
     } catch (error) {
       setOrchestrationRun((current) => current ? { ...current, status: "error", error: error.message } : current);
       saveOrchestrationPreview(orchestrationNodeId, { ...preview, runStatus: "error", error: error.message });
+      updateEpisode(activeEpisode.id, (episode) => ({ ...episode, governance: { ...episode.governance, workLeases: episode.governance.workLeases.map((item) => item.id === lease.id ? { ...item, status: "expired", completedAt: new Date().toISOString() } : item), agentRoutes: episode.governance.agentRoutes.map((item) => item.leaseId === lease.id ? { ...item, status: "expired" } : item) } }));
       appendActivity(activeEpisode.id, { type: "orchestration.run_failed", actor: "codex", title: "Read-only orchestration failed", summary: error.message, relatedNodeId: orchestrationNodeId, authorityImpact: "analysis" });
     }
   }
@@ -5720,6 +5750,7 @@ export default function App() {
         ownerName: project?.ownerName ?? "Owner",
         baseline: createEpisodeBaseline(project),
         readback: null,
+        readbackHistory: [],
         workLeases: [],
         agentRoutes: [],
         returns: [],
@@ -5779,9 +5810,9 @@ export default function App() {
     episode.activity.push(createActivityEvent({
         episodeId: id,
         type: "readback.proposed",
-        actor: "codex",
+        actor: "system",
         title: "Readback ready for owner review",
-        summary: "Codex proposed its context understanding. No work has been authorized.",
+        summary: "The Workroom generated a bounded context readback. No work has been authorized.",
         authorityImpact: "proposal",
       }));
 
@@ -5814,14 +5845,15 @@ export default function App() {
   async function runAutopilotEpisode(episode, instruction = "") {
     if (!episode?.id || autopilotEventSourceRef.current || episode.autopilotRun?.status === "working") return;
     const lease = (episode.governance?.workLeases ?? []).find((item) => item.status === "active" && item.action === "analysis");
-    const leaseValidation = validateWorkLease({ lease, episodeId: episode.id, baselineId: episode.governance?.baseline?.id ?? null, action: "analysis" });
+    const project = episode.projectId ? projects.find((item) => item.id === episode.projectId) ?? null : null;
+    const leaseValidation = validateWorkLease({ lease, episodeId: episode.id, baselineId: episode.governance?.baseline?.id ?? null, action: "analysis", projectStateId: project?.state?.id ?? null });
     if (episode.governance?.readback?.status !== "accepted" || !leaseValidation.valid) {
       appendActivity(episode.id, { type: "autopilot.authorization_blocked", actor: "system", title: "Analysis not authorized", summary: leaseValidation.error ?? "Accept the Readback before authorizing a Work Lease.", authorityImpact: "prohibited" });
       return;
     }
     const route = (episode.governance?.agentRoutes ?? []).find((item) => item.leaseId === lease.id) ?? createAgentRoute({ lease, role: "Read-only technical analyst" });
     const startedAt = new Date().toISOString();
-    const initial = { ...(episode.autopilotRun ?? {}), episodeId: episode.id, status: "queued", runId: null, startedAt, finishedAt: null, instruction, activeTaskId: null, activeNodeId: null, taskStates: { "intake-planner": "queued" }, outputs: [], errors: [], error: null, finalPackage: null, humanReviewStatus: "pending", events: [], context: { objective: episode.title, sourceCount: episode.sources?.length ?? 0, sourceNames: (episode.sources ?? []).map((source) => source.fileName).slice(0, 4) } };
+    const initial = { ...(episode.autopilotRun ?? {}), episodeId: episode.id, status: "queued", runId: null, startedAt, finishedAt: null, instruction, activeTaskId: null, activeNodeId: null, taskStates: { "intake-planner": "queued" }, outputs: [], errors: [], error: null, finalPackage: null, humanReviewStatus: "pending", workLeaseId: lease.id, events: [], context: { objective: episode.title, sourceCount: episode.sources?.length ?? 0, sourceNames: (episode.sources ?? []).map((source) => source.fileName).slice(0, 4) } };
     setAutopilotRun(initial);
     updateEpisode(episode.id, (current) => ({ ...current, autopilotRun: initial, intake: { ...normalizeEpisodeIntake(current.intake), status: "pending" } }));
     appendActivity(episode.id, { type: "autopilot.run_started", actor: "codex", title: "Autopilot episode run started", summary: `Bounded local run · maximum ${MAX_AUTOPILOT_TURNS} Codex turns.`, authorityImpact: "proposal" });
@@ -5832,7 +5864,7 @@ export default function App() {
         if (!stored) throw new Error(`Source ${source.fileName} is missing from local storage.`);
         sources.push(sourceForAnalysis(source, stored));
       }
-      const response = await fetch("/api/codex/autopilot/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ episodeId: episode.id, episodeName: episode.name, objective: episode.title, context: [episode.context, instruction].filter(Boolean).join("\n\n"), sources, consent: true, baseline: episode.governance?.baseline, workLease: lease, agentRoute: route }) });
+      const response = await fetch("/api/codex/autopilot/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ episodeId: episode.id, episodeName: episode.name, objective: episode.title, context: [episode.context, instruction].filter(Boolean).join("\n\n"), sources, consent: true, baseline: episode.governance?.baseline, projectState: project?.state ?? null, workLease: lease, agentRoute: route }) });
       const result = await response.json();
       if (!response.ok || !result.runId) throw new Error(result.message || "Local Autopilot runtime unavailable.");
       setAutopilotRun((current) => current ? { ...current, status: "working", runId: result.runId } : current);
@@ -5890,7 +5922,7 @@ export default function App() {
       };
       eventSource.onerror = () => {
         if (eventSource.readyState === EventSource.CLOSED || autopilotEventSourceRef.current !== eventSource) return;
-        updateEpisode(episode.id, (current) => ({ ...current, autopilotRun: { ...(current.autopilotRun ?? initial), status: "error", error: "Local Autopilot runtime unavailable." } }));
+        updateEpisode(episode.id, (current) => ({ ...current, governance: { ...current.governance, workLeases: current.governance.workLeases.map((item) => item.id === lease.id ? { ...item, status: "expired", completedAt: new Date().toISOString() } : item), agentRoutes: current.governance.agentRoutes.map((item) => item.leaseId === lease.id ? { ...item, status: "expired" } : item) }, autopilotRun: { ...(current.autopilotRun ?? initial), status: "error", error: "Local Autopilot runtime unavailable." } }));
         eventSource.close(); autopilotEventSourceRef.current = null;
       };
     } catch (error) {
@@ -5901,7 +5933,7 @@ export default function App() {
         finishedAt: new Date().toISOString(),
       };
       setAutopilotRun(failedRun);
-      updateEpisode(episode.id, (current) => ({ ...current, autopilotRun: { ...(current.autopilotRun ?? failedRun), ...failedRun } }));
+      updateEpisode(episode.id, (current) => ({ ...current, governance: { ...current.governance, workLeases: current.governance.workLeases.map((item) => item.id === lease.id ? { ...item, status: "expired", completedAt: new Date().toISOString() } : item), agentRoutes: current.governance.agentRoutes.map((item) => item.leaseId === lease.id ? { ...item, status: "expired" } : item) }, autopilotRun: { ...(current.autopilotRun ?? failedRun), ...failedRun } }));
       appendActivity(episode.id, { type: "autopilot.run_failed", actor: "system", title: "Autopilot run failed", summary: error.message, authorityImpact: "analysis" });
     }
   }
@@ -5912,14 +5944,19 @@ export default function App() {
     autopilotEventSourceRef.current?.close();
     autopilotEventSourceRef.current = null;
     setAutopilotRun((current) => current ? { ...current, status: "cancelled" } : current);
-    if (activeEpisode) updateEpisode(activeEpisode.id, (episode) => ({ ...episode, governance: { ...episode.governance, workLeases: episode.governance.workLeases.map((lease) => lease.status === "active" ? { ...lease, status: "cancelled", completedAt: new Date().toISOString() } : lease) }, autopilotRun: { ...(episode.autopilotRun ?? {}), status: "cancelled", finishedAt: new Date().toISOString() } }));
+    if (activeEpisode) updateEpisode(activeEpisode.id, (episode) => ({ ...episode, governance: { ...episode.governance, workLeases: episode.governance.workLeases.map((lease) => lease.id === episode.autopilotRun?.workLeaseId ? { ...lease, status: "cancelled", completedAt: new Date().toISOString() } : lease), agentRoutes: episode.governance.agentRoutes.map((route) => route.leaseId === episode.autopilotRun?.workLeaseId ? { ...route, status: "cancelled" } : route) }, autopilotRun: { ...(episode.autopilotRun ?? {}), status: "cancelled", finishedAt: new Date().toISOString() } }));
   }
 
   function promoteAutopilotPackage() {
     if (!activeEpisode?.autopilotRun?.finalPackage) return;
-    const packageValue = activeEpisode.autopilotRun.finalPackage;
-    updateEpisode(activeEpisode.id, (episode) => ({ ...episode, context: `${episode.context ?? ""}\n\nTrusted context package:\n${packageValue.summary}`, autopilotRun: { ...episode.autopilotRun, humanReviewStatus: "promoted" } }));
-    appendActivity(activeEpisode.id, { type: "autopilot.package_promoted", actor: "human", title: "Autopilot package promoted", summary: "Trusted context updated; stage and disposition unchanged.", authorityImpact: "human-review" });
+    const returnPacket = activeEpisode.governance?.returns?.find((entry) => entry.runId === activeEpisode.autopilotRun.runId) ?? activeEpisode.governance?.returns?.at(-1);
+    if (!returnPacket || returnPacket.status !== "returned") return;
+    updateEpisode(activeEpisode.id, (episode) => ({
+      ...episode,
+      governance: { ...episode.governance, returns: episode.governance.returns.map((entry) => entry.id === returnPacket.id ? { ...entry, acceptedEvidence: [...entry.evidence], acceptedClaims: [...entry.claims], reconciliationStatus: "staged" } : entry) },
+      autopilotRun: { ...episode.autopilotRun, humanReviewStatus: "reconciliation-staged" },
+    }));
+    appendActivity(activeEpisode.id, { type: "autopilot.package_staged", actor: "human", title: "Autopilot package staged for reconciliation", summary: "Nothing became trusted or authoritative yet. Confirm the staged Return Packet in the governance panel to change Project State.", authorityImpact: "human-review" });
   }
 
   function setAutopilotHumanStatus(status) {
@@ -8831,6 +8868,7 @@ export default function App() {
               onAuthorize={authorizeAutopilotAnalysis}
               onRecordState={recordProjectState}
               onAcceptReturnItem={acceptReturnItem}
+              onCommitReturn={commitReturnReconciliation}
               onRejectReturn={rejectReturn}
             />}
 

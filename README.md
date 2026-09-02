@@ -28,7 +28,7 @@ Agents can add inspectable evidence, recommendations, evaluations, source-backed
 - **Stage gates and human checkpoints** — advance the active episode manually when justified. Accepted intake checkpoints remain separate gates with their original titles and dependencies.
 - **Human disposition** — record the final human-owned outcome from the last stage.
 - **Targeted node orchestration** — create a deterministic preview for an eligible accepted node, explicitly approve a maximum-three-turn read-only run, stream specialist task state, cancel it, and inspect resulting artifacts.
-- **Autopilot Episode Runs** — consented agent-assisted episodes automatically run one bounded maximum-five-turn pipeline: intake planner, up to three dependency-aware specialists, and final synthesis/review. The draft plan remains unaccepted and the final package always requires human review.
+- **Autopilot Episode Runs** — agent-assisted episodes create a system Readback first. A human must accept that context and issue a one-run Work Lease against the current Episode baseline before the bounded maximum-five-turn pipeline can execute. The draft plan remains unaccepted and the final package returns with no authority until human reconciliation.
 - **Source-informed Episode creation** — paste transcript/context and attach up to 10 `.txt`, `.md`, `.pdf`, or `.docx` files (10 MB each). Text is extracted in the browser, originals and full extracted text stay in IndexedDB, and only source metadata is kept in the Episode's localStorage record. Explicit consent is required before source text is sent to the local Codex runtime.
 - **Activity and notifications** — review human, Codex, source, proposal, orchestration, Autopilot, failure, and completion events, with related-work links and dismissible agent notifications.
 
@@ -63,7 +63,9 @@ The workroom remains local-first: there is no database, authentication, multi-us
 
 Agent-assisted intake produces a proposal only. Source preparation generates bounded per-source summaries and a combined context package before the existing proposal pass; source-informed work nodes cite the source IDs they rely on. Human checkpoints are retained as explicit workflow gate records with their titles and dependencies when a human accepts the proposal. Humans remain solely responsible for accepting structure, advancing stages, and recording final disposition.
 
-Autopilot adds an episode-local `autopilotRun` record to compatible episodes. It stores run metadata, draft plan, task states, bounded outputs, assumptions, unresolved questions, errors, final package, and human review status in localStorage. Source text is loaded from IndexedDB only for the active run and is never retained by the server. Promotion of a final package updates trusted context only; it does not accept workflow structure, advance a stage, or record disposition. Revised runs are explicit human actions and are never retried automatically. Run history on the server is short-lived and bounded; it is not a persistence layer.
+Governance is stored with each Episode as an immutable baseline snapshot, current system Readback plus revision history, Work Leases, Agent Routes, and Return Packets. Project State is separately human-owned and changing it makes older Episode baselines stale until they are explicitly re-baselined.
+
+Autopilot adds an episode-local `autopilotRun` record to compatible episodes. It stores run metadata, draft plan, task states, bounded outputs, assumptions, unresolved questions, errors, final package, and human review status in localStorage. Source text is loaded from IndexedDB only for the active run and is never retained by the server. The Autopilot “Promote” action only stages its Return Packet for reconciliation; it does not update trusted context or Project State. Project State changes only when a human commits a staged reconciliation atomically. Revised runs are explicit human actions and are never retried automatically. Run history on the server is short-lived and bounded; it is not a persistence layer.
 
 ## Getting started
 
@@ -94,7 +96,7 @@ For the usual next-start workflow, run:
 npm run initialize
 ```
 
-This starts Vite on `http://localhost:5173/` and the local Codex runtime on `http://127.0.0.1:8787`, waits for both services to respond, and opens the workroom in the system browser. Keep that terminal open while working; press `Ctrl+C` to stop both processes cleanly. The runtime checks local Codex status and exposes read-only intake, node conversation, targeted orchestration, and Autopilot SSE endpoints; it requires a local Codex CLI login for analysis. Source text is sent only after the user explicitly consents in the modal. Agent-assisted creation shows a maximum-five-turn guard and starts one bounded Autopilot run after consent.
+This starts Vite on `http://localhost:5173/` and the local Codex runtime on `http://127.0.0.1:8787`, waits for both services to respond, and opens the workroom in the system browser. Keep that terminal open while working; press `Ctrl+C` to stop both processes cleanly. The runtime checks local Codex status and exposes read-only intake, node conversation, targeted orchestration, and Autopilot SSE endpoints; it requires a local Codex CLI login for analysis. Source text is sent only after the user explicitly consents in the modal. Agent-assisted creation shows a maximum-five-turn guard, generates a system Readback, and waits for explicit human context acceptance plus a current-baseline Work Lease before any bounded Autopilot run starts.
 
 ### Other commands
 
@@ -106,7 +108,7 @@ npm run test:intake # Run all lightweight node:test coverage
 npm run initialize # Start Vite and open the workroom in the browser
 ```
 
-The test script currently covers intake graph/checkpoint validation, source extraction fixtures, targeted orchestration, Autopilot scheduling/state/output contracts, and planner Episode-ID validation.
+The test script currently covers governance baseline/lease invariants, readback and Return Packet contracts, intake graph/checkpoint validation, source extraction fixtures, targeted orchestration, Autopilot scheduling/state/output contracts, and planner Episode-ID validation.
 
 ## Project structure
 
@@ -118,6 +120,7 @@ The test script currently covers intake graph/checkpoint validation, source extr
 │   ├── episodeSources.js     # Browser extraction, source manifest, and IndexedDB helpers
 │   ├── orchestration.js     # Deterministic targeted node orchestration planning contract
 │   ├── autopilot.js         # Five-turn scheduling, state, output, and authority contracts
+│   ├── governance.js        # Project state, baselines, readbacks, leases, routes, returns, and validation
 │   ├── workflowLayout.js    # Dagre layout and dependency trace helpers
 │   ├── App.css              # Workroom and React Flow styling
 │   ├── NewEpisodeModal.jsx  # New episode form
