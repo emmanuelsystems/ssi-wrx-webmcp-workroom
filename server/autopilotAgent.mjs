@@ -7,6 +7,7 @@ import {
   validateAutopilotTaskOutput,
 } from "../src/autopilot.js";
 import { EPISODE_STRUCTURE_OUTPUT_SCHEMA, validateEpisodeStructureProposal } from "../src/episodeIntake.js";
+import { validateWorkLease } from "../src/governance.js";
 
 const MAX_TEXT = 80_000;
 
@@ -22,6 +23,9 @@ export function validateAutopilotInput(input) {
     if (!source?.sourceId || sourceIds.has(source.sourceId) || typeof source.text !== "string" || !source.text.trim() || source.text.length > MAX_TEXT) throw new Error("source text or metadata is invalid.");
     sourceIds.add(source.sourceId);
   }
+  if (!input.baseline?.id) throw new Error("Episode baseline is required for an authorized run.");
+  const leaseValidation = validateWorkLease({ lease: input.workLease, episodeId: input.episodeId, baselineId: input.baseline.id, action: "analysis" });
+  if (!leaseValidation.valid) throw new Error(leaseValidation.error);
   return { sourceIds: [...sourceIds] };
 }
 

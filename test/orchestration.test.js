@@ -8,6 +8,7 @@ import {
   validateOrchestrationTaskOutput,
 } from "../src/orchestration.js";
 import { validateOrchestrationInput } from "../server/orchestrationAgent.mjs";
+import { createAgentRoute, createWorkLease } from "../src/governance.js";
 
 const plan = {
   tasks: [
@@ -28,6 +29,10 @@ const output = (taskId, sourceIds = ["source-1"]) => ({
   unresolvedQuestions: ["Question?"],
   recommendedNextStep: "Ask a human to review.",
 });
+
+const leaseEpisode = { id: "E0-001", governance: { baseline: { id: "baseline-1" }, ownerName: "Owner" } };
+const leaseRoute = createAgentRoute({ role: "First Mate coordinator" });
+const workLease = createWorkLease({ episode: leaseEpisode, agentRoute: leaseRoute, objective: "Analyze", action: "orchestration" });
 
 test("selects at most three specialist turns and keeps two-task plans", () => {
   assert.deepEqual(selectOrchestrationTasks(plan).map((task) => task.id), ["analysis", "synthesis", "review"]);
@@ -52,6 +57,8 @@ test("validates approved runtime input without retaining source text", () => {
     threads: [],
     sources: [{ sourceId: "source-1", fileName: "notes.txt", text: "Local source text." }],
     plan,
+    baseline: leaseEpisode.governance.baseline,
+    workLease,
   });
   assert.deepEqual(result.sourceIds, ["source-1"]);
   assert.doesNotThrow(() => validateOrchestrationInput({
@@ -64,6 +71,8 @@ test("validates approved runtime input without retaining source text", () => {
     threads: [],
     sources: [],
     plan,
+    baseline: leaseEpisode.governance.baseline,
+    workLease,
   }));
   assert.throws(() => validateOrchestrationInput({ episodeId: "E0-001", nodeId: "inquiry", objective: "Understand", context: "Context", node: {}, plan: {}, sources: [] }), /two or three runnable specialist tasks/);
 });

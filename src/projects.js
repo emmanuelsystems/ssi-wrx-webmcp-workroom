@@ -7,6 +7,9 @@ export function normalizeProject(project, index = 0) {
     description: project?.description?.trim() || "",
     createdAt: project?.createdAt ?? new Date().toISOString(),
     archived: project?.archived === true,
+    ownerName: project?.ownerName?.trim() || "Owner",
+    state: project?.state && typeof project.state === "object" ? project.state : null,
+    stateHistory: Array.isArray(project?.stateHistory) ? project.stateHistory : [],
   };
 }
 

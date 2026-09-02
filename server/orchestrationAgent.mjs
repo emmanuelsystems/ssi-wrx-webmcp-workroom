@@ -5,6 +5,7 @@ import {
   selectOrchestrationTasks,
   validateOrchestrationTaskOutput,
 } from "../src/orchestration.js";
+import { validateWorkLease } from "../src/governance.js";
 
 const MAX_TEXT = 80_000;
 
@@ -27,6 +28,9 @@ export function validateOrchestrationInput(input) {
     if (typeof source.text !== "string" || !source.text.trim() || source.text.length > MAX_TEXT) throw new Error("source text is invalid or too long.");
     sourceIds.add(source.sourceId);
   }
+  if (!input.baseline?.id) throw new Error("Episode baseline is required for an authorized run.");
+  const leaseValidation = validateWorkLease({ lease: input.workLease, episodeId: input.episodeId, baselineId: input.baseline.id, action: "orchestration" });
+  if (!leaseValidation.valid) throw new Error(leaseValidation.error);
   return { tasks, sourceIds: [...sourceIds] };
 }
 

@@ -13,6 +13,15 @@ const MAX_BODY = 1_200_000;
 const MAX_RETAINED_FINISHED_RUNS = 24;
 const FINISHED_RUN_TTL_MS = 15 * 60 * 1000;
 const runs = new Map();
+const consumedLeaseIds = new Set();
+
+function reserveLease(input, action) {
+  const leaseId = input?.workLease?.id;
+  if (!leaseId) throw new Error("Work Lease is required.");
+  if (consumedLeaseIds.has(leaseId)) throw new Error("Work Lease was already used.");
+  if (input.workLease.action !== action) throw new Error("Work Lease does not permit this run.");
+  consumedLeaseIds.add(leaseId);
+}
 
 function sendJson(response, status, payload) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
@@ -111,6 +120,7 @@ const server = createServer(async (request, response) => {
       const input = await readJson(request);
       if (input.approved !== true) throw new Error("Human approval is required before orchestration can run.");
       validateOrchestrationInput(input);
+      reserveLease(input, "orchestration");
       pruneRuns();
       const retainedInput = {
         episodeId: input.episodeId,
@@ -146,6 +156,7 @@ const server = createServer(async (request, response) => {
     if (request.method === "POST" && request.url === "/api/codex/autopilot/start") {
       const input = await readJson(request);
       validateAutopilotInput(input);
+      reserveLease(input, "analysis");
       pruneRuns();
       const retainedInput = { episodeId: input.episodeId, sourceIds: (input.sources ?? []).map((source) => source.sourceId) };
       const run = { id: crypto.randomUUID(), kind: "autopilot", input: retainedInput, outputs: [], draftPlan: null, finalPackage: null, events: [], subscribers: new Set(), controller: new AbortController(), done: false, status: "queued", startedAt: Date.now() };

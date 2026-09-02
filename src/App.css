@@ -4965,3 +4965,25 @@ select:focus-visible {
   font-weight: 700;
 }
 .run-inspector-canvas-toggle:hover { background: #eff3ed; }
+
+.governance-panel { margin: 0 20px 14px; padding: 15px 16px; border: 1px solid #d5ddcf; border-radius: 14px; background: #fbfdf9; color: #34402f; }
+.governance-panel > header, .governance-panel > header > div, .governance-actions, .return-packet { display: flex; }
+.governance-panel > header { justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 12px; }
+.governance-panel header span, .governance-grid span, .return-packet span { display: block; color: #74806e; font-size: 9px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.governance-panel h2 { margin: 3px 0 0; font-size: 17px; }
+.governance-panel header em { font-size: 11px; font-style: normal; color: #50604b; }
+.governance-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.governance-grid article { min-width: 0; padding: 10px; border-left: 3px solid #d3ddd0; background: #f4f7f1; }
+.governance-grid strong { display: block; margin-top: 4px; font-size: 12px; }
+.governance-grid p, .return-packet p { margin: 5px 0 0; color: #647060; font-size: 11px; line-height: 1.42; }
+.governance-panel button { margin-top: 8px; padding: 6px 8px; border: 1px solid #b6c3b0; border-radius: 7px; background: #fff; color: #40503b; cursor: pointer; font: inherit; font-size: 10px; font-weight: 700; }
+.governance-panel button:hover:not(:disabled) { background: #eaf0e6; }
+.governance-panel button:disabled { opacity: .65; cursor: default; }
+.governance-actions { gap: 5px; flex-wrap: wrap; }
+.return-packet { align-items: flex-start; gap: 14px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #dbe3d6; }
+.return-packet > div:first-child { flex: 0 1 270px; }
+.return-packet strong { display: block; margin-top: 4px; font-size: 12px; }
+.return-packet-items { display: grid; flex: 1; gap: 5px; }
+.return-packet-items button { margin: 0; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.governance-reject { color: #7e4439 !important; }
+@media (max-width: 980px) { .governance-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .return-packet { display: block; } .return-packet-items { margin-top: 10px; } }
