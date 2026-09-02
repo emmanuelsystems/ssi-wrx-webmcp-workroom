@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   harden:
-    if: github.event.head_commit.message == 'Run governance hardening'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,16 +21,18 @@ jobs:
           node-version: 22
           cache: npm
       - name: Apply governance invariants
-        run: python3 scripts/governance-hardening.py
+        id: patch
+        continue-on-error: true
+        run: python3 scripts/governance-hardening.py 2> hardening-error.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: governance-hardening-diagnostic
+          path: hardening-error.txt
+      - name: Stop if patch failed
+        if: steps.patch.outcome == 'failure'
+        run: exit 1
       - run: npm ci
       - run: npm run test:intake
       - run: npm run build
       - run: npm run lint
-      - name: Commit verified hardening
-        run: |
-          git rm .github/workflows/governance-hardening.yml scripts/governance-hardening.py
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add src/App.jsx src/governance.js server/autopilotAgent.mjs server/orchestrationAgent.mjs test/governance.test.js test/orchestration.test.js README.md .github/workflows/governance-ci.yml
-          git commit -m "Harden governance invariants"
-          git push origin HEAD:codex/governance-mvp
