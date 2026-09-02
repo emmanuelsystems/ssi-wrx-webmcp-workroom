@@ -15,6 +15,7 @@
   "dependencies": {
     "@dagrejs/dagre": "^3.1.1",
     "@openai/codex-sdk": "^0.150.1",
+    "@tabler/icons-react": "^3.46.0",
     "@xyflow/react": "^12.11.5",
     "mammoth": "^1.12.2",
     "pdfjs-dist": "^6.3.289",
