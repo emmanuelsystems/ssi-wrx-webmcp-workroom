@@ -5,13 +5,11 @@ import {
   IconBolt,
   IconBook2,
   IconBriefcase2,
-  IconCheck,
   IconCheckupList,
   IconChevronDown,
   IconCircleCheck,
   IconClipboardCheck,
   IconClock,
-  IconFile,
   IconFileDescription,
   IconGripVertical,
   IconHome,
@@ -29,10 +27,12 @@ import {
   IconUsers,
   IconX,
 } from "@tabler/icons-react";
+import { extractSourceFile, getEpisodeSource, SOURCE_TEXT_LIMIT } from "./episodeSources.js";
 
 import "./OperatingDashboard.css";
 
 const STORAGE_KEY = "ssi-wrx-operating-dashboard-v1";
+const SOURCE_TRUNCATION_NOTE = "\n\n[Source text truncated for this Codex turn; the full file remains attached locally.]";
 
 function createId(prefix = "item") {
   if (typeof crypto?.randomUUID === "function") return crypto.randomUUID();
@@ -104,6 +104,77 @@ const INITIAL_COLUMNS = {
   ],
 };
 
+function previewFromEpisodeProposal(proposal) {
+  const nodes = proposal.workNodes ?? [];
+  const split = Math.max(1, Math.ceil(nodes.length / 2));
+  const taskForNode = (node, columnId) => ({
+    title: node.title,
+    description: node.description,
+    output: `${node.kind} review`,
+    outputType: "Analysis",
+    state: columnId === "review" ? "Human review" : columnId === "now" ? "Ready" : "Queued",
+  });
+  return {
+    title: proposal.objective,
+    summary: proposal.context.summary,
+    now: nodes.slice(0, split).map((node) => taskForNode(node, "now")),
+    next: nodes.slice(split).map((node) => taskForNode(node, "next")),
+    review: (proposal.humanGates ?? []).map((gate) => ({
+      title: gate.title,
+      description: `Human checkpoint after ${(gate.afterNodeIds ?? []).join(", ") || "the proposed work"}.`,
+      output: "Human decision record",
+      outputType: "Approval",
+      state: "Human review",
+    })),
+  };
+}
+
+function columnsFromEpisodeProposal(proposal) {
+  const preview = previewFromEpisodeProposal(proposal);
+  const stateForColumn = { now: "Ready", next: "Queued", review: "Human review" };
+  return Object.fromEntries(
+    ["now", "next", "review"].map((columnId) => [
+      columnId,
+      (preview[columnId] ?? []).map((task) => ({
+        ...task,
+        id: createId(`proposal-${columnId}`),
+        state: stateForColumn[columnId],
+      })),
+    ]),
+  );
+}
+
+function sourceForConversation(source) {
+  const text = String(source.text ?? "").trim();
+  const boundedText = text.length > SOURCE_TEXT_LIMIT
+    ? `${text.slice(0, SOURCE_TEXT_LIMIT - SOURCE_TRUNCATION_NOTE.length)}${SOURCE_TRUNCATION_NOTE}`
+    : text;
+  return {
+    sourceId: source.sourceId,
+    fileName: source.fileName,
+    fileType: source.fileType,
+    extension: source.extension,
+    size: source.size,
+    extractionStatus: source.extractionStatus,
+    charCount: source.charCount,
+    createdAt: source.createdAt,
+    text: boundedText,
+  };
+}
+
+function conversationMessagesFromEpisode(episode) {
+  return (Array.isArray(episode?.additions) ? episode.additions : [])
+    .filter((item) => item.kind === "thread" && Array.isArray(item.messages))
+    .flatMap((thread) => thread.messages.map((message) => ({
+      id: message.id ?? createId("message"),
+      role: message.role === "agent" ? "agent" : "human",
+      text: message.content ?? message.text ?? "",
+      sourceIds: thread.sourceIds ?? [],
+    })))
+    .filter((message) => message.text.trim())
+    .slice(-60);
+}
+
 const NAV_GROUPS = [
   {
     label: "Workspace",
@@ -125,19 +196,7 @@ const NAV_GROUPS = [
   },
 ];
 
-const SOURCES = [
-  { name: "Client meeting — Sep 1", meta: "58 min · David Kim", icon: IconMicrophone },
-  { name: "Meeting transcript", meta: "Generated from recording", icon: IconFileDescription },
-  { name: "Client brief.pdf", meta: "2.4 MB", icon: IconFile },
-  { name: "Program overview.pdf", meta: "1.1 MB", icon: IconFile },
-  { name: "Q4 financials.xlsx", meta: "320 KB", icon: IconFile },
-];
-
-const PEOPLE = [
-  { initials: "DK", name: "David Kim", role: "Account lead" },
-  { initials: "SL", name: "Sarah Lee", role: "Client sponsor" },
-  { initials: "MC", name: "Michael Chen", role: "Solutions engineer" },
-];
+const EPISODE_STAGE_LABELS = ["Understand the work", "Evaluate the candidate", "Human disposition"];
 
 function getStoredColumns() {
   try {
@@ -148,7 +207,7 @@ function getStoredColumns() {
   }
 }
 
-function Sidebar({ activeNav, onNavigate }) {
+function Sidebar({ activeEpisodeId, activeNav, episodes, isNewConversation, onNavigate, onNewConversation, onSelectEpisode }) {
   return (
     <aside className="operating-sidebar">
       <div className="brand-lockup">
@@ -180,6 +239,32 @@ function Sidebar({ activeNav, onNavigate }) {
             })}
           </div>
         ))}
+        <div className="nav-group episode-nav-group">
+          <div className="episode-nav-heading">
+            <span className="nav-label">Episodes</span>
+            <button className="episode-new-button" onClick={onNewConversation} type="button">+ New</button>
+          </div>
+          <div className="episode-list" aria-label="Episodes">
+            <button className={`episode-nav-item episode-new-conversation ${isNewConversation ? "is-active" : ""}`} onClick={onNewConversation} type="button">
+              <span className="episode-nav-status" />
+              <span><strong>New conversation</strong><small>Draft a new Episode with SSI</small></span>
+            </button>
+            {episodes.map((episode) => (
+              <button
+                className={`episode-nav-item ${activeEpisodeId === episode.id ? "is-active" : ""}`}
+                key={episode.id}
+                onClick={() => onSelectEpisode(episode.id)}
+                type="button"
+              >
+                <span className="episode-nav-status" />
+                <span>
+                  <strong>{episode.name}</strong>
+                  <small>{episode.id} · {episode.status}</small>
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
       </nav>
 
       <div className="sidebar-footer">
@@ -196,45 +281,66 @@ function Sidebar({ activeNav, onNavigate }) {
   );
 }
 
-function ConversationSummary({ messages }) {
+function Conversation({ messages, isResponding }) {
   return (
     <section className="conversation-summary" aria-labelledby="conversation-title">
       <div className="conversation-eyebrow">
         <span className="status-dot" />
         Agent conversation
       </div>
-      <div className="intent-message">
-        <span>You said</span>
-        <p>
-          David just finished a meeting with a client. Review the meeting and
-          materials, identify what matters, and figure out what we should prepare next.
-        </p>
-      </div>
-      <div className="agent-understanding">
-        <div className="agent-symbol">
-          <IconSparkles aria-hidden="true" size={18} stroke={1.8} />
+      {messages.length === 0 ? (
+        <div className="conversation-empty">
+          <div className="agent-symbol">
+            <IconSparkles aria-hidden="true" size={18} stroke={1.8} />
+          </div>
+          <div>
+            <h2 id="conversation-title">Start with the outcome</h2>
+            <p>Tell SSI what you need to accomplish. It will help shape a reviewable plan without starting work on your behalf.</p>
+          </div>
         </div>
-        <div>
-          <span className="agent-name">SSI Agent</span>
-          <h2 id="conversation-title">What I understand</h2>
-          <p>
-            David met with Acme Corp to review their Q4 program outcomes and discuss
-            expanding the partnership. I’ll ground the work in the meeting and materials,
-            surface what matters, and recommend what to prepare next.
-          </p>
-          <ul>
-            <li><IconCheck size={15} /> Focus on outcomes, decisions, and open questions</li>
-            <li><IconCheck size={15} /> Surface risks, assumptions, and dependencies</li>
-            <li><IconCheck size={15} /> Prepare reviewable outputs before anything ships</li>
-          </ul>
+      ) : (
+        <div aria-live="polite" className="conversation-thread">
+          <h2 className="sr-only" id="conversation-title">Conversation with SSI Agent</h2>
           {messages.map((message) => (
-            <div className="follow-up-message" key={message.id}>
-              <strong>{message.author}</strong>
-              <span>{message.text}</span>
-            </div>
+            <article className={`conversation-message is-${message.role}`} key={message.id}>
+              {message.role === "agent" ? (
+                <div className="agent-symbol" aria-hidden="true">
+                  <IconSparkles size={16} stroke={1.8} />
+                </div>
+              ) : null}
+              <div className="conversation-bubble">
+                <div className="conversation-message-meta">
+                  <span>{message.role === "agent" ? "SSI Agent" : "You"}</span>
+                  {message.role === "agent" && message.model ? <small>{message.model}</small> : null}
+                </div>
+                <p>{message.text}</p>
+                {message.analysis ? <div className="agent-analysis">
+                  <span className="agent-analysis-label">Working assessment</span>
+                  <p>{message.analysis.summary}</p>
+                  {["findings", "decisions", "risks", "openQuestions"].map((section) => message.analysis[section]?.length ? (
+                    <div className="agent-analysis-section" key={section}>
+                      <strong>{section === "openQuestions" ? "Open questions" : section[0].toUpperCase() + section.slice(1)}</strong>
+                      <ul>{message.analysis[section].map((item) => <li key={item}>{item}</li>)}</ul>
+                    </div>
+                  ) : null)}
+                </div> : null}
+                {message.actions?.length ? <div className="conversation-actions-wrap">
+                  <span>Suggested next actions</span>
+                  <ul className="conversation-actions">
+                    {message.actions.map((action) => <li key={action}><IconArrowRight size={13} /> {action}</li>)}
+                  </ul>
+                </div> : null}
+              </div>
+            </article>
           ))}
+          {isResponding ? (
+            <article className="conversation-message is-agent is-pending" aria-label="SSI Agent is responding">
+              <div className="agent-symbol" aria-hidden="true"><IconSparkles size={16} stroke={1.8} /></div>
+              <div className="conversation-bubble"><div className="conversation-message-meta"><span>SSI Agent</span></div><p>Thinking<span className="typing-dots" aria-hidden="true">…</span></p></div>
+            </article>
+          ) : null}
         </div>
-      </div>
+      )}
     </section>
   );
 }
@@ -298,13 +404,16 @@ function WorkColumn({ id, title, subtitle, tasks, accent, ...props }) {
   );
 }
 
-function ContextPanel({ open, selectedTask, onClose }) {
+function ContextPanel({ context, open, selectedTask, onClose }) {
+  const sources = context.sources ?? [];
+  const people = context.people ?? [];
+  const decisions = context.decisions ?? [];
   return (
     <aside className={`context-panel ${open ? "is-open" : ""}`} aria-hidden={!open}>
       <header className="context-header">
         <div>
           <span>Engagement context</span>
-          <strong>{selectedTask ? selectedTask.title : "David — Client follow-up"}</strong>
+          <strong>{selectedTask ? selectedTask.title : context.title}</strong>
         </div>
         <button aria-label="Close context" onClick={onClose} type="button">
           <IconX size={18} />
@@ -324,56 +433,61 @@ function ContextPanel({ open, selectedTask, onClose }) {
         </div>
       ) : null}
 
-      <section className="context-section">
+      {context.summary ? <section className="context-section episode-context-section">
+        <div className="context-section-title">
+          <span><IconBook2 size={17} /> Episode brief</span>
+        </div>
+        <p className="episode-context-copy">{context.summary}</p>
+        <dl className="episode-context-meta">
+          <div><dt>Episode</dt><dd>{context.episodeId}</dd></div>
+          <div><dt>Stage</dt><dd>{context.stageLabel}</dd></div>
+        </dl>
+      </section> : null}
+
+      {sources.length > 0 ? <section className="context-section">
         <div className="context-section-title">
           <span><IconStack2 size={17} /> Sources</span>
-          <button type="button">View all</button>
         </div>
         <div className="context-list">
-          {SOURCES.map((source) => {
-            const Icon = source.icon;
-            return (
-              <button className="context-row" key={source.name} type="button">
-                <span className="context-icon"><Icon size={16} /></span>
-                <span><strong>{source.name}</strong><small>{source.meta}</small></span>
-              </button>
-            );
-          })}
+          {sources.map((source) => (
+            <button className="context-row" key={source.name} type="button">
+              <span className="context-icon"><IconFileDescription size={16} /></span>
+              <span><strong>{source.name}</strong>{source.meta ? <small>{source.meta}</small> : null}</span>
+            </button>
+          ))}
         </div>
-      </section>
+      </section> : null}
 
-      <section className="context-section">
+      {people.length > 0 ? <section className="context-section">
         <div className="context-section-title">
           <span><IconUsers size={17} /> People</span>
-          <button type="button">Manage</button>
         </div>
         <div className="people-list">
-          {PEOPLE.map((person) => (
+          {people.map((person) => (
             <div className="person-row" key={person.name}>
-              <span className="person-avatar">{person.initials}</span>
-              <span><strong>{person.name}</strong><small>{person.role}</small></span>
+              <span className="person-avatar">{person.initials ?? person.name.slice(0, 2).toUpperCase()}</span>
+              <span><strong>{person.name}</strong>{person.role ? <small>{person.role}</small> : null}</span>
             </div>
           ))}
         </div>
-      </section>
+      </section> : null}
 
-      <section className="context-section decisions-section">
+      {decisions.length > 0 ? <section className="context-section decisions-section">
         <div className="context-section-title">
           <span><IconClipboardCheck size={17} /> Known decisions</span>
         </div>
         <ul>
-          <li>Phase 1 scope approved</li>
-          <li>Data integration approach selected</li>
-          <li>Q4 pilot timeline agreed</li>
+          {decisions.map((decision) => <li key={decision}>{decision}</li>)}
         </ul>
-      </section>
+      </section> : null}
     </aside>
   );
 }
 
-function Composer({ onSend, disabled }) {
+function Composer({ attachedSources, disabled, includeSources, model, onAttachSources, onRemoveSource, onSend, onToggleSources, onModelChange, sourcesBusy }) {
   const [value, setValue] = useState("");
   const inputRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   function submit(event) {
     event.preventDefault();
@@ -386,23 +500,56 @@ function Composer({ onSend, disabled }) {
 
   return (
     <form className="command-composer" onSubmit={submit}>
-      <button aria-label="Attach source" className="composer-tool" type="button">
-        <IconPaperclip size={19} />
-      </button>
-      <input
-        aria-label="Message SSI Agent"
-        disabled={disabled}
-        onChange={(event) => setValue(event.target.value)}
-        placeholder="Ask SSI Agent anything, or adjust the plan..."
-        ref={inputRef}
-        value={value}
-      />
-      <button aria-label="Use microphone" className="composer-tool" type="button">
-        <IconMicrophone size={19} />
-      </button>
-      <button aria-label="Send message" className="composer-send" disabled={!value.trim()} type="submit">
-        <IconSend2 size={18} />
-      </button>
+      <div className="composer-main-row">
+        <button aria-label="Attach source" className="composer-tool" disabled={disabled || sourcesBusy} onClick={() => fileInputRef.current?.click()} type="button">
+          <IconPaperclip size={19} />
+        </button>
+        <input
+          accept=".txt,.md,.pdf,.docx,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+          aria-label="Attach source files"
+          className="composer-file-input"
+          multiple
+          onChange={(event) => {
+            const files = [...event.target.files];
+            event.target.value = "";
+            if (files.length) onAttachSources(files);
+          }}
+          ref={fileInputRef}
+          type="file"
+        />
+        <input
+          aria-label="Message SSI Agent"
+          disabled={disabled}
+          onChange={(event) => setValue(event.target.value)}
+          placeholder="Ask SSI Agent anything, or adjust the plan..."
+          ref={inputRef}
+          value={value}
+        />
+        <button aria-label="Use microphone" className="composer-tool" type="button">
+          <IconMicrophone size={19} />
+        </button>
+        <button aria-label="Send message" className="composer-send" disabled={disabled || !value.trim()} type="submit">
+          <IconSend2 size={18} />
+        </button>
+      </div>
+      <div className="composer-options">
+        <label>
+          <span>Model</span>
+          <select aria-label="Codex model" disabled={disabled} onChange={(event) => onModelChange(event.target.value || null)} value={model ?? ""}>
+            <option value="">Codex default</option>
+            <option value="gpt-5.6-luna">GPT-5.6 Luna</option>
+            <option value="gpt-5.6-terra">GPT-5.6 Terra</option>
+            <option value="gpt-5.6-sol">GPT-5.6 Sol</option>
+          </select>
+        </label>
+        {attachedSources.length ? <label className="source-consent">
+          <input checked={includeSources} disabled={disabled} onChange={(event) => onToggleSources(event.target.checked)} type="checkbox" />
+          <span>Include {attachedSources.length} attached source{attachedSources.length === 1 ? "" : "s"} in this conversation</span>
+        </label> : <span className="composer-hint">Attach .txt, .md, .pdf, or .docx files for grounded discussion.</span>}
+      </div>
+      {attachedSources.length ? <div className="composer-source-list" aria-label="Attached conversation sources">
+        {attachedSources.map((source) => <span key={source.sourceId}>{source.fileName}<button aria-label={`Remove ${source.fileName}`} onClick={() => onRemoveSource(source.sourceId)} type="button">×</button></span>)}
+      </div> : null}
     </form>
   );
 }
@@ -428,16 +575,61 @@ function PlaceholderView({ activeNav, onReturn }) {
   );
 }
 
-export default function OperatingDashboard() {
+export default function OperatingDashboard({
+  activeEpisodeId: activeEpisodeIdProp,
+  embedded = false,
+  episodes: episodesProp,
+  onProposal,
+  onCreateEpisodeFromProposal,
+  onNewConversation,
+  onOpenCanvas,
+  onPersistConversation,
+  onSelectEpisode,
+}) {
   const [activeNav, setActiveNav] = useState("work");
+  const [localEpisodes] = useState(() => []);
+  const episodes = episodesProp ?? localEpisodes;
+  const [localActiveEpisodeId, setLocalActiveEpisodeId] = useState(() => episodes[0]?.id ?? null);
+  const isEpisodeControlled = activeEpisodeIdProp !== undefined;
+  const activeEpisodeId = isEpisodeControlled ? activeEpisodeIdProp : localActiveEpisodeId;
   const [columns, setColumns] = useState(getStoredColumns);
-  const [contextOpen, setContextOpen] = useState(true);
+  const [attachedSources, setAttachedSources] = useState([]);
+  const [includeSources, setIncludeSources] = useState(false);
+  const [sourcesBusy, setSourcesBusy] = useState(false);
+  const [model, setModel] = useState(null);
+  const [contextOpen, setContextOpen] = useState(false);
   const [selectedTask, setSelectedTask] = useState(null);
   const [dragging, setDragging] = useState(null);
   const [workingIds, setWorkingIds] = useState([]);
-  const [messages, setMessages] = useState([]);
+  const [messages, setMessages] = useState(() => conversationMessagesFromEpisode(episodes.find((episode) => episode.id === activeEpisodeId) ?? null));
+  const [isResponding, setIsResponding] = useState(false);
+  const [proposedPlan, setProposedPlan] = useState(null);
+  const [episodeProposal, setEpisodeProposal] = useState(null);
+  const [codexThreadId, setCodexThreadId] = useState(null);
   const [toast, setToast] = useState("");
   const [priorityMode, setPriorityMode] = useState(false);
+  const dashboardEventSourceRef = useRef(null);
+  const activeEpisode = useMemo(() => activeEpisodeId ? episodes.find((episode) => episode.id === activeEpisodeId) ?? null : null, [activeEpisodeId, episodes]);
+  const engagementContext = useMemo(() => activeEpisode ? {
+    title: activeEpisode.name || activeEpisode.title,
+    episodeId: activeEpisode.id,
+    summary: activeEpisode.context,
+    stageLabel: EPISODE_STAGE_LABELS[activeEpisode.currentStage] ?? EPISODE_STAGE_LABELS[0],
+    sources: attachedSources.map((source) => ({ name: source.fileName, meta: `${source.charCount.toLocaleString()} extracted characters` })),
+    decisions: (Array.isArray(activeEpisode.additions) ? activeEpisode.additions : [])
+      .filter((item) => item.kind === "decision")
+      .map((item) => item.title || item.body)
+      .filter(Boolean)
+      .slice(0, 5),
+  } : null, [activeEpisode, attachedSources]);
+
+  useEffect(() => {
+    setMessages(conversationMessagesFromEpisode(activeEpisode));
+    const proposal = activeEpisode?.intake?.proposal ?? null;
+    setEpisodeProposal(proposal);
+    setProposedPlan(proposal ? previewFromEpisodeProposal(proposal) : null);
+    setColumns(proposal ? columnsFromEpisodeProposal(proposal) : INITIAL_COLUMNS);
+  }, [activeEpisode?.id]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ columns }));
@@ -449,10 +641,67 @@ export default function OperatingDashboard() {
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
+  useEffect(() => () => dashboardEventSourceRef.current?.close(), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!activeEpisode?.sources?.length) return undefined;
+    Promise.all(activeEpisode.sources.map(async (source) => {
+      const stored = await getEpisodeSource(source.sourceId).catch(() => null);
+      return stored ? { ...source, ...stored } : source;
+    })).then((sources) => {
+      if (cancelled) return;
+      setAttachedSources(sources.filter((source) => source.text?.trim()));
+      // Episode sources are available as context, but the human must explicitly
+      // include their text in a turn before Codex receives it.
+      setIncludeSources(false);
+    });
+    return () => { cancelled = true; };
+  }, [activeEpisode]);
+
   const allTasks = useMemo(() => Object.values(columns).flat(), [columns]);
+  const hasProposedPlan = Boolean(proposedPlan);
+  const hasEngagementContext = Boolean(
+    engagementContext && (engagementContext.summary?.trim() || engagementContext.sources.length > 0),
+  );
 
   function navigate(id) {
     setActiveNav(id);
+  }
+
+  function selectEpisode(episodeId) {
+    if (episodeId === activeEpisodeId) return;
+    if (isEpisodeControlled) onSelectEpisode?.(episodeId);
+    else setLocalActiveEpisodeId(episodeId);
+    setActiveNav("work");
+    setMessages([]);
+    setProposedPlan(null);
+    setEpisodeProposal(null);
+    setColumns(INITIAL_COLUMNS);
+    setSelectedTask(null);
+    setCodexThreadId(null);
+    setWorkingIds([]);
+    setPriorityMode(false);
+    setAttachedSources([]);
+    setIncludeSources(false);
+    setContextOpen(false);
+  }
+
+  function startNewConversation() {
+    onNewConversation?.();
+    if (!isEpisodeControlled) setLocalActiveEpisodeId(null);
+    setActiveNav("work");
+    setMessages([]);
+    setProposedPlan(null);
+    setEpisodeProposal(null);
+    setColumns(INITIAL_COLUMNS);
+    setSelectedTask(null);
+    setCodexThreadId(null);
+    setWorkingIds([]);
+    setPriorityMode(false);
+    setAttachedSources([]);
+    setIncludeSources(false);
+    setContextOpen(false);
   }
 
   function dragStart(event, taskId, columnId) {
@@ -476,7 +725,7 @@ export default function OperatingDashboard() {
 
   function selectTask(task) {
     setSelectedTask(task);
-    setContextOpen(true);
+    if (hasEngagementContext) setContextOpen(true);
   }
 
   function addAction(columnId) {
@@ -494,43 +743,110 @@ export default function OperatingDashboard() {
     setToast("Action added. Use the conversation to refine it.");
   }
 
-  function beginWork() {
-    if (workingIds.length) {
-      setToast("The recommended work is already in progress.");
-      return;
+  async function attachSources(files) {
+    setSourcesBusy(true);
+    try {
+      const extracted = await Promise.all(files.slice(0, 10 - attachedSources.length).map(extractSourceFile));
+      setAttachedSources((current) => [...current, ...extracted]);
+      setIncludeSources(true);
+      setContextOpen(true);
+      setToast(`${extracted.length} source${extracted.length === 1 ? "" : "s"} attached and included in this conversation. You can turn this off in the composer.`);
+    } catch (error) {
+      setToast(error.message || "A source could not be attached.");
+    } finally {
+      setSourcesBusy(false);
     }
-    const ids = columns.now.map((task) => task.id);
-    setWorkingIds(ids);
-    setToast("Recommended work started. Human approvals remain required.");
   }
 
-  function sendMessage(text) {
-    const userMessage = { id: createId("message"), author: "You", text };
-    setMessages((current) => [...current, userMessage]);
-    window.setTimeout(() => {
-      setMessages((current) => [
-        ...current,
-        {
-          id: createId("response"),
-          author: "SSI Agent",
-          text: "I’ve captured that direction. The plan remains a proposal until you begin the selected work.",
-        },
-      ]);
-    }, 550);
+  function beginWork() {
+    if (!hasProposedPlan || !episodeProposal) return;
+    onProposal?.(episodeProposal, { accept: true });
+    onOpenCanvas?.();
+    setToast("Workflow proposal accepted. Review the Episode canvas before starting First Mate.");
+  }
+
+  async function sendMessage(text) {
+    const userMessage = { id: createId("message"), role: "human", text };
+    const conversation = [...messages, userMessage];
+    setMessages(conversation);
+    if (activeEpisode?.id) onPersistConversation?.({ episodeId: activeEpisode.id, messages: conversation, codexThreadId, sourceIds: attachedSources.map((source) => source.sourceId), status: "pending" });
+    setIsResponding(true);
+    try {
+      const response = await fetch("/api/codex/dashboard-conversation/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          question: text,
+          messages: conversation.map((message) => ({ role: message.role, content: message.text })),
+          codexThreadId,
+          model,
+          episode: activeEpisode ? {
+            id: activeEpisode.id,
+            name: activeEpisode.name,
+            title: activeEpisode.title,
+            context: activeEpisode.context,
+            currentStage: activeEpisode.currentStage,
+            status: activeEpisode.status,
+            sourceIds: activeEpisode.sources.map((source) => source.sourceId),
+            knownDecisions: engagementContext?.decisions ?? [],
+          } : null,
+          sources: includeSources ? attachedSources.map(sourceForConversation) : [],
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.runId) throw new Error(result.message || "Local Codex runtime unavailable.");
+      const eventSource = new EventSource(`/api/codex/runs/${result.runId}/events`);
+      dashboardEventSourceRef.current = eventSource;
+      eventSource.onmessage = (event) => {
+        const update = JSON.parse(event.data);
+        if (update.type === "completed") {
+          const agentMessage = { id: createId("response"), role: "agent", text: update.response, analysis: update.analysis, actions: update.nextActions ?? [], model: update.model };
+          setMessages((current) => [...current, agentMessage]);
+          setCodexThreadId(update.threadId ?? null);
+          if (activeEpisode?.id) onPersistConversation?.({ episodeId: activeEpisode.id, messages: [...conversation, agentMessage], codexThreadId: update.threadId ?? codexThreadId, sourceIds: attachedSources.map((source) => source.sourceId), status: "complete" });
+          if (update.episodeProposal) {
+            setEpisodeProposal(update.episodeProposal);
+            setProposedPlan(previewFromEpisodeProposal(update.episodeProposal));
+            setColumns(columnsFromEpisodeProposal(update.episodeProposal));
+            if (activeEpisode?.id) onProposal?.(update.episodeProposal);
+            else onCreateEpisodeFromProposal?.(update.episodeProposal, { messages: [...conversation, agentMessage], codexThreadId: update.threadId ?? null, sources: attachedSources });
+          }
+          setIsResponding(false);
+          eventSource.close();
+          dashboardEventSourceRef.current = null;
+        }
+        if (["error", "cancelled"].includes(update.type)) {
+          setMessages((current) => [...current, { id: createId("response-error"), role: "agent", text: update.message ?? "I could not complete that response." }]);
+          setIsResponding(false);
+          eventSource.close();
+          dashboardEventSourceRef.current = null;
+        }
+      };
+      eventSource.onerror = () => {
+        if (eventSource.readyState === EventSource.CLOSED) return;
+        setMessages((current) => [...current, { id: createId("response-error"), role: "agent", text: "The local Codex connection ended before a response was returned." }]);
+        setIsResponding(false);
+        eventSource.close();
+        dashboardEventSourceRef.current = null;
+      };
+    } catch (error) {
+      setMessages((current) => [...current, { id: createId("response-error"), role: "agent", text: error.message || "I could not start a Codex response." }]);
+      setIsResponding(false);
+    }
   }
 
   if (activeNav !== "work") {
     return (
-      <div className="operating-dashboard">
-        <Sidebar activeNav={activeNav} onNavigate={navigate} />
+      <div className={`operating-dashboard ${embedded ? "is-embedded" : ""}`}>
+        {!embedded ? <Sidebar activeEpisodeId={activeEpisodeId} activeNav={activeNav} episodes={episodes} isNewConversation={!activeEpisodeId} onNavigate={navigate} onNewConversation={startNewConversation} onSelectEpisode={selectEpisode} /> : null}
         <PlaceholderView activeNav={activeNav} onReturn={() => navigate("work")} />
       </div>
     );
   }
 
   return (
-    <div className={`operating-dashboard ${contextOpen ? "has-context" : ""}`}>
-      <Sidebar activeNav={activeNav} onNavigate={navigate} />
+    <div className={`operating-dashboard ${embedded ? "is-embedded" : ""} ${hasEngagementContext && contextOpen ? "has-context" : ""}`}>
+      {!embedded ? <Sidebar activeEpisodeId={activeEpisodeId} activeNav={activeNav} episodes={episodes} isNewConversation={!activeEpisodeId} onNavigate={navigate} onNewConversation={startNewConversation} onSelectEpisode={selectEpisode} /> : null}
 
       <main className="outcome-desk">
         <header className="desk-header">
@@ -539,19 +855,23 @@ export default function OperatingDashboard() {
             <p className="desk-subtitle">Systems Shaper SSI Workroom</p>
           </div>
           <div className="desk-actions">
-            <button
-              className={`secondary-action ${priorityMode ? "is-active" : ""}`}
-              onClick={() => setPriorityMode((current) => !current)}
-              type="button"
-            >
-              <IconAdjustmentsHorizontal size={17} />
-              {priorityMode ? "Finish prioritizing" : "Adjust priorities"}
-            </button>
-            <button className="primary-action" onClick={beginWork} type="button">
-              {workingIds.length ? <IconLoader2 className="spin" size={17} /> : <IconPlayerPlay size={17} />}
-              {workingIds.length ? "Work in progress" : "Begin recommended work"}
-            </button>
-            {!contextOpen ? (
+            {hasProposedPlan ? (
+              <>
+                <button
+                  className={`secondary-action ${priorityMode ? "is-active" : ""}`}
+                  onClick={() => setPriorityMode((current) => !current)}
+                  type="button"
+                >
+                  <IconAdjustmentsHorizontal size={17} />
+                  {priorityMode ? "Finish prioritizing" : "Adjust priorities"}
+                </button>
+                <button className="primary-action" onClick={beginWork} type="button">
+                  <IconLayoutDashboard size={17} />
+                  Create workflow canvas
+                </button>
+              </>
+            ) : null}
+            {hasEngagementContext && !contextOpen ? (
               <button className="icon-action" aria-label="Open engagement context" onClick={() => setContextOpen(true)} type="button">
                 <IconBook2 size={19} />
               </button>
@@ -560,14 +880,14 @@ export default function OperatingDashboard() {
         </header>
 
         <div className="desk-scroll-region">
-          <ConversationSummary messages={messages} />
+          <Conversation isResponding={isResponding} messages={messages} />
 
-          <section className={`recommended-work ${priorityMode ? "is-prioritizing" : ""}`}>
+          {hasProposedPlan ? <section className={`recommended-work ${priorityMode ? "is-prioritizing" : ""}`}>
             <div className="section-heading">
               <div>
                 <span className="section-kicker"><IconCheckupList size={17} /> Recommended work</span>
-                <h2>A plan to move the engagement forward</h2>
-                <p>Review the sequence, inspect an action, or drag work to reprioritize it.</p>
+                <h2>{proposedPlan.title}</h2>
+                <p>{proposedPlan.summary}</p>
               </div>
               <span className="plan-status"><IconClock size={15} /> Proposed plan</span>
             </div>
@@ -613,17 +933,29 @@ export default function OperatingDashboard() {
                 workingIds={workingIds}
               />
             </div>
-          </section>
+          </section> : null}
         </div>
 
-        <Composer disabled={false} onSend={sendMessage} />
+        <Composer
+          attachedSources={attachedSources}
+          disabled={isResponding}
+          includeSources={includeSources}
+          model={model}
+          onAttachSources={attachSources}
+          onModelChange={setModel}
+          onRemoveSource={(sourceId) => setAttachedSources((current) => current.filter((source) => source.sourceId !== sourceId))}
+          onSend={sendMessage}
+          onToggleSources={setIncludeSources}
+          sourcesBusy={sourcesBusy}
+        />
       </main>
 
-      <ContextPanel
+      {hasEngagementContext ? <ContextPanel
+        context={engagementContext}
         onClose={() => setContextOpen(false)}
         open={contextOpen}
         selectedTask={selectedTask}
-      />
+      /> : null}
 
       {toast ? <div className="operating-toast"><IconCircleCheck size={18} /> {toast}</div> : null}
     </div>

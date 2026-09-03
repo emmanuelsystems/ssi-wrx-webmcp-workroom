@@ -4,6 +4,7 @@ import { createEpisodeIntakeProposal, streamEpisodeIntakeProposal } from "./epis
 import { streamOrchestrationRun, validateOrchestrationInput } from "./orchestrationAgent.mjs";
 import { streamAutopilotRun, validateAutopilotInput } from "./autopilotAgent.mjs";
 import { streamNodeConversation, validateNodeConversationInput } from "./nodeConversationAgent.mjs";
+import { streamDashboardConversation, validateDashboardConversationInput } from "./dashboardConversationAgent.mjs";
 import { MAX_SOURCE_FILES, validateSourceManifest } from "../src/episodeSources.js";
 
 const HOST = "127.0.0.1";
@@ -140,6 +141,19 @@ const server = createServer(async (request, response) => {
       void streamNodeConversation({ input, repoRoot: REPO_ROOT, signal: run.controller.signal, onEvent: (event) => emit(run, event) })
         .then((result) => finishRun(run, { type: "completed", response: result.response, threadId: result.threadId }))
         .catch((error) => finishRun(run, { type: error.name === "AbortError" ? "cancelled" : "error", message: error.name === "AbortError" ? "Node conversation cancelled." : (error.message || "Codex node response failed.") }));
+      sendJson(response, 202, { runId: run.id });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/codex/dashboard-conversation/start") {
+      const input = await readJson(request);
+      validateDashboardConversationInput(input);
+      pruneRuns();
+      const run = { id: crypto.randomUUID(), kind: "dashboard-conversation", input: { messageCount: input.messages.length }, events: [], subscribers: new Set(), controller: new AbortController(), done: false, status: "queued", startedAt: Date.now() };
+      runs.set(run.id, run);
+      emit(run, { type: "status", label: "SSI Agent queued" });
+      void streamDashboardConversation({ input, repoRoot: REPO_ROOT, signal: run.controller.signal, onEvent: (event) => emit(run, event) })
+        .then((result) => finishRun(run, { type: "completed", response: result.reply, analysis: result.analysis, nextActions: result.nextActions, episodeProposal: result.episodeProposal, model: input.model ?? "Codex default", threadId: result.threadId }))
+        .catch((error) => finishRun(run, { type: error.name === "AbortError" ? "cancelled" : "error", message: error.name === "AbortError" ? "Conversation cancelled." : (error.message || "Codex conversation failed.") }));
       sendJson(response, 202, { runId: run.id });
       return;
     }

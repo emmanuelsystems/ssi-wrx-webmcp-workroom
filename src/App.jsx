@@ -68,6 +68,7 @@ import {
 } from "./projects";
 
 import StatusIndicator from "./StatusIndicator";
+import OperatingDashboard from "./OperatingDashboard";
 
 import "./App.css";
 
@@ -3713,6 +3714,8 @@ export default function App() {
   const [expandedProjects, setExpandedProjects] = useState({});
   const [newEpisodeProjectId, setNewEpisodeProjectId] = useState(null);
   const [workflowExpanded, setWorkflowExpanded] = useState(true);
+  const [surface, setSurface] = useState("work");
+  const [workEpisodeId, setWorkEpisodeId] = useState(null);
 
   const [
     activeEpisodeId,
@@ -4044,6 +4047,101 @@ export default function App() {
       activeEpisodeId,
       updater
     );
+  }
+
+  function persistWorkConversation({ episodeId, messages, codexThreadId = null, sourceIds = [], status = "complete" }) {
+    if (!episodeId || !Array.isArray(messages)) return;
+    const normalizedMessages = messages
+      .filter((message) => message?.text?.trim())
+      .map((message) => ({
+        id: message.id ?? `message-${crypto.randomUUID()}`,
+        role: message.role === "agent" ? "agent" : "human",
+        content: message.text.trim(),
+        createdAt: message.createdAt ?? new Date().toISOString(),
+      }));
+    updateEpisode(episodeId, (episode) => {
+      const existing = (episode.additions ?? []).find((item) => item.kind === "thread" && item.parentNodeId === "work");
+      const thread = {
+        id: existing?.id ?? `thread-${crypto.randomUUID()}`,
+        kind: "thread",
+        stageIndex: episode.currentStage ?? 0,
+        parentNodeId: "work",
+        messages: normalizedMessages,
+        sourceIds: [...new Set(sourceIds)],
+        codexThreadId: codexThreadId ?? existing?.codexThreadId ?? null,
+        status,
+        position: existing?.position ?? { x: 80, y: 80 },
+      };
+      return {
+        ...episode,
+        additions: existing
+          ? (episode.additions ?? []).map((item) => item.id === existing.id ? thread : item)
+          : [...(episode.additions ?? []), thread],
+      };
+    });
+  }
+
+  function persistWorkProposal(proposal) {
+    if (!proposal || !workEpisodeId) return;
+    const episode = findEpisodeById(workEpisodeId);
+    if (!episode) return;
+    const normalizedProposal = {
+      ...proposal,
+      episodeId: episode.id,
+      context: {
+        summary: proposal.context?.summary ?? "",
+        suggestedSources: proposal.context?.suggestedSources ?? [],
+      },
+      workNodes: (proposal.workNodes ?? []).map((node) => ({ ...node, sourceIds: node.sourceIds ?? [] })),
+      humanGates: proposal.humanGates ?? [],
+      assumptions: proposal.assumptions ?? [],
+      unresolved: proposal.unresolved ?? [],
+    };
+    const validation = validateEpisodeStructureProposal(normalizedProposal, episode.id, episode.sources ?? []);
+    if (!validation.valid) return;
+    updateEpisode(episode.id, (current) => ({
+      ...current,
+      intake: { ...normalizeEpisodeIntake(current.intake), status: "proposed", proposal: normalizedProposal },
+    }));
+    appendActivity(episode.id, {
+      type: "proposal.created",
+      actor: "codex",
+      title: "Episode structure proposed from Work conversation",
+      summary: `${normalizedProposal.workNodes.length} work nodes · ${normalizedProposal.humanGates.length} human checkpoints`,
+      authorityImpact: "proposal",
+    });
+  }
+
+  async function createEpisodeFromWorkProposal(proposal, { messages = [], codexThreadId = null, sources = [] } = {}) {
+    if (!proposal || !Array.isArray(proposal.workNodes) || !proposal.objective?.trim()) return;
+    const sourceManifest = sourceManifestFromRecords(sources);
+    const proposalValidation = validateEpisodeStructureProposal(proposal, proposal.episodeId ?? "draft", sourceManifest);
+    if (!proposalValidation.valid) return;
+    const nextIdNumber = episodes.reduce((highest, episode) => Math.max(highest, Number(episode.id.split("-")[1]) || 0), 0) + 1;
+    const episodeId = `E0-${String(nextIdNumber).padStart(3, "0")}`;
+    const normalizedProposal = { ...proposal, episodeId };
+    const initialThread = {
+      id: `thread-${crypto.randomUUID()}`,
+      kind: "thread",
+      stageIndex: 0,
+      parentNodeId: "work",
+      messages: messages.filter((message) => message?.text?.trim()).map((message) => ({ id: message.id ?? `message-${crypto.randomUUID()}`, role: message.role === "agent" ? "agent" : "human", content: message.text.trim(), createdAt: message.createdAt ?? new Date().toISOString() })),
+      sourceIds: sources.map((source) => source.sourceId),
+      codexThreadId,
+      status: "complete",
+      position: { x: 80, y: 80 },
+    };
+    await createEpisode({
+      title: normalizedProposal.objective,
+      name: deriveEpisodeName(normalizedProposal.objective),
+      context: normalizedProposal.context?.summary ?? "",
+      setupMode: "manual",
+      sources,
+      intakeProposal: normalizedProposal,
+      initialThread,
+      idOverride: episodeId,
+    });
+    setWorkEpisodeId(episodeId);
   }
 
   async function attachNodeSources(nodeId, files) {
@@ -5461,6 +5559,9 @@ export default function App() {
     sources = [],
     sourceEvents = [],
     template = null,
+    intakeProposal = null,
+    initialThread = null,
+    idOverride = null,
   }) {
     const nextNumber =
       episodes.reduce(
@@ -5483,13 +5584,7 @@ export default function App() {
         0
       ) + 1;
 
-    const id =
-      `E0-${String(
-        nextNumber
-      ).padStart(
-        3,
-        "0"
-      )}`;
+    const id = idOverride ?? `E0-${String(nextNumber).padStart(3, "0")}`;
 
     const sourceManifest = sourceManifestFromRecords(sources);
     const sourceValidation = validateSourceManifest(sourceManifest);
@@ -5519,12 +5614,12 @@ export default function App() {
 
       layouts: {},
 
-      additions: [],
+      additions: initialThread ? [initialThread] : [],
 
       intake: {
-        status: setupMode === "agent-assisted" ? "pending" : "idle",
+        status: intakeProposal ? "proposed" : setupMode === "agent-assisted" ? "pending" : "idle",
         request: null,
-        proposal: null,
+        proposal: intakeProposal,
         acceptedAt: null,
       },
 
@@ -5583,6 +5678,14 @@ export default function App() {
           summary: `${sourceManifest.length} source${sourceManifest.length === 1 ? "" : "s"} extracted and stored locally.`,
           metadata: { sourceIds: sourceManifest.map((source) => source.sourceId) },
         })] : []),
+        ...(intakeProposal ? [createActivityEvent({
+          episodeId: id,
+          type: "proposal.created",
+          actor: "codex",
+          title: "Episode structure proposed from Work conversation",
+          summary: `${intakeProposal.workNodes?.length ?? 0} work nodes · ${intakeProposal.humanGates?.length ?? 0} human checkpoints`,
+          authorityImpact: "proposal",
+        })] : []),
         ...sourceEvents.map((event) => createActivityEvent({
           episodeId: id,
           type: event.type,
@@ -5617,7 +5720,7 @@ export default function App() {
     );
 
     setIntakePanelOpen(
-      setupMode === "agent-assisted"
+      Boolean(intakeProposal) || setupMode === "agent-assisted"
     );
 
     setCreateOpen(
@@ -8306,13 +8409,31 @@ export default function App() {
             </strong>
 
             <span className="badge">
-              {
-                activeEpisode.id
-              }
+              {surface === "work" && !workEpisodeId ? "New conversation" : activeEpisode.id}
             </span>
           </div>
 
           <div className="topbar-actions">
+            <button
+              type="button"
+              className={`button ${surface === "work" ? "active" : ""}`}
+              onClick={() => {
+                setSurface("work");
+                setWorkEpisodeId(null);
+              }}
+            >
+              Work conversation
+            </button>
+            <button
+              type="button"
+              className={`button ${surface === "canvas" ? "active" : ""}`}
+              onClick={() => {
+                setSurface("canvas");
+                if (workEpisodeId) setActiveEpisodeId(workEpisodeId);
+              }}
+            >
+              Canvas
+            </button>
             <button
               type="button"
               className="button"
@@ -8402,6 +8523,7 @@ export default function App() {
               <div className="sidebar-section-header">
                 <span>Projects</span>
                 <div className="sidebar-project-actions">
+                  <button type="button" className="small-button" onClick={() => { setSurface("work"); setWorkEpisodeId(null); }}>+ New conversation</button>
                   <button type="button" className="small-button" onClick={() => setProjectModalOpen(true)}>+ New Project</button>
                   <button type="button" className="small-button" onClick={() => { setNewEpisodeProjectId(null); setCreateOpen(true); }}>+ Episode</button>
                 </div>
@@ -8468,7 +8590,7 @@ export default function App() {
                   };
                   const renderEpisode = (episode) => (
                     <div className="project-episode" key={episode.id}>
-                      <button type="button" className={`episode ${episode.id === activeEpisodeId ? "active" : ""}`} onClick={() => setActiveEpisodeId(episode.id)}>
+                      <button type="button" className={`episode ${episode.id === activeEpisodeId ? "active" : ""}`} onClick={() => { setActiveEpisodeId(episode.id); if (surface === "work") setWorkEpisodeId(episode.id); }}>
                         <span className="episode-symbol">E</span>
                         <span className="episode-copy"><small>{episode.id}</small><strong title={episode.title}>{episode.name || deriveEpisodeName(episode.title)}</strong><small>Stage {episode.currentStage + 1} · {episode.intake?.status === "pending" ? "Pending intake" : episode.status === "archived" ? "Archived" : "Active"}</small></span>
                       </button>
@@ -8520,6 +8642,31 @@ export default function App() {
           {/* MAIN */}
 
           <section className="main">
+            {surface === "work" ? (
+              <OperatingDashboard
+                activeEpisodeId={workEpisodeId}
+                embedded
+                episodes={episodes}
+                onCreateEpisodeFromProposal={createEpisodeFromWorkProposal}
+                onNewConversation={() => {
+                  setSurface("work");
+                  setWorkEpisodeId(null);
+                }}
+                onOpenCanvas={() => {
+                  setSurface("canvas");
+                  if (workEpisodeId) setActiveEpisodeId(workEpisodeId);
+                }}
+                onPersistConversation={persistWorkConversation}
+                onProposal={(proposal) => {
+                  if (workEpisodeId) persistWorkProposal(proposal);
+                }}
+                onSelectEpisode={(episodeId) => {
+                  setWorkEpisodeId(episodeId);
+                  setActiveEpisodeId(episodeId);
+                }}
+              />
+            ) : (
+              <>
             {showCanvasHeader && <div className="canvas-header">
               <div>
                 <div className="breadcrumb">
@@ -9044,6 +9191,8 @@ export default function App() {
               thread={activeThread}
               onSend={handleDrawerSend}
             />
+              </>
+            )}
           </section>
         </div>
       </div>
