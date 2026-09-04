@@ -1,0 +1,295 @@
+# SSI-WRX WebMCP capability registry
+# Source-derived evidence artifact only. This file does not authorize implementation.
+
+registry_version: "0.1"
+evidence_cutoff: "2026-09-05"
+source:
+  repository: emmanuelsystems/ssi-wrx-webmcp-workroom
+  branch: feature/intent-led-operating-dashboard
+  commit: 929a706a074b0554b9af1706afdb838bd3b3cad1
+  registration_file: src/App.jsx
+  library: use-webmcp-tool
+
+status:
+  source_registration_count: 11
+  evaluator_observed_count: 11
+  label: WEBMCP_DISCOVERABLE / SCHEMA_PARTIAL / AGENT_INVOCATION_UNVERIFIED
+  note: >-
+    The source registration count reconciles the prior README-vs-workbench mismatch.
+    This registry does not prove independent agent invocation, authorization enforcement,
+    canonical-state correctness, portability, immutable receipts, or idempotent replay.
+
+capabilities:
+  - name: get_pending_episode_intakes
+    description: List Episodes awaiting human-reviewed agent structuring proposals.
+    annotation:
+      readOnlyHint: true
+    consequence_class: READ_ONLY
+    input_schema:
+      type: object
+      properties: {}
+    authority_note: No mutation.
+
+  - name: get_episode_intake
+    description: Inspect one Episode intake request and any proposed structure.
+    annotation:
+      readOnlyHint: true
+    consequence_class: READ_ONLY
+    input_schema:
+      type: object
+      properties:
+        episode_id:
+          type: string
+      required:
+        - episode_id
+    authority_note: No mutation.
+
+  - name: submit_episode_structure
+    description: Submit a proposed Episode structure for human review. This does not accept or execute it.
+    annotation:
+      readOnlyHint: false
+    consequence_class: PROPOSAL_WRITE
+    input_schema:
+      type: object
+      properties:
+        episode_id:
+          type: string
+        objective:
+          type: string
+        context_summary:
+          type: string
+        work_nodes:
+          type: array
+        human_gates:
+          type: array
+        assumptions:
+          type: array
+        unresolved:
+          type: array
+      required:
+        - episode_id
+        - objective
+        - context_summary
+        - work_nodes
+        - human_gates
+        - assumptions
+        - unresolved
+    authority_note: Creates a structure proposal for human review; source description explicitly says it does not accept or execute it.
+    schema_quality_notes:
+      - Array properties do not declare item schemas in the current registration.
+
+  - name: list_episodes
+    description: List all Workroom episodes and their current progress.
+    annotation:
+      readOnlyHint: true
+    consequence_class: READ_ONLY
+    input_schema:
+      type: object
+      properties: {}
+    authority_note: No mutation.
+
+  - name: get_episode
+    description: Inspect one Workroom episode including current core nodes, reasoning branches, node threads, and human disposition.
+    annotation:
+      readOnlyHint: true
+    consequence_class: READ_ONLY
+    input_schema:
+      type: object
+      properties:
+        episodeId:
+          type: string
+          description: Episode ID. Omit to inspect the active episode.
+    authority_note: No mutation.
+
+  - name: get_node_thread
+    description: Inspect the complete conversation history for one Workroom node thread.
+    annotation:
+      readOnlyHint: true
+    consequence_class: READ_ONLY
+    input_schema:
+      type: object
+      properties:
+        threadId:
+          type: string
+      required:
+        - threadId
+    authority_note: No mutation.
+
+  - name: get_pending_node_prompts
+    description: Get pending human questions from Workroom node threads. Each pending item includes the full thread history.
+    annotation:
+      readOnlyHint: true
+    consequence_class: READ_ONLY
+    input_schema:
+      type: object
+      properties: {}
+    authority_note: No mutation.
+
+  - name: respond_to_node_prompt
+    description: Respond to the currently pending question in a Workroom node thread. The response is appended to the same conversation. This cannot advance stages or make the human disposition.
+    annotation:
+      readOnlyHint: false
+    consequence_class: CONVERSATION_WRITE
+    input_schema:
+      type: object
+      properties:
+        promptId:
+          type: string
+        response:
+          type: string
+      required:
+        - promptId
+        - response
+    authority_note: Appends an agent response to an existing pending thread and marks it answered; does not advance stages or set final disposition.
+
+  - name: add_evidence
+    description: Add evidence as a visible reasoning branch. This cannot advance the stage or make a human disposition.
+    annotation:
+      readOnlyHint: false
+    consequence_class: DIRECT_EVIDENCE_WRITE
+    input_schema:
+      type: object
+      properties:
+        episodeId:
+          type: string
+        title:
+          type: string
+        finding:
+          type: string
+        source:
+          type: string
+        parentNodeId:
+          type: string
+      required:
+        - title
+        - finding
+        - source
+    authority_note: >-
+      Directly appends a durable evidence node to the Episode additions collection.
+      This is not equivalent to the proposed governed `propose_evidence` contract and is the primary authority-boundary gap for the next slice.
+
+  - name: propose_action
+    description: Add an agent recommendation as a reasoning branch. The agent may recommend but cannot advance stages or make final disposition.
+    annotation:
+      readOnlyHint: false
+    consequence_class: RECOMMENDATION_WRITE
+    input_schema:
+      type: object
+      properties:
+        episodeId:
+          type: string
+        action:
+          type: string
+        reasoning:
+          type: string
+        parentNodeId:
+          type: string
+      required:
+        - action
+        - reasoning
+    authority_note: Appends a recommendation branch; does not advance stage or record final disposition.
+
+  - name: evaluate_proposal
+    description: Record an evidence-based evaluation branch. This does not make the human disposition.
+    annotation:
+      readOnlyHint: false
+    consequence_class: EVALUATION_WRITE
+    input_schema:
+      type: object
+      properties:
+        episodeId:
+          type: string
+        verdict:
+          type: string
+          enum:
+            - pass
+            - pass_with_conditions
+            - fail
+            - revise
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 100
+        summary:
+          type: string
+        conflicts:
+          type: array
+          items:
+            type: string
+        risks:
+          type: array
+          items:
+            type: string
+        missingEvidence:
+          type: array
+          items:
+            type: string
+        parentNodeId:
+          type: string
+      required:
+        - verdict
+        - confidence
+        - summary
+        - conflicts
+        - risks
+        - missingEvidence
+    authority_note: Appends an evaluation branch; does not make the human disposition.
+
+governance_summary:
+  read_only_tools:
+    - get_pending_episode_intakes
+    - get_episode_intake
+    - list_episodes
+    - get_episode
+    - get_node_thread
+    - get_pending_node_prompts
+  mutating_tools:
+    - submit_episode_structure
+    - respond_to_node_prompt
+    - add_evidence
+    - propose_action
+    - evaluate_proposal
+  human_owned_controls_preserved_by_descriptions:
+    - workflow structure acceptance
+    - stage advancement
+    - final disposition
+
+target_governed_three_tool_slice:
+  desired_sequence:
+    - list_episodes
+    - get_episode_context
+    - propose_evidence
+    - PENDING_HUMAN_REVIEW
+    - human_accept_revise_reject
+    - immutable_before_after_receipt
+    - idempotent_replay
+  source_mapping:
+    list_episodes:
+      current_exact_tool: list_episodes
+      status: EXISTS_READ_ONLY
+    get_episode_context:
+      current_exact_tool: null
+      nearest_current_tool: get_episode
+      status: DESIGN_CONTRACT_REQUIRED
+      note: Current source exposes `get_episode`, not `get_episode_context`.
+    propose_evidence:
+      current_exact_tool: null
+      nearest_current_tool: add_evidence
+      status: AUTHORITY_BOUNDARY_UNRESOLVED
+      note: >-
+        Current `add_evidence` directly mutates Episode additions. Do not rename or reinterpret it as proposal-only behavior without an Owner Decision and implementation authorization.
+
+schema_observations:
+  - >-
+    Input naming is inconsistent across the current surface (`episode_id` in intake tools versus `episodeId` in the older Workroom tools).
+  - >-
+    `submit_episode_structure` declares several arrays without item schemas. This is a source-observed schema weakness; do not attribute it to the 61% evaluator score until the evaluator findings are exported.
+
+unverified_evidence_still_needed:
+  - evaluator findings behind the observed 61% health score
+  - successful independent read-only invocation receipt
+  - proposal-only invocation receipt with explicit human gate
+  - immutable before/after state receipt
+  - idempotent replay evidence
+  - exact browser/client matrix
+  - model/client identity per run
