@@ -1,0 +1,202 @@
+{
+  "fixture_schema_version": "1.0",
+  "fixture_id": "webmcp-governed-three-tool-v1",
+  "status": "SANITIZED_DESIGN_FIXTURE_NOT_RUNTIME_IMPORT",
+  "source_baseline": {
+    "branch": "feature/intent-led-operating-dashboard",
+    "commit": "929a706a074b0554b9af1706afdb838bd3b3cad1"
+  },
+  "purpose": "Freeze one non-sensitive Episode and deterministic expectations for reviewing the governed list_episodes -> get_episode_context -> propose_evidence slice without defining a new canonical state store.",
+  "constraints": [
+    "No client-sensitive content or source originals are included.",
+    "The fixture does not authorize implementation.",
+    "The symbolic state labels STATE_A and STATE_B are assertion labels only; the production state identity mechanism remains an Owner Decision.",
+    "Proposal and receipt persistence are represented as expected behavior, not as a decision about physical storage.",
+    "The existing add_evidence behavior is not reinterpreted by this fixture."
+  ],
+  "episode": {
+    "id": "EVAL-001",
+    "title": "Validate a bounded research handoff",
+    "name": "Research handoff validation",
+    "context": "Review a sanitized research handoff and determine whether one additional source-backed finding should be presented to a human for acceptance without changing trusted evidence automatically.",
+    "sources": [
+      {
+        "id": "source-eval-001",
+        "name": "sanitized-handoff.md",
+        "type": "text/markdown",
+        "size": 684,
+        "status": "available"
+      }
+    ],
+    "nodeSourceIds": {
+      "evidence": [
+        "source-eval-001"
+      ]
+    },
+    "template": null,
+    "currentStage": 1,
+    "status": "active",
+    "disposition": null,
+    "layouts": {},
+    "additions": [
+      {
+        "id": "fixture-evidence-accepted-001",
+        "kind": "evidence",
+        "stageIndex": 1,
+        "parentNodeId": "evidence",
+        "title": "Existing accepted evidence",
+        "finding": "The handoff names the governing human-review boundary explicitly.",
+        "source": "sanitized-handoff.md",
+        "createdAt": "2026-09-07T00:00:00.000Z",
+        "metadata": {
+          "fixture": true,
+          "acceptance": "preexisting_trusted_state"
+        }
+      },
+      {
+        "id": "fixture-thread-001",
+        "kind": "thread",
+        "stageIndex": 1,
+        "parentNodeId": "evidence",
+        "status": "answered",
+        "messages": [
+          {
+            "id": "fixture-message-human-001",
+            "role": "human",
+            "content": "Check whether the handoff is explicit about review authority.",
+            "createdAt": "2026-09-07T00:01:00.000Z"
+          },
+          {
+            "id": "fixture-message-agent-001",
+            "role": "agent",
+            "content": "It explicitly preserves human review before trusted-state promotion.",
+            "createdAt": "2026-09-07T00:02:00.000Z"
+          }
+        ]
+      }
+    ],
+    "intake": null,
+    "autopilotRun": null,
+    "workflow": {
+      "nodes": [],
+      "edges": [],
+      "gates": []
+    },
+    "projectId": null,
+    "runtime": {
+      "codex": {
+        "intakeThreadId": null,
+        "lastRunAt": null,
+        "lastError": null,
+        "orchestration": {}
+      }
+    },
+    "activity": []
+  },
+  "expected_read_projection": {
+    "list_episodes": {
+      "schema_version": "1.0",
+      "episode": {
+        "episode_id": "EVAL-001",
+        "name": "Research handoff validation",
+        "title": "Validate a bounded research handoff",
+        "status": "active",
+        "current_stage": 1,
+        "disposition": null,
+        "review_state": "NONE"
+      },
+      "accepted_state_changed": false
+    },
+    "get_episode_context": {
+      "schema_version": "1.0",
+      "episode_id": "EVAL-001",
+      "accepted_addition_ids": [
+        "fixture-evidence-accepted-001"
+      ],
+      "pending_review_count": 0,
+      "source_manifest_ids": [
+        "source-eval-001"
+      ],
+      "state_ref_label": "STATE_A",
+      "accepted_state_changed": false
+    }
+  },
+  "proposal_case": {
+    "input": {
+      "episode_id": "EVAL-001",
+      "title": "Additional source-backed finding",
+      "finding": "The sanitized handoff separates an agent contribution from the human authority event that can promote it into trusted state.",
+      "source": "sanitized-handoff.md",
+      "parent_node_id": "evidence",
+      "state_ref": "STATE_A",
+      "idempotency_key": "eval-001-evidence-0001"
+    },
+    "expected_after_first_call": {
+      "proposal_status": "PENDING_HUMAN_REVIEW",
+      "proposal_count_delta": 1,
+      "accepted_addition_ids": [
+        "fixture-evidence-accepted-001"
+      ],
+      "accepted_state_changed": false,
+      "current_stage": 1,
+      "disposition": null,
+      "receipt": {
+        "tool": "propose_evidence",
+        "consequence_class": "PROPOSAL_WRITE",
+        "idempotency_key": "eval-001-evidence-0001",
+        "state_before_ref_label": "STATE_A",
+        "accepted_state_changed": false
+      }
+    },
+    "same_key_same_payload_replay": {
+      "expected": "RETURN_EXISTING_PROPOSAL_RESULT",
+      "proposal_count_delta": 0,
+      "accepted_state_changed": false
+    },
+    "same_key_different_payload_replay": {
+      "changed_field": "finding",
+      "replacement_value": "A different normalized finding must not reuse the same idempotency key.",
+      "expected_error": "IDEMPOTENCY_CONFLICT",
+      "proposal_count_delta": 0,
+      "accepted_state_changed": false
+    },
+    "stale_state_case": {
+      "state_ref": "STALE_STATE_REF",
+      "minimum_safe_result": "STALE_STATE",
+      "accepted_state_changed": false
+    }
+  },
+  "human_decision_cases": {
+    "reject": {
+      "expected_proposal_status": "REJECTED",
+      "accepted_addition_ids": [
+        "fixture-evidence-accepted-001"
+      ],
+      "accepted_state_changed": false,
+      "disposition": null
+    },
+    "accept": {
+      "expected_proposal_status": "ACCEPTED",
+      "expected_new_accepted_evidence_count": 1,
+      "accepted_state_changed": true,
+      "state_before_ref_label": "STATE_A",
+      "state_after_ref_label": "STATE_B",
+      "requires_separate_human_decision_receipt": true,
+      "disposition": null
+    },
+    "revise": {
+      "expected": "PRESERVE_ORIGINAL_PROPOSAL_AND_LINK_REVISION",
+      "accepted_state_changed_before_explicit_accept": false,
+      "disposition": null
+    }
+  },
+  "forbidden_outcomes": [
+    "propose_evidence directly appends to accepted additions",
+    "propose_evidence advances currentStage",
+    "propose_evidence sets disposition",
+    "same-key replay creates a second durable proposal",
+    "same-key/different-payload replay mutates proposal or accepted state",
+    "human rejection removes the historical proposal record invisibly",
+    "agent invocation performs the human acceptance event"
+  ]
+}
