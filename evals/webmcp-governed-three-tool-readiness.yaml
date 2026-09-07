@@ -1,0 +1,197 @@
+schema_version: "1.0"
+eval_id: webmcp-governed-three-tool-readiness-v1
+status: DESIGN_EVAL_NOT_IMPLEMENTATION_AUTHORIZATION
+source_baseline:
+  branch: feature/intent-led-operating-dashboard
+  commit: 929a706a074b0554b9af1706afdb838bd3b3cad1
+contract: docs/webmcp-governed-three-tool-contract.md
+fixture: fixtures/webmcp-governed-three-tool.fixture.json
+
+purpose: >-
+  Provide deterministic acceptance checks for the smallest governed WebMCP slice
+  without choosing a physical proposal store, state hashing mechanism, or broader
+  product architecture.
+
+preconditions:
+  - Load exactly one copy of the frozen fixture Episode EVAL-001.
+  - Capture accepted/trusted Episode state before each case.
+  - Capture proposal state separately from accepted/trusted state for comparison.
+  - Record tool arguments, normalized payload identity, result, timestamp, client identity, and state refs.
+  - Do not use existing add_evidence as a substitute for propose_evidence.
+
+checks:
+  - id: read-list-no-mutation
+    tool: list_episodes
+    consequence_class: READ_ONLY
+    action:
+      arguments: {}
+    assert:
+      episode_present: EVAL-001
+      current_stage: 1
+      disposition: null
+      review_state: NONE
+      accepted_state_changed: false
+      proposal_count_delta: 0
+    fail_if:
+      - any Episode field changes during the read
+      - activity history is appended solely because of the read
+      - proposal state is created during the read
+
+  - id: read-context-no-mutation
+    tool: get_episode_context
+    consequence_class: READ_ONLY
+    action:
+      arguments:
+        episode_id: EVAL-001
+    assert:
+      accepted_addition_ids:
+        - fixture-evidence-accepted-001
+      pending_review_count: 0
+      source_manifest_ids:
+        - source-eval-001
+      state_ref_present: true
+      accepted_state_changed: false
+      proposal_count_delta: 0
+    fail_if:
+      - pending proposal records appear during the read
+      - accepted additions are rewritten
+      - stage or disposition changes
+
+  - id: proposal-first-call
+    tool: propose_evidence
+    consequence_class: PROPOSAL_WRITE
+    action:
+      fixture_path: proposal_case.input
+    assert:
+      proposal_status: PENDING_HUMAN_REVIEW
+      proposal_count_delta: 1
+      accepted_addition_ids:
+        - fixture-evidence-accepted-001
+      accepted_state_changed: false
+      current_stage: 1
+      disposition: null
+      receipt_required: true
+      receipt_tool: propose_evidence
+      receipt_consequence_class: PROPOSAL_WRITE
+      receipt_idempotency_key: eval-001-evidence-0001
+    fail_if:
+      - proposed evidence appears in accepted additions
+      - currentStage advances
+      - disposition is set
+      - a human decision is synthesized by the agent call
+      - no immutable invocation receipt is produced
+
+  - id: proposal-same-key-same-payload-replay
+    tool: propose_evidence
+    consequence_class: PROPOSAL_WRITE
+    action:
+      fixture_path: proposal_case.input
+      repeat_previous_call: true
+    assert:
+      returns_existing_proposal_result: true
+      proposal_count_delta: 0
+      accepted_state_changed: false
+    fail_if:
+      - a second durable proposal is created
+      - a second accepted evidence item is created
+
+  - id: proposal-idempotency-conflict
+    tool: propose_evidence
+    consequence_class: PROPOSAL_WRITE
+    action:
+      base_fixture_path: proposal_case.input
+      mutate:
+        finding: A different normalized finding must not reuse the same idempotency key.
+    assert:
+      error: IDEMPOTENCY_CONFLICT
+      proposal_count_delta: 0
+      accepted_state_changed: false
+    fail_if:
+      - the existing proposal is overwritten
+      - a second proposal is created
+      - accepted state changes
+
+  - id: proposal-stale-state
+    tool: propose_evidence
+    consequence_class: PROPOSAL_WRITE
+    action:
+      base_fixture_path: proposal_case.input
+      mutate:
+        state_ref: STALE_STATE_REF
+    assert:
+      minimum_safe_error: STALE_STATE
+      accepted_state_changed: false
+    fail_if:
+      - stale state is treated as current without an explicit stale marker or failure
+      - accepted state changes
+
+  - id: human-reject-preserves-trusted-state
+    action_type: HUMAN_DECISION
+    precondition: proposal-first-call has produced one pending proposal
+    action:
+      decision: reject
+    assert:
+      proposal_status: REJECTED
+      accepted_addition_ids:
+        - fixture-evidence-accepted-001
+      accepted_state_changed: false
+      disposition: null
+      historical_proposal_remains_inspectable: true
+    fail_if:
+      - rejected proposal disappears without trace
+      - accepted evidence changes
+      - Episode disposition changes
+
+  - id: human-accept-is-explicit-authority-event
+    action_type: HUMAN_DECISION
+    precondition: proposal-first-call has produced one pending proposal
+    action:
+      decision: accept
+    assert:
+      proposal_status: ACCEPTED
+      accepted_state_changed: true
+      expected_new_accepted_evidence_count: 1
+      separate_human_decision_receipt_required: true
+      before_and_after_state_refs_required: true
+      disposition: null
+    fail_if:
+      - acceptance occurs as part of propose_evidence
+      - no separate human authority receipt exists
+      - accepted change cannot be distinguished from proposal creation
+
+  - id: human-revise-preserves-history
+    action_type: HUMAN_DECISION
+    precondition: proposal-first-call has produced one pending proposal
+    action:
+      decision: revise
+    assert:
+      original_proposal_preserved: true
+      revision_link_required: true
+      accepted_state_changed_before_explicit_accept: false
+      disposition: null
+    fail_if:
+      - original proposal is overwritten invisibly
+      - revision becomes accepted without a separate human accept event
+
+acceptance_gate:
+  required_checks:
+    - read-list-no-mutation
+    - read-context-no-mutation
+    - proposal-first-call
+    - proposal-same-key-same-payload-replay
+    - proposal-idempotency-conflict
+    - proposal-stale-state
+    - human-reject-preserves-trusted-state
+    - human-accept-is-explicit-authority-event
+    - human-revise-preserves-history
+  pass_condition: all required checks pass with receipts/evidence attached
+  implementation_authorized_by_pass: false
+
+unresolved_owner_decisions:
+  - physical proposal and receipt persistence location
+  - exact state identity/version/hash mechanism
+  - fate of existing add_evidence direct-mutation capability
+  - accepted-evidence promotion representation
+  - cross-Episode promotion and revalidation
+  - model routing including Astra
+  - authorization to implement the governed slice
