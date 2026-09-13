@@ -2310,7 +2310,7 @@ function EpisodeIntakePanel({
   );
 }
 
-function AutopilotRunPanel({ run, onStop, onRetry, follow, onFollow, onPromote, onRevise, onPause, onReject, onInspectOutput, onToggleCanvasArtifacts, canvasArtifactsVisible, outputCount, onHide }) {
+function AutopilotRunPanel({ run, onStop, onRetry, follow, onFollow, onPromote, onRevise, onPause, onResume, onReject, onInspectOutput, onToggleCanvasArtifacts, canvasArtifactsVisible, outputCount, onHide }) {
   const [instruction, setInstruction] = useState("");
   const [selectedTaskId, setSelectedTaskId] = useState(null);
   if (!run) return null;
@@ -2322,6 +2322,13 @@ function AutopilotRunPanel({ run, onStop, onRetry, follow, onFollow, onPromote, 
   const activeTask = taskEntries.find(([, status]) => status === "working")?.[0] ?? null;
   const activeRole = run.events?.slice().reverse().find((event) => event.taskId === activeTask && event.role)?.role ?? activeTask?.replace(/-/g, " ") ?? "Waiting for the next task";
   const liveActivity = (run.events ?? []).filter((event) => event.type === "activity").slice(-5).reverse();
+  const reviewStatus = run.humanReviewStatus ?? "pending";
+  const reviewCopy = {
+    pending: { title: "Human review required", detail: "Review the package, then choose one deliberate outcome. Nothing changes until you act." },
+    promoted: { title: "Trusted context promoted", detail: "The package summary is now retained as trusted context. Stage and disposition remain human-owned." },
+    paused: { title: "Review paused", detail: "The package is retained and no follow-up run is in progress. Resume when you are ready to decide." },
+    rejected: { title: "Package rejected", detail: "The package remains in the record. You can request a revised run if new guidance is available." },
+  }[reviewStatus] ?? { title: "Human review required", detail: "Review the package before recording a human outcome." };
   return <aside className="autopilot-run-panel" aria-label="Autopilot run inspector">
     <header><div><div className="concept-preview-label">Run inspector</div><h2>{run.status === "complete" ? "Human review required" : run.status === "working" ? "Live read-only run" : `Run ${run.status}`}</h2></div><div className="autopilot-panel-header-actions"><StatusIndicator status={run.status === "complete" ? "complete" : run.status === "working" ? "working" : run.status === "error" ? "error" : "waiting"} label={run.status} size="sm" /><button type="button" onClick={onHide} aria-label="Hide run inspector">×</button></div></header>
     <div className="autopilot-progress"><span>Planning</span><span>Specialists</span><span>Synthesis / review</span><span>Human review</span></div>
@@ -2359,7 +2366,16 @@ function AutopilotRunPanel({ run, onStop, onRetry, follow, onFollow, onPromote, 
     <label className="autopilot-follow"><input type="checkbox" checked={follow} onChange={(event) => onFollow(event.target.checked)} /> Follow active work</label>
     {run.status === "working" && <button type="button" onClick={onStop}>Stop run</button>}
     {["error", "cancelled"].includes(run.status) && <div className="autopilot-human-actions"><strong>{run.status === "error" ? "Run failed before human review" : "Run stopped before human review"}</strong><button type="button" onClick={onRetry}>Retry run</button></div>}
-    {run.status === "complete" && run.finalPackage && <div className="autopilot-human-actions"><strong>Human review required</strong><button type="button" onClick={onPromote}>Promote as trusted context</button><textarea rows="2" value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="Optional revised-run instruction" /><button type="button" onClick={() => onRevise(instruction)}>Request revised run</button><button type="button" onClick={onPause}>Pause</button><button type="button" onClick={onReject}>Reject</button></div>}
+    {run.status === "complete" && run.finalPackage && <section className={`autopilot-human-actions ${reviewStatus}`} aria-live="polite">
+      <div className="autopilot-review-heading"><span>Review outcome</span><strong>{reviewCopy.title}</strong><p>{reviewCopy.detail}</p></div>
+      <button type="button" className="primary autopilot-promote-button" onClick={onPromote} disabled={reviewStatus === "promoted"}>{reviewStatus === "promoted" ? "Trusted context retained" : "Promote as trusted context"}</button>
+      <details className="autopilot-revision-details">
+        <summary>Request a revised run</summary>
+        <label className="autopilot-revision-field"><span>What should change?</span><textarea rows="3" value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="Describe the evidence, scope, or comparison the next run should address." /><small>The next run remains read-only and creates a separate review package.</small></label>
+        <button type="button" onClick={() => { onRevise(instruction.trim()); setInstruction(""); }} disabled={!instruction.trim()}>Start revised run</button>
+      </details>
+      <div className="autopilot-review-footer">{reviewStatus === "paused" ? <button type="button" className="quiet" onClick={onResume}>Resume review</button> : <button type="button" className="quiet" onClick={onPause} disabled={reviewStatus === "rejected"}>Pause review</button>}<button type="button" className="quiet danger" onClick={onReject} disabled={reviewStatus === "rejected"}>{reviewStatus === "rejected" ? "Package rejected" : "Reject package"}</button></div>
+    </section>}
     {run.error && <div className="autopilot-error">{run.error}</div>}
   </aside>;
 }
@@ -5727,6 +5743,7 @@ export default function App() {
 
   function promoteAutopilotPackage() {
     if (!activeEpisode?.autopilotRun?.finalPackage) return;
+    if (activeEpisode.autopilotRun.humanReviewStatus === "promoted") return;
     const packageValue = activeEpisode.autopilotRun.finalPackage;
     updateEpisode(activeEpisode.id, (episode) => ({ ...episode, context: `${episode.context ?? ""}\n\nTrusted context package:\n${packageValue.summary}`, autopilotRun: { ...episode.autopilotRun, humanReviewStatus: "promoted" } }));
     appendActivity(activeEpisode.id, { type: "autopilot.package_promoted", actor: "human", title: "Autopilot package promoted", summary: "Trusted context updated; stage and disposition unchanged.", authorityImpact: "human-review" });
@@ -8796,6 +8813,7 @@ export default function App() {
                 onPromote={promoteAutopilotPackage}
                 onRevise={(instruction) => runAutopilotEpisode(activeEpisode, instruction.trim())}
                 onPause={() => setAutopilotHumanStatus("paused")}
+                onResume={() => setAutopilotHumanStatus("pending")}
                 onReject={() => setAutopilotHumanStatus("rejected")}
                 outputCount={(activeEpisode.additions ?? []).filter((item) => item.stageIndex === viewStage && isGeneratedRunArtifact(item)).length}
                 canvasArtifactsVisible={showGeneratedArtifacts}
