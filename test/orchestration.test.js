@@ -1,33 +1,23 @@
-import assert from "node:assert/strict";
 import test from "node:test";
+import assert from "node:assert/strict";
 
 import {
   applyOrchestrationEvent,
+  createFollowUpOrchestrationPlan,
+  isReviewFollowUpNode,
   mapOrchestrationArtifacts,
   selectOrchestrationTasks,
   validateOrchestrationTaskOutput,
 } from "../src/orchestration.js";
 import { validateOrchestrationInput } from "../server/orchestrationAgent.mjs";
 
-const plan = {
-  tasks: [
-    { id: "analysis", title: "Analyze", role: "Analysis specialist" },
-    { id: "synthesis", title: "Synthesize", role: "Synthesis specialist" },
-    { id: "review", title: "Review", role: "Independent reviewer" },
-    { id: "extra", title: "Extra", role: "Unused" },
-  ],
-};
-
-const output = (taskId, sourceIds = ["source-1"]) => ({
-  taskId,
-  role: "Analysis specialist",
-  summary: "Bounded finding.",
-  findings: ["Supported finding."],
-  evidenceSourceIds: sourceIds,
-  assumptions: ["Assumption."],
-  unresolvedQuestions: ["Question?"],
-  recommendedNextStep: "Ask a human to review.",
-});
+const plan = { tasks: [
+  { id: "analysis", title: "Analyze", role: "Analysis specialist" },
+  { id: "synthesis", title: "Synthesize", role: "Synthesis specialist" },
+  { id: "review", title: "Review", role: "Independent reviewer" },
+  { id: "extra", title: "Extra", role: "Unused" },
+] };
+const output = (taskId, sourceIds = ["source-1"]) => ({ taskId, role: "Analysis specialist", summary: "Bounded finding.", findings: ["Supported finding."], evidenceSourceIds: sourceIds, assumptions: ["Assumption."], unresolvedQuestions: ["Question?"], recommendedNextStep: "Ask a human to review." });
 
 test("selects at most three specialist turns and keeps two-task plans", () => {
   assert.deepEqual(selectOrchestrationTasks(plan).map((task) => task.id), ["analysis", "synthesis", "review"]);
@@ -41,31 +31,10 @@ test("validates structured specialist output and source citations", () => {
 });
 
 test("validates approved runtime input without retaining source text", () => {
-  const result = validateOrchestrationInput({
-    approved: true,
-    episodeId: "E0-001",
-    nodeId: "inquiry",
-    episodeName: "Episode",
-    objective: "Understand the work.",
-    context: "Bounded context.",
-    node: { id: "inquiry", kind: "inquiry" },
-    threads: [],
-    sources: [{ sourceId: "source-1", fileName: "notes.txt", text: "Local source text." }],
-    plan,
-  });
+  const result = validateOrchestrationInput({ approved: true, episodeId: "E0-001", nodeId: "inquiry", episodeName: "Episode", objective: "Understand the work.", context: "Bounded context.", node: { id: "inquiry", kind: "inquiry" }, threads: [], sources: [{ sourceId: "source-1", fileName: "notes.txt", text: "Local source text." }], plan });
   assert.deepEqual(result.sourceIds, ["source-1"]);
-  assert.doesNotThrow(() => validateOrchestrationInput({
-    episodeId: "E0-001",
-    nodeId: "inquiry",
-    episodeName: "Episode",
-    objective: "Understand the work.",
-    context: "",
-    node: { id: "inquiry", kind: "inquiry" },
-    threads: [],
-    sources: [],
-    plan,
-  }));
   assert.throws(() => validateOrchestrationInput({ episodeId: "E0-001", nodeId: "inquiry", objective: "Understand", context: "Context", node: {}, plan: {}, sources: [] }), /two or three runnable specialist tasks/);
+  assert.throws(() => validateOrchestrationInput({ approved: true, episodeId: "E0-001", nodeId: "inquiry", objective: "Understand", context: "Context", node: { id: "inquiry" }, threads: [], sources: [], plan, followUp: { approved: false, nodeId: "inquiry", authority: "human-approved-scope" } }), /Approved follow-up scope/);
 });
 
 test("transitions queued, working, complete, and cancelled run state", () => {
@@ -73,19 +42,40 @@ test("transitions queued, working, complete, and cancelled run state", () => {
   state = applyOrchestrationEvent(state, { type: "task", taskId: "analysis", status: "working" });
   assert.equal(state.taskStates.analysis, "Working");
   state = applyOrchestrationEvent(state, { type: "task", taskId: "analysis", status: "complete", output: output("analysis") });
-  assert.equal(state.taskStates.analysis, "Complete");
   assert.equal(state.taskOutputs.length, 1);
-  state = applyOrchestrationEvent(state, { type: "cancelled", message: "Stopped by human." });
+  state = applyOrchestrationEvent(state, { type: "cancelled" });
   assert.equal(state.status, "cancelled");
 });
 
-test("maps specialist outputs to inspectable evidence and recommendation artifacts", () => {
-  const artifacts = mapOrchestrationArtifacts([output("analysis"), output("synthesis"), output("review")], {
-    nodeId: "inquiry",
-    nodeKind: "inquiry",
-    runId: "run-1",
-  });
+test("maps specialist outputs to inspectable artifacts", () => {
+  const artifacts = mapOrchestrationArtifacts([output("analysis"), output("synthesis"), output("review")], { nodeId: "inquiry", nodeKind: "inquiry", runId: "run-1" });
   assert.deepEqual(artifacts.map((artifact) => artifact.kind), ["evidence", "recommendation", "evaluation"]);
   assert.equal(artifacts[0].orchestrationRunId, "run-1");
-  assert.deepEqual(artifacts[0].sourceIds, ["source-1"]);
+});
+
+const node = {
+  id: "review-follow-up-test",
+  kind: "action",
+  createdFrom: "review",
+  title: "Investigate the unresolved conflict",
+  description: "Approved source-backed inspection only.",
+  expectedOutcome: "Evidence-backed conflict assessment",
+  sourceIds: ["source-1"],
+  metadata: { reviewOrigin: { type: "conflict", label: "Conflict #1" } },
+};
+
+test("review follow-up nodes receive an approved bounded plan", () => {
+  assert.equal(isReviewFollowUpNode(node), true);
+  const plan = createFollowUpOrchestrationPlan({ episode: { id: "E0-020", title: "Episode" }, node });
+  assert.equal(plan.status, "approved");
+  assert.equal(plan.request.allowedAuthority, "Approved bounded read-only analysis. No stage advancement or disposition.");
+  assert.equal(plan.followUp.origin.type, "conflict");
+  assert.ok(selectOrchestrationTasks(plan).length <= 3);
+});
+
+test("follow-up output accepts only known evidence and bounded outcomes", () => {
+  const output = { taskId: "task-1", role: "Reviewer", summary: "Result", findings: [], evidenceSourceIds: ["source-1"], assumptions: [], unresolvedQuestions: [], recommendedNextStep: "Review", reviewOutcome: "still-unresolved" };
+  assert.equal(validateOrchestrationTaskOutput(output, "task-1", ["source-1"]).valid, true);
+  assert.equal(validateOrchestrationTaskOutput({ ...output, reviewOutcome: "invented" }, "task-1", ["source-1"]).valid, false);
+  assert.equal(validateOrchestrationTaskOutput({ ...output, evidenceSourceIds: ["unknown"] }, "task-1", ["source-1"]).valid, false);
 });

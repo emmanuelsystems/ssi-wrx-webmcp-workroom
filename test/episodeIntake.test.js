@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createIntentSummary,
   createWorkflowGateEdges,
   createWorkflowGates,
+  normalizeIntentSummary,
   validateEpisodeStructureProposal,
 } from "../src/episodeIntake.js";
 import {
@@ -31,6 +33,23 @@ const baseProposal = {
 function proposalWith(change) {
   return structuredClone({ ...baseProposal, ...change });
 }
+
+test("requires a human-confirmed intent summary before new agent-assisted analysis", () => {
+  const intent = createIntentSummary({
+    episode: { title: "Assess the bounded decision", context: "Use the retained notes only.", sources: [{ sourceId: "notes" }] },
+  });
+  assert.equal(intent.status, "review-required");
+  assert.equal(intent.sourceCount, 1);
+  assert.match(intent.authority.mayNot, /advance stages/);
+
+  const confirmed = normalizeIntentSummary({ ...intent, status: "confirmed", confirmedAt: "2026-09-14T00:00:00.000Z" });
+  assert.equal(confirmed.status, "confirmed");
+  assert.equal(confirmed.confirmedAt, "2026-09-14T00:00:00.000Z");
+});
+
+test("keeps legacy episodes compatible when they have no intent summary", () => {
+  assert.equal(normalizeIntentSummary(null, { title: "Existing episode" }), null);
+});
 
 test("accepts multiple explicit human checkpoints and preserves their dependency edges", () => {
   const result = validateEpisodeStructureProposal(baseProposal, "E0-001");

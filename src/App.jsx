@@ -1,5 +1,6 @@
 import {
   Component,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -35,6 +36,9 @@ import {
   applyOrchestrationEvent,
   mapOrchestrationArtifacts,
   selectOrchestrationTasks,
+  createFollowUpOrchestrationPlan,
+  isReviewFollowUpNode,
+  validateOrchestrationTaskOutput,
 } from "./orchestration";
 
 import {
@@ -44,10 +48,12 @@ import {
 } from "./autopilot";
 
 import {
+  createIntentSummary,
   createEpisodeIntakeRequest,
   createWorkflowGateEdges,
   createWorkflowGates,
   normalizeEpisodeIntake,
+  normalizeIntentSummary,
   validateEpisodeStructureProposal,
 } from "./episodeIntake";
 
@@ -108,6 +114,38 @@ function isGeneratedRunArtifact(item) {
   return item?.id?.startsWith("autopilot-") || item?.id?.startsWith("orchestration-artifact-");
 }
 
+function isReviewFollowUpAddition(item) {
+  return isReviewFollowUpNode(item);
+}
+
+function normalizeFollowUpAddition(item) {
+  if (!isReviewFollowUpAddition(item)) return item;
+  const currentStatus = item.metadata?.execution?.status ?? (item.status === "proposed" ? "ready" : item.status ?? "ready");
+  return {
+    ...item,
+    status: item.status === "proposed" ? "ready" : item.status ?? "ready",
+    metadata: {
+      ...(item.metadata ?? {}),
+      execution: {
+        status: currentStatus,
+        runId: null,
+        taskStates: {},
+        taskOutputs: [],
+        artifactIds: [],
+        startedAt: null,
+        completedAt: null,
+        error: null,
+        ...(item.metadata?.execution ?? {}),
+      },
+    },
+  };
+}
+
+function groundedRuntimeMessage(message, fallback = "The bounded follow-up did not return a grounded result.") {
+  const text = String(message ?? "").trim();
+  return /^(not found|404|failed to fetch|internal server error)$/i.test(text) ? fallback : text || fallback;
+}
+
 function layoutGeneratedReviewArtifacts(episode, stageIndex, basePositions) {
   const artifacts = (episode.additions ?? []).filter(
     (item) => item.stageIndex === stageIndex && isDurableArtifact(item) && isGeneratedRunArtifact(item)
@@ -133,6 +171,12 @@ function compactArtifactSummary(value) {
   const summary = value?.replace(/\s+/g, " ").trim() ?? "";
   if (summary.length <= 120) return summary;
   return `${summary.slice(0, 117).replace(/\s+$/, "")}…`;
+}
+
+function compactNodeSummary(value) {
+  const summary = value?.replace(/\s+/g, " ").trim() ?? "";
+  if (summary.length <= 82) return summary;
+  return `${summary.slice(0, 79).replace(/\s+$/, "")}…`;
 }
 
 function markdownList(items, fallback = "Not recorded.") {
@@ -163,10 +207,6 @@ function createActivityEvent({
   };
 }
 
-function getLatestAgentNotification(events = []) {
-  return events.filter((event) => event.actor?.kind === "codex" || event.actor?.kind === "system").at(-1) ?? null;
-}
-
 function deriveEpisodeName(title) {
   const value = title?.replace(/\s+/g, " ").trim() ?? "";
   if (!value) return "Untitled episode";
@@ -176,6 +216,12 @@ function deriveEpisodeName(title) {
   const words = value.replace(/[?!.:,;]/g, "").split(" ").slice(0, 6);
   const result = words.join(" ");
   return `${result.slice(0, 42).replace(/\s+$/, "")}${result.length > 42 || words.length < value.split(" ").length ? "…" : ""}`;
+}
+
+function deriveSidebarProjectName(name) {
+  return name
+    .replace(/\s+and WebMCP Experiments$/i, " + WebMCP")
+    .replace(/\s+validation rerun$/i, " validation");
 }
 
 function getContextSummary(episode) {
@@ -479,6 +525,23 @@ function latestHumanMessage(
   return null;
 }
 
+function normalizeEpisodeConversation(conversation) {
+  if (!conversation || typeof conversation !== "object") {
+    return {
+      messages: [],
+      status: "idle",
+      codexThreadId: null,
+    };
+  }
+
+  return {
+    messages: Array.isArray(conversation.messages) ? conversation.messages : [],
+    status: conversation.status ?? "idle",
+    codexThreadId: conversation.codexThreadId ?? null,
+    updatedAt: conversation.updatedAt ?? null,
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* MIGRATION                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -688,19 +751,21 @@ function normalizeEpisode(
       (
         episode.additions ?? []
       ).map((item) => ({
-        ...migrateAddition(
-          item
-        ),
+        ...normalizeFollowUpAddition(migrateAddition(item)),
 
         parentNodeId:
           item.parentNodeId
             ? remapOldParentNode(
                 item.parentNodeId
               )
-            : null,
+              : null,
       })),
 
+    conversation: normalizeEpisodeConversation(episode.conversation),
+
     intake: normalizeEpisodeIntake(episode.intake),
+
+    intent: normalizeIntentSummary(episode.intent, episode),
 
     autopilotRun: normalizeAutopilotRun(episode.autopilotRun),
 
@@ -1084,7 +1149,7 @@ function NewEpisodeModal({
             />
             <span>
               <strong>Let Codex draft the workflow</strong>
-              <small>It will run a bounded, read-only analysis and propose the next workflow for your review.</small>
+              <small>First review the intent and authority boundaries. After your confirmation, it can run bounded, read-only analysis and propose a workflow for review.</small>
             </span>
           </label>
 
@@ -1152,7 +1217,7 @@ function NewEpisodeModal({
               }
             >
               {sourceBusy ? "Preparing sources…" : setupMode === "agent-assisted"
-                ? "Create & Analyze"
+                ? "Create & review intent"
                 : "Create Episode"}
             </button>
           </div>
@@ -1285,25 +1350,6 @@ function AgentIcon() {
   );
 }
 
-function ActivityIcon() {
-  return (
-    <svg className="activity-icon" viewBox="0 0 16 16" aria-hidden="true">
-      <path d="M2.5 4.5h2M2.5 8h3M2.5 11.5h2M7 4.5h6.5M8 8h5.5M7 11.5h6.5" />
-      <circle cx="6" cy="4.5" r="1" />
-      <circle cx="6" cy="11.5" r="1" />
-    </svg>
-  );
-}
-
-function NotificationIcon() {
-  return (
-    <svg className="notification-icon" viewBox="0 0 16 16" aria-hidden="true">
-      <path d="M4 11.5h8l-1-1.5V7a3 3 0 0 0-6 0v3L4 11.5Z" />
-      <path d="M6.5 13a1.7 1.7 0 0 0 3 0" />
-    </svg>
-  );
-}
-
 function CardNode({
   data,
   selected,
@@ -1361,6 +1407,12 @@ function CardNode({
         {data.label}
       </div>
 
+      {data.statusLabel && (
+        <div className="node-work-status">
+          <StatusIndicator status={data.statusTone ?? "waiting"} label={data.statusLabel} size="sm" />
+        </div>
+      )}
+
       {data.autopilotStatus && <div className="node-autopilot-status"><StatusIndicator status={data.autopilotStatus === "completed" ? "complete" : data.autopilotStatus === "working" ? "working" : data.autopilotStatus === "failed" ? "error" : "waiting"} label={`Autopilot · ${data.autopilotStatus}`} size="sm" /></div>}
 
       {data.runArtifactCount > 0 && (
@@ -1383,7 +1435,7 @@ function CardNode({
       {data.body && (
         <div className="node-body">
           {data.compactNode || data.durableArtifact
-            ? compactArtifactSummary(data.body)
+            ? compactNodeSummary(data.body)
             : data.body}
         </div>
       )}
@@ -1391,6 +1443,37 @@ function CardNode({
       {data.meta && (
         <div className="node-meta">
           {data.meta}
+        </div>
+      )}
+
+      {data.evidenceCount > 0 ? (
+        <div className="node-evidence-summary">
+          <span>Evidence</span>
+          <strong>{data.evidenceCount} retained source{data.evidenceCount === 1 ? "" : "s"}</strong>
+        </div>
+      ) : data.showEvidenceState ? (
+        <div className="node-evidence-summary empty">
+          <span>Evidence</span>
+          <strong>No retained evidence</strong>
+        </div>
+      ) : null}
+
+      {data.resultSummary && (
+        <div className="node-result-summary">
+          <span>Result</span>
+          <p>{data.resultSummary}</p>
+        </div>
+      )}
+
+      {data.followUp && data.followUp.status !== "completed" && (
+        <button type="button" className="action-button action-button-primary nodrag follow-up-run-button" onClick={(event) => { event.stopPropagation(); data.onRunFollowUp?.(); }} disabled={data.followUp.status === "running"}>
+          {data.followUp.status === "failed" ? "Retry bounded work" : data.followUp.status === "running" ? "Running…" : "Run bounded work"}
+        </button>
+      )}
+
+      {data.requiresHuman && (
+        <div className="node-human-checkpoint-note">
+          Human judgment required
         </div>
       )}
 
@@ -1522,6 +1605,14 @@ function GateNode({
         {data.title}
       </div>
 
+      <div className="node-work-status">
+        <StatusIndicator
+          status={data.completed ? "complete" : data.canContinue ? "human-required" : "waiting"}
+          label={data.completed ? "Complete" : data.canContinue ? "Needs review" : "Waiting"}
+          size="sm"
+        />
+      </div>
+
       {data.checkpointDependencies?.length > 0 && (
         <div className="node-meta">
           After: {data.checkpointDependencies.join(", ")}
@@ -1533,6 +1624,8 @@ function GateNode({
           ✓ Completed
         </div>
       ) : data.canContinue ? (
+        <>
+          <div className="node-human-checkpoint-note">Agent work complete. Human judgment required before stage movement.</div>
         <button
           type="button"
           className="node-button primary nodrag"
@@ -1543,6 +1636,7 @@ function GateNode({
           Continue to next
           stage →
         </button>
+        </>
       ) : (
         <div className="node-meta">
           Inspecting
@@ -1632,6 +1726,14 @@ function HumanNode({
 
       <div className="node-title">
         {data.title}
+      </div>
+
+      <div className="node-work-status">
+        <StatusIndicator
+          status={data.disposition ? "complete" : "human-required"}
+          label={data.disposition ? "Complete" : "Needs review"}
+          size="sm"
+        />
       </div>
 
       {data.body && (
@@ -2225,6 +2327,7 @@ function EpisodeIntakePanel({
   onClose,
   onRequestRevision,
   onAccept,
+  onConfirmIntent,
   codexRunning = false,
   codexStatus,
   codexRun,
@@ -2239,6 +2342,7 @@ function EpisodeIntakePanel({
 
   const request = intake.request ?? createEpisodeIntakeRequest({ episode });
   const proposal = intake.proposal;
+  const intent = episode.intent;
   const activity = (codexRun?.events ?? []).filter((event) => ["activity", "milestone", "phase"].includes(event.type)).slice(-8);
 
   return (
@@ -2247,7 +2351,9 @@ function EpisodeIntakePanel({
         <div>
           <div className="concept-preview-label">Agent-assisted setup</div>
           <h2>
-            {intake.status === "pending"
+            {intake.status === "intent-review"
+              ? "Review intent before analysis"
+              : intake.status === "pending"
               ? "Agent structuring"
               : "Proposed episode structure"}
           </h2>
@@ -2256,6 +2362,24 @@ function EpisodeIntakePanel({
         </div>
         <button type="button" onClick={onClose} aria-label="Close intake">×</button>
       </header>
+
+      {intake.status === "intent-review" && intent && (
+        <div className="episode-intake-panel-body">
+          <div className="proposal-status">Human confirmation required · No analysis has started</div>
+          <div className="intake-section"><span>Objective</span><strong>{intent.objective || "No objective provided."}</strong></div>
+          <div className="intake-section"><span>Known context</span><p>{intent.context || "No additional context provided."}</p></div>
+          <div className="intake-summary-grid">
+            <div><span>Sources</span><strong>{intent.sourceCount} selected</strong></div>
+            <div><span>Agent may</span><strong>Read and propose</strong></div>
+            <div><span>Agent may not</span><strong>Decide or act</strong></div>
+          </div>
+          <details className="intake-details">
+            <summary>Inspect authority boundaries</summary>
+            <div className="intake-section"><span>Allowed</span><p>{intent.authority.may}</p></div>
+            <div className="intake-section"><span>Not allowed</span><p>{intent.authority.mayNot}</p></div>
+          </details>
+        </div>
+      )}
 
       {intake.status === "pending" && (
         <div className="episode-intake-panel-body">
@@ -2297,7 +2421,12 @@ function EpisodeIntakePanel({
       )}
 
       <footer>
-        {intake.status === "pending" ? (
+        {intake.status === "intent-review" ? (
+          <>
+            <button type="button" onClick={onClose}>Review later</button>
+            <button type="button" onClick={onConfirmIntent} className="primary">Confirm for analysis</button>
+          </>
+        ) : intake.status === "pending" ? (
           codexRunning ? <button type="button" onClick={onCancelAnalysis}>Cancel analysis</button> : ["error", "cancelled"].includes(codexRun?.status) ? <button type="button" onClick={onRetryAnalysis}>Retry analysis</button> : <button type="button" onClick={onClose}>Close</button>
         ) : (
           <>
@@ -2441,9 +2570,8 @@ function NotificationDrawer({ episode, open, onClose, onOpenRelated }) {
   );
 }
 
-function EpisodeProgressGuide({ episode, viewStage, liveOrchestrationRun, onSelectStage, onOpenIntake, onOpenActivity, onOpenOrchestration, onOpenSources }) {
+function OverviewWorkspace({ episode, viewStage, liveOrchestrationRun, onSelectStage, onOpenIntake, onOpenActivity, onOpenNotifications, onOpenReview, onOpenWork, onOpenOrchestration, onOpenSources, onExport }) {
   const autopilot = episode.autopilotRun;
-  const orchestrationRuns = Object.entries(episode.runtime?.codex?.orchestration ?? {});
   const activeOrchestration = liveOrchestrationRun?.episodeId === episode.id && ["queued", "working"].includes(liveOrchestrationRun.status)
     ? [liveOrchestrationRun.nodeId, liveOrchestrationRun]
     : null;
@@ -2452,7 +2580,8 @@ function EpisodeProgressGuide({ episode, viewStage, liveOrchestrationRun, onSele
   const sourceCount = episode.sources?.length ?? 0;
   const completedAutopilotTasks = Object.values(autopilot?.taskStates ?? {}).filter((status) => ["complete", "completed"].includes(status)).length;
   const autopilotTaskCount = Object.keys(autopilot?.taskStates ?? {}).length;
-  const setupNeedsReview = ["pending", "proposed"].includes(episode.intake?.status);
+  const findings = autopilot?.finalPackage?.findings ?? [];
+  const setupNeedsReview = ["intent-review", "pending", "proposed"].includes(episode.intake?.status);
   const finalReviewReady = autopilot?.status === "complete" && autopilot.finalPackage;
 
   let nextTitle = "Review this stage and continue when it is justified.";
@@ -2461,39 +2590,494 @@ function EpisodeProgressGuide({ episode, viewStage, liveOrchestrationRun, onSele
 
   if (setupNeedsReview) {
     nextTitle = "Review the proposed episode structure.";
-    nextDetail = "Autopilot produced a draft. Accept it, ask for a revision, or leave it unaccepted—this is a human decision.";
+    nextDetail = "Review the objective, context, and authority boundaries before any agent analysis begins.";
     nextAction = { label: "Review setup", onClick: onOpenIntake };
   } else if (activeOrchestration) {
     nextTitle = "First Mate is processing this workflow step.";
-    nextDetail = "No prompt is required while the read-only run is active. Its outputs will appear when each specialist finishes.";
+    nextDetail = "Read-only outputs will appear as each specialist finishes.";
     nextAction = { label: "Open First Mate", onClick: () => onOpenOrchestration(activeOrchestration[0]) };
   } else if (finalReviewReady) {
     nextTitle = "Review the final Autopilot package.";
-    nextDetail = "The run is complete. You can promote trusted context, request a revised run, or keep the package as inspectable draft work.";
-    nextAction = { label: "Open activity", onClick: onOpenActivity };
+    nextDetail = "The run is complete. Review retained outputs and findings before taking the next human-owned action.";
+    nextAction = { label: "Review now", onClick: onOpenReview };
   } else if (viewStage === 2) {
     nextTitle = "Record the human disposition.";
     nextDetail = "Agents cannot complete this step. Review the retained evidence and make the final decision yourself.";
   }
 
+  const recentActivity = (episode.activity ?? []).slice(-4).reverse();
+  const workStatus = autopilot?.status === "working"
+    ? "In progress"
+    : autopilot?.status === "complete"
+      ? "Package ready"
+      : autopilot?.status === "error"
+        ? "Run failed"
+        : autopilot?.status === "cancelled"
+          ? "Run stopped"
+          : "Not started";
+  const reviewStatus = autopilot?.humanReviewStatus === "promoted"
+    ? "Trusted context retained"
+    : autopilot?.humanReviewStatus === "rejected"
+      ? "Package rejected"
+      : autopilot?.finalPackage
+        ? "Review required"
+        : "No decision required";
+
   return (
-    <section className="episode-progress-guide" aria-label="Episode progress guide">
-      <header>
-        <div><span>Episode cockpit</span><h2>Where this episode stands</h2></div>
-        <div className="episode-progress-summary">
-          {sourceCount > 0 && <button type="button" className="episode-progress-source-count" onClick={onOpenSources}>{sourceCount} source {sourceCount === 1 ? "file" : "files"}</button>}
-          <div className="episode-progress-output-count">{generatedOutputs} retained output{generatedOutputs === 1 ? "" : "s"}</div>
-        </div>
+    <section className="overview-workspace" aria-label="Overview workspace">
+      <div className="overview-hero-grid">
+        <section className="overview-next-card">
+          <div className="overview-next-copy">
+            <span className="overview-eyebrow">Next for you</span>
+            <h2>{nextTitle}</h2>
+            <p>{nextDetail}</p>
+            <div className="overview-next-actions">
+              {nextAction && <button type="button" className="overview-primary-action" onClick={nextAction.onClick}>{nextAction.label}<span aria-hidden="true">→</span></button>}
+              <button type="button" className="overview-secondary-action" onClick={onOpenActivity}>Open activity</button>
+            </div>
+          </div>
+          <div className="overview-next-mark" aria-hidden="true"><span>WRX</span><strong>Human<br />judgment</strong></div>
+        </section>
+
+        <section className="overview-progress-card">
+          <div className="overview-card-heading"><span className="overview-eyebrow">Episode progress</span><span className="overview-stage-count">Stage {episode.currentStage + 1} of 3</span></div>
+          <div className="overview-progress-line" aria-hidden="true">{EPISODE_STAGES.map((stage, index) => <span key={stage.name} className={index === viewStage ? "current" : index < episode.currentStage ? "complete" : "pending"} />)}</div>
+          <div className="overview-progress-labels">{EPISODE_STAGES.map((stage, index) => <button type="button" key={stage.name} disabled={index > episode.currentStage} className={index === viewStage ? "current" : index < episode.currentStage ? "complete" : ""} onClick={() => onSelectStage(index)}><b>{index < episode.currentStage ? "✓" : index + 1}</b><span>{stage.name}</span></button>)}</div>
+        </section>
+      </div>
+
+      <div className="overview-summary-grid">
+        <section className="overview-summary-card governance-summary"><span className="overview-summary-icon">G</span><div><span className="overview-card-label">Governance</span><strong>{episode.intent?.status === "confirmed" ? "Human authority active" : setupNeedsReview ? "Confirmation required" : "Human authority active"}</strong><p>Read-only analysis. No autonomous disposition.</p>{setupNeedsReview && <button type="button" onClick={onOpenIntake}>View details <span aria-hidden="true">→</span></button>}</div></section>
+        <section className="overview-summary-card work-summary"><span className="overview-summary-icon">W</span><div><span className="overview-card-label">Agent work</span><strong>{autopilot ? `${completedAutopilotTasks} of ${autopilotTaskCount} tasks complete` : "Not started"}</strong><p>{workStatus}. Bounded, local, read-only.</p><button type="button" onClick={onOpenWork}>Open work <span aria-hidden="true">→</span></button></div></section>
+        <section className="overview-summary-card evidence-summary"><span className="overview-summary-icon">E</span><div><span className="overview-card-label">Evidence</span><strong>{sourceCount} source{sourceCount === 1 ? "" : "s"} · {generatedOutputs} output{generatedOutputs === 1 ? "" : "s"}</strong><p>{findings.length ? `${findings.length} finding${findings.length === 1 ? "" : "s"} retained.` : "No conflicts recorded."}</p>{sourceCount > 0 ? <button type="button" onClick={onOpenSources}>View sources <span aria-hidden="true">→</span></button> : <button type="button" onClick={onOpenReview}>Open review <span aria-hidden="true">→</span></button>}</div></section>
+        <section className="overview-summary-card judgment-summary"><span className="overview-summary-icon">J</span><div><span className="overview-card-label">Human judgment</span><strong>{reviewStatus}</strong><p>{findings.length ? `${findings.length} finding${findings.length === 1 ? "" : "s"} needs a decision.` : "Review remains human-owned."}</p><button type="button" onClick={onOpenReview}>Go to review <span aria-hidden="true">→</span></button></div></section>
+      </div>
+
+      <div className="overview-bottom-grid">
+        <section className="overview-activity-card">
+          <div className="overview-section-heading"><div><span className="overview-eyebrow">Recent activity</span><h3>What changed</h3></div><button type="button" onClick={onOpenActivity}>View all <span aria-hidden="true">→</span></button></div>
+          {recentActivity.length ? <div className="overview-activity-list">{recentActivity.map((event) => <article key={event.id}><span className="overview-activity-dot" aria-hidden="true" /><div><strong>{event.title}</strong><p>{event.summary || "Activity retained in the episode record."}</p></div><time>{new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></article>)}</div> : <div className="overview-empty-activity">No activity recorded yet.</div>}
+        </section>
+        <section className="overview-quick-card">
+          <div className="overview-section-heading"><div><span className="overview-eyebrow">Quick actions</span><h3>Keep moving</h3></div></div>
+          <div className="overview-quick-actions"><button type="button" onClick={onOpenWork}>Open work</button>{sourceCount > 0 && <button type="button" onClick={onOpenSources}>View sources</button>}<button type="button" onClick={onOpenNotifications}>View updates</button>{autopilot?.finalPackage && <button type="button" onClick={onExport}>Export package</button>}</div>
+          {pendingThreads > 0 && <p className="overview-quick-note">{pendingThreads} conversation{pendingThreads === 1 ? "" : "s"} awaiting a response.</p>}
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function buildEpisodeWorkEvents(episode) {
+  const events = [];
+  const workflowNodes = episode.workflow?.nodes ?? [];
+  if (workflowNodes.length > 0) {
+    events.push({
+      id: `${episode.id}-work-created`,
+      type: "work-created",
+      label: "Work created",
+      items: workflowNodes.slice(0, 3).map((node) => node.title).filter(Boolean),
+      extraCount: Math.max(0, workflowNodes.length - 3),
+    });
+  }
+
+  const sourceCount = episode.sources?.length ?? 0;
+  if (sourceCount > 0) {
+    events.push({
+      id: `${episode.id}-evidence-added`,
+      type: "evidence-added",
+      label: "Evidence added",
+      title: `${sourceCount} retained source${sourceCount === 1 ? "" : "s"} available for review.`,
+    });
+  }
+
+  const run = episode.autopilotRun;
+  const finalPackage = run?.status === "complete" ? run.finalPackage : null;
+  if (finalPackage) {
+    events.push({
+      id: `${episode.id}-${run.runId ?? "run"}-result`,
+      type: "work-result",
+      label: "WRX",
+      title: "Evidence inspection completed.",
+      summary: finalPackage.summary || "A bounded analysis result is ready for human review.",
+      evidenceCount: finalPackage.evidenceSourceIds?.length ?? episode.sources?.length ?? 0,
+      conflictCount: finalPackage.conflicts?.length ?? 0,
+    });
+    if ((finalPackage.conflicts?.length ?? 0) > 0) {
+      events.push({
+        id: `${episode.id}-${run.runId ?? "run"}-conflicts`,
+        type: "conflict-detected",
+        label: "Conflict detected",
+        title: `${finalPackage.conflicts.length} conflict${finalPackage.conflicts.length === 1 ? "" : "s"} require human review.`,
+      });
+    }
+    if (finalPackage.humanReviewRequired === true) {
+      events.push({
+        id: `${episode.id}-${run.runId ?? "run"}-authorization`,
+        type: "authorization-required",
+        label: "Authorization required",
+        title: "Human review is required before any promotion or disposition.",
+      });
+    }
+  }
+
+  const followUpEvents = (episode.activity ?? []).filter((event) => ["review.follow_up_completed", "review.follow_up_failed"].includes(event.type));
+  followUpEvents.forEach((event) => {
+    const node = (episode.additions ?? []).find((item) => item.id === event.relatedNodeId);
+    if (event.type === "review.follow_up_completed") {
+      events.push({ id: event.id, type: "work-result", label: "WRX", title: "Evidence inspection completed.", summary: event.summary || node?.resultSummary || "A bounded follow-up result is ready for review.", evidenceCount: event.metadata?.evidenceCount ?? 0, conflictCount: event.metadata?.unresolvedCount ?? 0, followUp: true });
+    } else {
+      events.push({ id: event.id, type: "authorization-required", label: "Follow-up unavailable", title: groundedRuntimeMessage(event.summary) });
+    }
+  });
+
+  if (episode.disposition) {
+    events.push({
+      id: `${episode.id}-human-decision`,
+      type: "human-decision",
+      label: "Human decision",
+      title: episode.disposition,
+    });
+  }
+
+  return events;
+}
+
+function ConversationWorkspace({ episode, conversation, threads, getNodeTitle, onOpenThread, onOpenActivity, onOpenSources, onOpenWork, onOpenReview, onSend, contextPrompt }) {
+  const workflowNodeCount = episode.workflow?.nodes?.length ?? 0;
+  const sourceCount = episode.sources?.length ?? 0;
+  const historicalSubthreads = threads.length;
+  const workEvents = buildEpisodeWorkEvents(episode);
+  const hasEpisodeMessages = (conversation?.messages?.length ?? 0) > 0;
+  return (
+    <section className="mode-workspace conversation-workspace" aria-label="Conversation workspace">
+      <header className="mode-workspace-header">
+        <div><span className="mode-eyebrow">Episode conversation</span><h2>Keep the episode grounded in the human question.</h2><p>{episode.title}</p></div>
+        <button type="button" className="mode-secondary-action" onClick={onOpenActivity}>View activity</button>
       </header>
-      <div className="episode-progress-stages">
-        {EPISODE_STAGES.map((stage, index) => <button type="button" key={stage.name} className={index === viewStage ? "active" : index < episode.currentStage ? "complete" : ""} disabled={index > episode.currentStage} onClick={() => onSelectStage(index)}><b>{index < episode.currentStage ? "✓" : index + 1}</b><span>{stage.name}</span></button>)}
+      <div className="conversation-layout">
+        <div className="conversation-primary-column">
+          <article className="episode-conversation-card">
+            <div className="conversation-thread-meta"><span>Episode conversation</span><small>Stage {episode.currentStage + 1}</small></div>
+            <div className="episode-conversation-intro"><strong>One continuous thread for this episode</strong><span>WRX can inspect and respond. Work, evidence, and decisions remain human-owned.</span></div>
+            {!hasEpisodeMessages && <div className="conversation-transition-note"><strong>Episode conversation starts here</strong><p>No episode-level chronology has been reconstructed. Historical node discussions remain available as Work Subthreads below.</p></div>}
+            {hasEpisodeMessages && <ConversationMessages thread={conversation} episodeLevel onOpenWork={onOpenWork} onOpenSources={sourceCount > 0 ? onOpenSources : undefined} />}
+            {workEvents.map((event) => {
+              if (event.type === "work-created") {
+                return <article className="conversation-event-card work-created-event" key={event.id}>
+                  <div className="conversation-event-label">Work created</div>
+                  <ul>{event.items.map((item) => <li key={item}>{item}</li>)}</ul>
+                  {event.extraCount > 0 && <span className="conversation-event-more">+{event.extraCount} more work nodes</span>}
+                  <button type="button" className="mode-link-action" onClick={onOpenWork}>Open Work <span aria-hidden="true">→</span></button>
+                </article>;
+              }
+              if (event.type === "work-result") {
+                return <article className="conversation-event-card work-result-event" key={event.id}>
+                  <div className="conversation-event-label">{event.label}</div>
+                  <strong>{event.title}</strong>
+                  <p>{event.summary}</p>
+                  <div className="conversation-event-facts"><span>{event.evidenceCount} retained source{event.evidenceCount === 1 ? "" : "s"} support{event.evidenceCount === 1 ? "s" : ""} the result.</span><span>{event.conflictCount ? `${event.conflictCount} ${event.followUp ? "unresolved question" : "conflict"}${event.conflictCount === 1 ? "" : "s"} recorded.` : event.followUp ? "No unresolved questions recorded." : "No conflicts recorded."}</span></div>
+                  <div className="conversation-event-actions">{sourceCount > 0 && <button type="button" className="mode-link-action" onClick={onOpenSources}>Review evidence <span aria-hidden="true">→</span></button>}<button type="button" className="mode-link-action" onClick={onOpenWork}>Open Work <span aria-hidden="true">→</span></button></div>
+                </article>;
+              }
+              return <article className={`conversation-event-card conversation-${event.type}`} key={event.id}>
+                <div className="conversation-event-label">{event.label}</div>
+                <strong>{event.title}</strong>
+                {(event.type === "evidence-added" || event.type === "conflict-detected" || event.type === "authorization-required") && <div className="conversation-event-actions">{event.type === "evidence-added" && <button type="button" className="mode-link-action" onClick={onOpenSources}>Review evidence <span aria-hidden="true">→</span></button>}{event.type !== "evidence-added" && <button type="button" className="mode-link-action" onClick={onOpenReview}>Review <span aria-hidden="true">→</span></button>}</div>}
+              </article>;
+            })}
+            <ConversationComposer key={`${episode.id}:${contextPrompt ?? ""}`} thread={conversation} onSend={onSend} episodeLevel initialDraft={contextPrompt ?? ""} />
+          </article>
+
+          {historicalSubthreads > 0 && <section className="conversation-subthreads-card">
+            <div className="conversation-subthreads-heading"><div><span className="mode-eyebrow">Work subthreads</span><h3>Execution and provenance from this episode</h3></div><button type="button" className="mode-link-action" onClick={onOpenWork}>Open Work <span aria-hidden="true">→</span></button></div>
+            <p>Historical node-level threads remain attached to their Work nodes.</p>
+            <div className="conversation-subthread-list">{threads.slice(0, 4).map((thread) => <button type="button" key={thread.id} className="conversation-subthread-row" onClick={() => onOpenThread(thread)}><span><strong>{getNodeTitle(thread)}</strong><small>{thread.status === "pending" ? "Awaiting response" : "Inspect retained messages"}</small></span><span aria-hidden="true">→</span></button>)}</div>
+            {historicalSubthreads > 4 && <span className="conversation-event-more">+{historicalSubthreads - 4} more Work Subthreads</span>}
+          </section>}
+        </div>
+        <aside className="mode-context-panel conversation-context-panel">
+          <div className="conversation-context-heading"><span className="mode-eyebrow">Episode context</span><span className="conversation-context-state">Human-owned</span></div>
+          <div className="conversation-context-block"><span className="conversation-context-label">Objective</span><p>{episode.title || "No objective recorded."}</p></div>
+          <dl>
+            <div><dt>Current stage</dt><dd>{EPISODE_STAGES[episode.currentStage]?.name ?? "Not recorded"}</dd></div>
+            <div><dt>Active work</dt><dd>{workflowNodeCount ? `${workflowNodeCount} workflow node${workflowNodeCount === 1 ? "" : "s"}` : "No active work"}</dd></div>
+            <div><dt>Evidence</dt><dd>{sourceCount ? `${sourceCount} source${sourceCount === 1 ? "" : "s"}` : "No retained evidence yet"}</dd></div>
+            <div><dt>Conflicts</dt><dd>{episode.autopilotRun?.finalPackage?.conflicts?.length ?? 0} recorded</dd></div>
+            <div><dt>Human decisions</dt><dd>{episode.disposition ? episode.disposition : "No disposition recorded"}</dd></div>
+          </dl>
+          <div className="conversation-context-actions"><button type="button" className="mode-link-action" onClick={onOpenWork}>Open Work <span aria-hidden="true">→</span></button>{sourceCount > 0 && <button type="button" className="mode-link-action" onClick={onOpenSources}>View evidence <span aria-hidden="true">→</span></button>}</div>
+        </aside>
       </div>
-      <div className="episode-progress-grid">
-        <div><span>Autopilot</span><strong>{autopilot ? autopilot.status === "working" ? "Running" : autopilot.status === "complete" ? "Package ready" : `Run ${autopilot.status}` : "Not started"}</strong><small>{autopilot ? `${completedAutopilotTasks} of ${autopilotTaskCount} tasks completed` : "Optional agent-assisted analysis"}</small></div>
-        <div><span>First Mate</span><strong>{activeOrchestration ? "Working" : orchestrationRuns.length > 0 ? "Outputs retained" : "Not started"}</strong><small>{activeOrchestration ? "Read-only specialist work in progress" : "Optional targeted orchestration"}</small></div>
-        <div><span>Prompts</span><strong>{pendingThreads > 0 ? "Reply pending" : "Nothing required"}</strong><small>{pendingThreads > 0 ? `${pendingThreads} agent conversation${pendingThreads === 1 ? "" : "s"} awaiting a reply` : "Ask only when a finding needs clarification"}</small></div>
+    </section>
+  );
+}
+
+function ReviewActionButtons({ onInspect, onAsk, onWork, workLabel = "Work on this" }) {
+  return <div className="review-item-actions">
+    {onInspect && <button type="button" className="review-item-action review-item-action-tertiary" onClick={onInspect}>Inspect</button>}
+    {onAsk && <button type="button" className="review-item-action" onClick={onAsk}>Ask WRX</button>}
+    {onWork && <button type="button" className="review-item-action review-item-action-emphasis" onClick={onWork}>{workLabel}</button>}
+  </div>;
+}
+
+function ReviewOutputDetail({ output, episode, getNodeTitle, hasSubthread, onClose, onAsk, onWork, onOpenWork, onOpenSources }) {
+  if (!output) return null;
+  const title = output.title || output.label || output.taskId || "Retained output";
+  const role = output.metadata?.taskRole || output.taskRole || output.role || "Evaluation specialist";
+  const body = output.body || output.summary || output.result || "No retained result was recorded for this output.";
+  const sourceIds = output.sourceIds ?? output.evidenceSourceIds ?? [];
+  const sourceCount = sourceIds.filter((sourceId) => episode.sources?.some((source) => source.sourceId === sourceId)).length;
+  const generatedOutputs = (episode.additions ?? []).filter(isGeneratedRunArtifact);
+  const priorOutputCount = Math.max(0, generatedOutputs.filter((item) => item.id !== output.id).length);
+  const nodeId = output.parentNodeId || output.nodeId || null;
+  const nodeTitle = nodeId ? getNodeTitle(nodeId, output.stageIndex ?? episode.currentStage) : null;
+  const reviewState = output.kind === "conflict" ? "Conflicted" : output.requiresHuman ? "Needs review" : output.kind === "evidence" ? "Supported" : "Needs revision";
+  const followUpAvailable = output.followUpAvailable !== false;
+  const reason = output.metadata?.unresolvedQuestions?.[0] || output.unresolvedQuestions?.[0] || output.reason || (reviewState === "Supported" ? "This output is retained as supporting evidence." : "The retained package requires human inspection before disposition.");
+  const askPrompt = `Ask WRX about this retained output: ${title}`;
+  return <div className="review-modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="review-modal review-output-detail" role="dialog" aria-modal="true" aria-label="Retained output detail">
+      <header className="review-modal-header"><div><div className="review-modal-eyebrow">Output detail</div><h2>{role}</h2><p>{title}</p></div><button type="button" onClick={onClose} aria-label="Close output detail">×</button></header>
+      <div className="review-modal-body">
+        <div className="review-detail-section"><span>Result</span><div className="review-detail-result">{body}</div></div>
+        <div className="review-detail-grid"><div><span>Review state</span><strong>{reviewState}</strong></div><div><span>Reason</span><p>{reason}</p></div></div>
+        <div className="review-detail-grid"><div><span>Based on</span><p>{sourceCount} source{sourceCount === 1 ? "" : "s"}<br />{priorOutputCount} prior output{priorOutputCount === 1 ? "" : "s"}</p></div><div><span>Generated from</span><p>{nodeTitle ? <>Work item: {nodeTitle}</> : "No originating Work item recorded."}</p></div></div>
+        {nodeTitle && <div className="review-detail-links"><span>Provenance</span>{hasSubthread(nodeId, output.stageIndex ?? episode.currentStage) ? <button type="button" onClick={onOpenWork}>View Work Subthread <span aria-hidden="true">→</span></button> : <small>No Work Subthread recorded for this output.</small>}</div>}
+        <div className="review-detail-links"><span>Related evidence</span>{sourceCount > 0 ? <button type="button" onClick={onOpenSources}>Inspect sources <span aria-hidden="true">→</span></button> : <small>No linked source material recorded.</small>}</div>
       </div>
-      <div className="episode-progress-next"><div><span>Next for you</span><strong>{nextTitle}</strong><p>{nextDetail}</p></div>{nextAction && <button type="button" onClick={nextAction.onClick}>{nextAction.label}</button>}</div>
+      <footer className="review-modal-actions"><button type="button" className="review-secondary-action" onClick={() => onAsk(askPrompt)}>Ask WRX</button>{onWork && followUpAvailable && <button type="button" className="review-primary-action" onClick={() => onWork({ type: "output", value: output, label: title, title, sourceIds, parentNodeId: nodeId })}>Work on this</button>}</footer>
+    </section>
+  </div>;
+}
+
+function BoundedWorkProposalModal({ proposal, onClose, onApprove }) {
+  if (!proposal) return null;
+  return <div className="review-modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="review-modal review-proposal-modal" role="dialog" aria-modal="true" aria-label="Proposed bounded work">
+      <header className="review-modal-header"><div><div className="review-modal-eyebrow">Proposed work</div><h2>Bounded follow-up</h2><p>Review scope before creating Work for this episode.</p></div><button type="button" onClick={onClose} aria-label="Close proposed work">×</button></header>
+      <div className="review-modal-body">
+        <div className="review-proposal-section"><span>Objective</span><strong>{proposal.objective}</strong></div>
+        <div className="review-proposal-section"><span>Why</span><p>{proposal.why}</p></div>
+        <div className="review-proposal-grid"><div><span>Scope</span><p>{proposal.scope}</p></div><div><span>Inputs</span><p>{proposal.inputs}</p></div><div><span>Expected output</span><p>{proposal.expectedOutput}</p></div></div>
+        <div className="review-authority-callout"><span>Authority</span><p><strong>Allowed:</strong> inspect, compare, draft findings.</p><p><strong>Not allowed:</strong> promote package, advance stage, or make final disposition.</p></div>
+        <p className="review-proposal-origin">Created from Review → {proposal.originLabel}</p>
+      </div>
+      <footer className="review-modal-actions"><button type="button" className="review-secondary-action" onClick={onClose}>Cancel</button><button type="button" className="review-primary-action" onClick={() => onApprove(proposal)}>Approve and create Work</button></footer>
+    </section>
+  </div>;
+}
+
+function FollowUpExecutionModal({ node, onClose, onRun, busy = false }) {
+  if (!node) return null;
+  return <div className="review-modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+    <section className="review-modal review-proposal-modal" role="dialog" aria-modal="true" aria-label="Run bounded follow-up work">
+      <header className="review-modal-header"><div><div className="review-modal-eyebrow">Approved Work</div><h2>Run bounded follow-up</h2><p>Confirm the read-only execution scope before starting.</p></div><button type="button" onClick={onClose} disabled={busy} aria-label="Close follow-up execution">×</button></header>
+      <div className="review-modal-body">
+        <div className="review-proposal-section"><span>Objective</span><strong>{node.title}</strong></div>
+        <div className="review-proposal-grid"><div><span>Scope</span><p>{node.description || node.expectedOutcome}</p></div><div><span>Inputs</span><p>{node.sourceIds?.length ? `${node.sourceIds.length} approved source${node.sourceIds.length === 1 ? "" : "s"}` : "Episode context and retained review record"}</p></div><div><span>Runtime</span><p>Up to 3 local, read-only specialist turns.</p></div></div>
+        <div className="review-authority-callout"><span>Human authority</span><p><strong>Allowed:</strong> inspect, compare, and draft findings.</p><p><strong>Not allowed:</strong> change scope, advance stage, promote evidence, or make final disposition.</p></div>
+      </div>
+      <footer className="review-modal-actions"><button type="button" className="review-secondary-action" onClick={onClose} disabled={busy}>Cancel</button><button type="button" className="review-primary-action" onClick={onRun} disabled={busy}>{busy ? "Starting…" : "Run bounded work"}</button></footer>
+    </section>
+  </div>;
+}
+
+function ReviewWorkspace({ episode, run, onOpenSources, onOpenActivity, onOpenWork, onAskWrx, onInspectOutput, onWorkOnItem, onPromote, onPause, onReject, onDisposition }) {
+  const finalPackage = run?.finalPackage;
+  const findings = finalPackage?.findings ?? [];
+  const risks = finalPackage?.risks ?? [];
+  const conflicts = finalPackage?.conflicts ?? [];
+  const outputs = (episode.additions ?? []).filter(isGeneratedRunArtifact);
+  const followUpResults = (episode.additions ?? []).filter((item) => item.metadata?.reviewFollowUp);
+  const resolvedFollowUpCount = followUpResults.filter((item) => item.metadata?.reviewFollowUp?.reviewOutcome === "resolved").length;
+  const unresolvedConflictCount = Math.max(0, conflicts.length - resolvedFollowUpCount);
+  const sources = episode.sources ?? [];
+  const disposition = episode.disposition;
+  const reviewStatus = run?.humanReviewStatus;
+  const hasReviewTarget = Boolean(finalPackage || outputs.length || findings.length || risks.length || conflicts.length || sources.length || disposition || episode.currentStage === 2);
+  const recommendation = disposition
+    ? disposition === "Promote" ? "Promote reviewed package" : disposition
+    : reviewStatus === "promoted"
+    ? "Promote reviewed package"
+    : reviewStatus === "rejected"
+    ? "Reject package"
+    : unresolvedConflictCount > 0
+    ? "Revise before validation"
+    : finalPackage && sources.length === 0
+    ? "Request more evidence"
+    : finalPackage
+    ? "Promote reviewed package"
+    : hasReviewTarget
+    ? "Pause pending clarification"
+    : "No recommendation yet";
+  const recommendationWhy = unresolvedConflictCount > 0
+    ? `${unresolvedConflictCount} unresolved conflict${unresolvedConflictCount === 1 ? "" : "s"} remain in the retained package${resolvedFollowUpCount > 0 ? ` after ${resolvedFollowUpCount} follow-up result${resolvedFollowUpCount === 1 ? "" : "s"}.` : "."}`
+    : finalPackage && sources.length === 0
+    ? "The package has retained outputs, but no source is available to support the recommendation."
+    : finalPackage
+    ? "The retained package is complete enough for a human to inspect before deciding."
+    : "There is not yet a complete package to recommend from.";
+  const readiness = reviewStatus === "promoted" ? "Already promoted" : reviewStatus === "rejected" ? "Rejected" : unresolvedConflictCount > 0 || (finalPackage && sources.length === 0) ? "Not ready to promote" : finalPackage ? "Ready for human review" : "Review target is incomplete";
+  const outputState = (output) => output.metadata?.reviewFollowUp ? "Follow-up result" : output.kind === "conflict" ? "Conflicted" : output.kind === "evidence" ? "Supported" : output.requiresHuman ? "Needs review" : "Retained output";
+  const outputCanWork = (output) => !output.metadata?.reviewFollowUp && (output.kind !== "evidence" || output.requiresHuman || output.kind === "conflict");
+  const textCanWork = (text) => /(missing|unresolved|conflict|gap|insufficient|no evidence|risk|unknown|pending|contradict)/i.test(text);
+  const reviewItem = (type, value, index = 0) => ({
+    type,
+    value,
+    label: `${type[0].toUpperCase()}${type.slice(1)} #${index + 1}`,
+    title: type === "output" ? (value.title || value.label || value.taskId || `Retained output ${index + 1}`) : type === "evidence" ? (value.fileName || value.name || "Retained source") : value,
+    sourceIds: type === "output" ? (value.sourceIds ?? []) : type === "evidence" ? [value.sourceId] : [],
+    parentNodeId: type === "output" ? value.parentNodeId : null,
+  });
+
+  return (
+    <section className="mode-workspace review-workspace" aria-label="Review workspace">
+      <header className="mode-workspace-header review-workspace-header">
+        <div><span className="mode-eyebrow">Evidence + human judgment</span><h2>{hasReviewTarget ? "Human review required" : "Review the retained record"}</h2><p>{finalPackage?.summary ?? "Inspect the retained package, evidence, and unresolved questions before choosing a human-owned outcome."}</p></div>
+        <div className="review-header-actions"><button type="button" className="mode-secondary-action" onClick={onOpenActivity}>Activity</button>{sources.length > 0 && <button type="button" className="mode-secondary-action" onClick={onOpenSources}>Sources</button>}</div>
+      </header>
+
+      <div className="review-summary-grid review-summary-grid-secondary"><div><span>Stage</span><strong>{EPISODE_STAGES[episode.currentStage]?.name ?? "Not recorded"}</strong></div><div><span>Evidence</span><strong>{sources.length} source{sources.length === 1 ? "" : "s"}</strong></div><div><span>Outputs</span><strong>{outputs.length} retained</strong></div><div><span>Human authority</span><strong>Active</strong></div></div>
+
+      {!hasReviewTarget ? <section className="review-empty-state review-record-card"><div className="review-record-label">Nothing currently requires human review</div><p>No pending checkpoint, conflict, package, or disposition is waiting for a decision.</p><button type="button" className="review-secondary-action" onClick={onOpenWork}>Open Work <span aria-hidden="true">→</span></button></section> : <div className="review-content-grid review-content-grid-refined">
+        <div className="review-record-column">
+          <section className="review-record-card review-decision-package"><div className="review-record-label">Decision package</div><h3>{recommendation}</h3><div className="review-package-grid"><div><span>Why</span><p>{recommendationWhy}</p></div><div><span>Readiness</span><p>{readiness}</p></div><div><span>Recommended next action</span><p>{conflicts.length > 0 || (finalPackage && sources.length === 0) ? "Return to Work and resolve the missing review criteria." : "Inspect the retained outputs and evidence before deciding."}</p></div></div><button type="button" className="review-secondary-action review-open-work" onClick={onOpenWork}>Open Work <span aria-hidden="true">→</span></button></section>
+
+          <section className="review-record-card review-items-card"><div className="review-record-label">Items needing review</div>{outputs.length ? <div className="review-items-list">{outputs.map((output, index) => { const item = reviewItem("output", output, index); return <article key={output.id}><div><strong>{item.title}</strong><small>{outputState(output)}</small></div><ReviewActionButtons onInspect={() => onInspectOutput({ ...output, followUpAvailable: outputCanWork(output) })} onAsk={() => onAskWrx(`Ask WRX about this retained output: ${item.title}`)} onWork={outputCanWork(output) ? () => onWorkOnItem(item) : undefined} /></article>; })}</div> : <p>No retained outputs are available for inspection yet.</p>}</section>
+
+          <section className="review-record-card review-evidence-card"><div className="review-record-label">Evidence</div>{sources.length ? <><p className="review-card-intro">{sources.length} retained source{sources.length === 1 ? "" : "s"} available to inspect.</p><div className="review-evidence-list">{sources.map((source, index) => { const item = reviewItem("evidence", source, index); return <article key={source.sourceId || source.id || source.fileName}><span aria-hidden="true">✓</span><div><strong>{source.fileName || source.name || "Retained source"}</strong><small>{source.title || "Retained evidence for this package."}</small></div><ReviewActionButtons onInspect={onOpenSources} onAsk={() => onAskWrx(`Ask WRX about this evidence: ${source.fileName || source.name || "retained source"}`)} onWork={() => onWorkOnItem(item)} workLabel="Verify evidence" /></article>; })}</div></> : <><p>No retained evidence supports this package yet.</p><p className="review-card-muted">The current review is based on retained outputs and episode context only.</p><button type="button" className="review-secondary-action" onClick={onOpenWork}>Open Work <span aria-hidden="true">→</span></button></>}</section>
+
+          <section className="review-record-card"><div className="review-record-label">Findings</div>{findings.length ? <div className="review-text-item-list">{findings.map((finding, index) => { const item = reviewItem("finding", finding, index); return <article key={`${finding}-${index}`}><p>{finding}</p><ReviewActionButtons onInspect={() => onInspectOutput({ id: `finding-${index}`, kind: "finding", title: "Finding", body: finding, sourceIds: finalPackage?.evidenceSourceIds ?? [], followUpAvailable: textCanWork(finding) })} onAsk={() => onAskWrx(`Ask WRX about this finding: ${finding}`)} onWork={textCanWork(finding) ? () => onWorkOnItem(item) : undefined} /></article>; })}</div> : <p>No findings have been retained for this episode yet.</p>}</section>
+          <section className="review-record-card review-risks-card"><div className="review-record-label">Conflicts &amp; risks {conflicts.length > 0 && <small>{conflicts.length} unresolved</small>}</div>{risks.length || conflicts.length ? <div className="review-text-item-list">{[...risks.map((risk) => ({ value: risk, type: "risk" })), ...conflicts.map((conflict) => ({ value: conflict, type: "conflict" }))].map(({ value, type }, index) => { const item = reviewItem(type, value, index); return <article key={`${value}-${index}`}><p>{value}</p><ReviewActionButtons onInspect={() => onInspectOutput({ id: `${type}-${index}`, kind: type, title: type === "conflict" ? "Conflict" : "Risk", body: value, sourceIds: finalPackage?.evidenceSourceIds ?? [], followUpAvailable: textCanWork(value) })} onAsk={() => onAskWrx(`Ask WRX about this ${type}: ${value}`)} onWork={textCanWork(value) ? () => onWorkOnItem(item) : undefined} workLabel={type === "conflict" ? "Investigate conflict" : "Work on this"} /></article>; })}</div> : <p>No explicit conflicts or risks recorded.</p>}</section>
+          <section className="review-record-card"><div className="review-record-label">Interpretation</div><p>{finalPackage?.recommendedNextStep ?? "Review the retained evidence and decide the smallest justified next action."}</p></section>
+        </div>
+
+        <aside className="review-decision-card review-decision-card-refined"><span className="mode-eyebrow">Human decision</span><div className="review-recommendation-label">WRX recommendation</div><h3>{recommendation}</h3><p>You remain the final authority. WRX recommendations are inspectable and never change disposition automatically.</p>{finalPackage && reviewStatus !== "promoted" && reviewStatus !== "rejected" && <><button type="button" className="review-primary-action" onClick={onPromote}>{recommendation === "Promote reviewed package" ? "Accept recommendation" : "Promote package"}</button><button type="button" className="review-secondary-action" onClick={onOpenWork}>Return to Work <span aria-hidden="true">→</span></button><button type="button" className="review-secondary-action" onClick={onPause}>Pause review</button><button type="button" className="review-danger-action" onClick={onReject}>Reject package</button></>}{reviewStatus === "promoted" && <div className="review-recorded-state">Promote package was recorded by a human.</div>}{reviewStatus === "rejected" && <div className="review-recorded-state">Reject package was recorded by a human.</div>}{!disposition && episode.currentStage === 2 && <div className="review-disposition-actions"><button type="button" onClick={() => onDisposition("Revise")}>Revise</button><button type="button" onClick={() => onDisposition("Pause")}>Pause</button><button type="button" onClick={() => onDisposition("Stop")}>Stop</button><button type="button" className="primary" onClick={() => onDisposition("Promote")}>Promote</button></div>}</aside>
+      </div>}
+    </section>
+  );
+}
+
+function CollectionWorkspace({ view, episodes, projects, onOpenEpisode }) {
+  const projectName = (episode) => projects.find((project) => project.id === episode.projectId)?.name ?? "Unassigned";
+  const stageName = (episode) => EPISODE_STAGES[episode.currentStage]?.name ?? "Stage not recorded";
+  const needsReview = episodes.filter((episode) => episode.autopilotRun?.finalPackage && !["promoted", "rejected"].includes(episode.autopilotRun.humanReviewStatus));
+  const active = episodes.filter((episode) => episode.status === "active");
+  const drafts = episodes.filter((episode) => ["intent-review", "pending", "proposed"].includes(episode.intake?.status));
+  const archived = episodes.filter((episode) => episode.status === "archived");
+  const needsInput = episodes.filter((episode) => episode.intake?.status === "pending" || episode.conversation?.status === "pending" || (episode.additions ?? []).some((item) => item.kind === "thread" && item.status === "pending"));
+
+  const sections = view === "needs-review"
+    ? [{ label: "Episodes", items: needsReview, action: "review", empty: "Nothing currently requires human review." }]
+    : view === "active"
+    ? [{ label: "Active episodes", items: active, action: "overview", empty: "No active episodes." }]
+    : view === "drafts"
+    ? [{ label: "Draft episodes", items: drafts, action: "overview", empty: "No drafts." }]
+    : view === "archive"
+    ? [{ label: "Archived episodes", items: archived, action: "overview", empty: "No archived episodes." }]
+    : [
+      { label: "Needs your review", items: needsReview, action: "review" },
+      { label: "Needs your input", items: needsInput.filter((episode) => !needsReview.includes(episode)), action: "overview" },
+      { label: "Active", items: active.filter((episode) => !needsReview.includes(episode) && !needsInput.includes(episode)), action: "overview" },
+    ].filter((section) => section.items.length > 0);
+
+  const itemCount = view === "my-work"
+    ? new Set(sections.flatMap((section) => section.items.map((episode) => episode.id))).size
+    : sections[0]?.items.length ?? 0;
+  const title = view === "my-work" ? "My work" : view === "needs-review" ? "Needs review" : view[0].toUpperCase() + view.slice(1);
+  const description = view === "my-work"
+    ? "Human-owned actions waiting across the workspace."
+    : view === "needs-review"
+    ? "Human judgment and validation waiting for you."
+    : view === "active"
+    ? "All currently active episodes in this workspace."
+    : view === "drafts"
+    ? "Episodes still being prepared or awaiting intake confirmation."
+    : "Completed or archived episodes retained for reference.";
+
+  return (
+    <section className="collection-workspace" aria-label={`${title} collection`}>
+      <header className="collection-header">
+        <div><span className="mode-eyebrow">Workspace collection</span><h2>{title} {itemCount > 0 && <small>{itemCount}</small>}</h2><p>{description}</p></div>
+      </header>
+      <div className="collection-list">
+        {sections.length > 0 ? sections.map((section) => (
+          <section className="collection-section" key={section.label}>
+            <div className="collection-section-heading"><span>{section.label}</span><small>{section.items.length}</small></div>
+            {section.items.length > 0 ? <div className="collection-items">
+              {section.items.map((episode) => (
+                <article className="collection-item" key={`${section.label}-${episode.id}`}>
+                  <div className="collection-item-copy"><span className="collection-item-id">{episode.id}</span><strong>{episode.name || deriveEpisodeName(episode.title)}</strong><small>{projectName(episode)} · Stage {episode.currentStage + 1} · {stageName(episode)}</small>{section.action === "review" && <em>{episode.autopilotRun?.finalPackage?.conflicts?.length ? `${episode.autopilotRun.finalPackage.conflicts.length} unresolved conflict${episode.autopilotRun.finalPackage.conflicts.length === 1 ? "" : "s"}` : "Human review required"}</em>}{section.action !== "review" && episode.autopilotRun?.status === "working" && <em>Work in progress</em>}</div>
+                  <button type="button" onClick={() => onOpenEpisode(episode, section.action)}>{section.action === "review" ? "Review" : "Open"} <span aria-hidden="true">→</span></button>
+                </article>
+              ))}
+            </div> : <div className="collection-empty"><strong>{section.empty ?? "No items in this collection."}</strong><p>{view === "needs-review" ? "New checkpoints, evidence conflicts, and disposition requests will appear here." : view === "my-work" ? "Human-owned requests and review tasks will appear here as work progresses." : "This collection reflects only recorded workspace state."}</p></div>}
+          </section>
+        )) : <div className="collection-empty"><strong>{view === "my-work" ? "Nothing currently needs your attention." : "No items in this collection."}</strong><p>{view === "needs-review" ? "New checkpoints, evidence conflicts, and disposition requests will appear here." : view === "my-work" ? "Human-owned requests and review tasks will appear here as work progresses." : "This collection reflects only recorded workspace state."}</p></div>}
+      </div>
+    </section>
+  );
+}
+
+function WorkroomOverview({ episodes, projects, onOpenEpisode, onOpenCollection, onOpenProject }) {
+  const needsReview = episodes.filter((episode) => episode.autopilotRun?.finalPackage && !["promoted", "rejected"].includes(episode.autopilotRun.humanReviewStatus));
+  const active = episodes.filter((episode) => episode.status === "active");
+  const drafts = episodes.filter((episode) => ["intent-review", "pending", "proposed"].includes(episode.intake?.status));
+  const archived = episodes.filter((episode) => episode.status === "archived");
+  const needsInput = episodes.filter((episode) => episode.intake?.status === "pending" || episode.conversation?.status === "pending" || (episode.additions ?? []).some((item) => item.kind === "thread" && item.status === "pending"));
+  const projectName = (episode) => projects.find((project) => project.id === episode.projectId)?.name ?? "Unassigned";
+  const episodeTimestamp = (episode) => episode.activity?.at(-1)?.timestamp ?? null;
+  const formatTime = (timestamp) => timestamp ? new Date(timestamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "Not recorded";
+  const attention = [...new Map([...needsReview, ...needsInput].map((episode) => [episode.id, episode])).values()].sort((a, b) => (episodeTimestamp(b) ?? "").localeCompare(episodeTimestamp(a) ?? "")).slice(0, 5);
+  const recentActivity = episodes.flatMap((episode) => (episode.activity ?? []).map((event) => ({ event, episode }))).filter(({ event }) => {
+    const value = `${event.title ?? ""} ${event.type ?? ""}`.toLowerCase();
+    return /(complete|evidence|review|disposition|conflict|authoriz|decision|retained|package)/.test(value) && !/(turn|task_started|run_started|agent_started)/.test(value);
+  }).sort((a, b) => (b.event.timestamp ?? "").localeCompare(a.event.timestamp ?? "")).slice(0, 5);
+  const activeByProject = projects.map((project) => ({ project, count: active.filter((episode) => episode.projectId === project.id).length })).filter((item) => item.count > 0);
+  const unassignedActiveCount = active.filter((episode) => !episode.projectId).length;
+  if (unassignedActiveCount > 0) activeByProject.push({ project: { id: "unassigned", name: "Unassigned" }, count: unassignedActiveCount });
+  const recentEpisodes = [...episodes].filter((episode) => episodeTimestamp(episode)).sort((a, b) => episodeTimestamp(b).localeCompare(episodeTimestamp(a))).slice(0, 5);
+  const openEpisode = (episode, destination = "overview") => onOpenEpisode(episode, destination);
+
+  return (
+    <section className="workroom-overview" aria-label="Workroom overview">
+      <header className="workroom-overview-header">
+        <span className="mode-eyebrow">Workroom overview</span>
+        <h1>Current state across all projects and episodes.</h1>
+        <p>Operational signals, human checkpoints, and recent change across WRX.</p>
+      </header>
+
+      <div className="workroom-overview-counts" aria-label="Workroom counts">
+        <button type="button" onClick={() => onOpenCollection("active")}><strong>{active.length}</strong><span>Active</span></button>
+        <button type="button" onClick={() => onOpenCollection("needs-review")}><strong>{needsReview.length}</strong><span>Need review</span></button>
+        <button type="button" onClick={() => onOpenCollection("drafts")}><strong>{drafts.length}</strong><span>Drafts</span></button>
+        <button type="button" onClick={() => onOpenCollection("archive")}><strong>{archived.length}</strong><span>Archived</span></button>
+      </div>
+
+      <div className="workroom-overview-grid">
+        <section className="workroom-overview-card workroom-attention-card">
+          <div className="workroom-section-heading"><div><span className="mode-eyebrow">Needs attention</span><h2>Where to look next</h2></div><button type="button" onClick={() => onOpenCollection("needs-review")}>View all <span aria-hidden="true">→</span></button></div>
+          {attention.length ? <div className="workroom-attention-list">{attention.map((episode) => <article key={episode.id}><div><span>{episode.id}</span><strong>{episode.name || deriveEpisodeName(episode.title)}</strong><small>{episode.autopilotRun?.finalPackage?.conflicts?.length ? `${episode.autopilotRun.finalPackage.conflicts.length} unresolved conflict${episode.autopilotRun.finalPackage.conflicts.length === 1 ? "" : "s"}` : needsReview.includes(episode) ? "Human review required" : "Human input required"}</small></div><button type="button" onClick={() => openEpisode(episode, needsReview.includes(episode) ? "review" : "overview")}>{needsReview.includes(episode) ? "Review" : "Open"} <span aria-hidden="true">→</span></button></article>)}</div> : <div className="workroom-overview-empty">Nothing needs your attention right now.</div>}
+        </section>
+
+        <section className="workroom-overview-card workroom-activity-card">
+          <div className="workroom-section-heading"><div><span className="mode-eyebrow">Recent activity</span><h2>What changed</h2></div></div>
+          {recentActivity.length ? <div className="workroom-activity-list">{recentActivity.map(({ event, episode }) => <button type="button" key={`${episode.id}-${event.id}`} onClick={() => openEpisode(episode)}><span className="workroom-activity-dot" aria-hidden="true" /><span><strong>{event.title || "Workroom activity"}</strong><small>{episode.id} · {formatTime(event.timestamp)}</small></span><span aria-hidden="true">→</span></button>)}</div> : <div className="workroom-overview-empty">No recent Workroom activity.</div>}
+        </section>
+      </div>
+
+      <div className="workroom-overview-grid workroom-overview-grid-lower">
+        <section className="workroom-overview-card">
+          <div className="workroom-section-heading"><div><span className="mode-eyebrow">Active by project</span><h2>Where work is moving</h2></div></div>
+          {activeByProject.length ? <div className="workroom-project-list">{activeByProject.map(({ project, count }) => <button type="button" key={project.id} onClick={() => onOpenProject(project.id)}><span>{project.name.replace(/\s+and WebMCP Experiments$/i, " + WebMCP").replace(/\s+validation rerun$/i, " validation")}</span><strong>{count} active</strong><span aria-hidden="true">→</span></button>)}</div> : <div className="workroom-overview-empty">No active episodes.</div>}
+        </section>
+
+        <section className="workroom-overview-card">
+          <div className="workroom-section-heading"><div><span className="mode-eyebrow">Recent episodes</span><h2>Recently updated</h2></div></div>
+          {recentEpisodes.length ? <div className="workroom-recent-episodes">{recentEpisodes.map((episode) => <button type="button" key={episode.id} onClick={() => openEpisode(episode)}><span className="workroom-recent-id">{episode.id}</span><span><strong>{episode.name || deriveEpisodeName(episode.title)}</strong><small>{projectName(episode)} · Stage {episode.currentStage + 1} · {formatTime(episodeTimestamp(episode))}</small></span><span aria-hidden="true">→</span></button>)}</div> : <div className="workroom-overview-empty">No recently updated episodes.</div>}
+        </section>
+      </div>
     </section>
   );
 }
@@ -2905,12 +3489,79 @@ function NodeOrchestrationWindow({
 function ConversationMessages({
   thread,
   compact = false,
+  onOpenWork,
+  onOpenSources,
+  episodeLevel = false,
 }) {
   const messages = thread?.messages ?? [];
   const visibleMessages = compact
     ? messages.slice(-4)
     : messages;
   const pending = thread?.status === "pending";
+
+  function renderMessageContent(message) {
+    const content = message.content ?? "";
+    const cleanAgentLine = (line) => line.replace(/^-\s*/, "").replace(/\*\*/g, "").trim();
+    const lowLevelRuntimeError = /^(not found|404|cannot\s+(?:get|post|put|patch|delete)\s+|internal server error|failed to fetch)$/i.test(content.trim());
+    const latestAgentMessageId = [...messages].reverse().find((item) => item.role === "agent")?.id;
+    const failedResponse = message.role === "agent" && (lowLevelRuntimeError || (message.id === latestAgentMessageId && ["error", "cancelled"].includes(thread?.status)));
+    if (failedResponse) {
+      return <div className="conversation-fallback-response">
+        {!episodeLevel && <strong>WRX</strong>}
+        <p>I couldn't produce a grounded response from the current episode context.</p>
+        {!lowLevelRuntimeError && content.trim() && <small>Runtime reason: {content}</small>}
+        <span>You can:</span>
+        <ul><li>clarify the question</li><li>inspect current Work</li><li>review retained evidence</li></ul>
+        {(onOpenWork || onOpenSources) && <div className="conversation-fallback-actions">{onOpenWork && <button type="button" className="mode-link-action" onClick={onOpenWork}>Open Work <span aria-hidden="true">→</span></button>}{onOpenSources && <button type="button" className="mode-link-action" onClick={onOpenSources}>Review evidence <span aria-hidden="true">→</span></button>}</div>}
+      </div>;
+    }
+    if (message.role !== "agent") {
+      const boundaryStart = content.indexOf("Based only on the accepted Episode context:");
+      const rulesStart = content.indexOf("Do not treat proposals as approved decisions.");
+      if (boundaryStart === 0 && rulesStart > boundaryStart) {
+        const question = content.slice("Based only on the accepted Episode context:".length, rulesStart).trim();
+        const rules = content.slice(rulesStart).split("\n").map((line) => line.trim()).filter(Boolean);
+        return <>
+          <div className="drawer-message-bubble">{question}</div>
+          <div className="conversation-system-boundary">
+            <div className="conversation-system-label"><span aria-hidden="true">▣</span>System boundary</div>
+            <p>Based only on the accepted Episode context:</p>
+            <strong className="conversation-system-subheading">Agent may not</strong>
+            <ul>{rules.map((rule) => <li key={rule}>{rule.replace(/^Do not /, "")}</li>)}</ul>
+          </div>
+        </>;
+      }
+    }
+
+    if (message.role === "agent") {
+      const sectionPattern = /(?:^|\n)(Established facts|Uncertainties|Evidence needed|Human judgment required)\n/g;
+      const headingPattern = /(?:^|\n)#{1,3}\s+([^\n]+)\n/g;
+      const matches = [...content.matchAll(sectionPattern)];
+      const headingMatches = matches.length ? [] : [...content.matchAll(headingPattern)];
+      const structuredMatches = matches.length ? matches : headingMatches;
+      if (structuredMatches.length) {
+        return <div className="conversation-agent-structure">{structuredMatches.map((match, index) => {
+          const bodyStart = match.index + match[0].length;
+          const bodyEnd = structuredMatches[index + 1]?.index ?? content.length;
+          const lines = content.slice(bodyStart, bodyEnd).split("\n").map((line) => line.trim()).filter(Boolean);
+          return <section key={match[1]}><strong>{match[1]}</strong><ul>{lines.map((line) => <li key={line}>{cleanAgentLine(line)}</li>)}</ul></section>;
+        })}</div>;
+      }
+
+      const lines = content.split("\n").map((line) => line.trim()).filter(Boolean);
+      const firstBullet = lines.findIndex((line) => /^-\s+/.test(line));
+      if (firstBullet >= 0) {
+        const intro = lines.slice(0, firstBullet).join(" ");
+        const bullets = lines.slice(firstBullet);
+        return <div className="conversation-agent-structure">
+          {intro && <p className="conversation-agent-intro">{intro}</p>}
+          <section><strong>Agent response</strong><ul>{bullets.map((line) => <li key={line}>{cleanAgentLine(line)}</li>)}</ul></section>
+        </div>;
+      }
+    }
+
+    return <div className="drawer-message-bubble">{content}</div>;
+  }
 
   return (
     <div className="conversation-messages">
@@ -2932,11 +3583,9 @@ function ConversationMessages({
         >
           <div className="drawer-message-inner">
             <div className="drawer-message-role">
-              {message.role === "human" ? "You" : "Agent"}
+              {message.role === "human" ? "You" : episodeLevel ? "WRX" : "Agent"}
             </div>
-            <div className="drawer-message-bubble">
-              {message.content}
-            </div>
+            {renderMessageContent(message)}
           </div>
         </div>
       ))}
@@ -2960,9 +3609,15 @@ function ConversationMessages({
 function ConversationComposer({
   thread,
   onSend,
+  episodeLevel = false,
+  initialDraft = "",
 }) {
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft] = useState(initialDraft);
   const pending = thread?.status === "pending";
+
+  useEffect(() => {
+    setDraft(initialDraft);
+  }, [initialDraft]);
 
   function submit(event) {
     event.preventDefault();
@@ -2987,6 +3642,8 @@ function ConversationComposer({
           placeholder={
             pending
               ? "Waiting for the agent to respond..."
+              : episodeLevel
+              ? "Message WRX about this episode..."
               : thread
               ? "Continue this node conversation..."
               : "Ask the agent about this node..."
@@ -2999,7 +3656,7 @@ function ConversationComposer({
             className="drawer-send-button"
             disabled={pending || !draft.trim()}
           >
-            Ask agent
+            {episodeLevel ? "Ask WRX" : "Ask agent"}
           </button>
         </div>
       </div>
@@ -3115,7 +3772,7 @@ function AnchoredConversationCard({
       ref={cardRef}
       className={`anchored-conversation ${placement}`}
       style={{ left: position.left, top: position.top }}
-      aria-label={`Conversation for ${anchorTitle}`}
+      aria-label={`Work Subthread for ${anchorTitle}`}
     >
       <span
         className="anchored-conversation-connector"
@@ -3124,7 +3781,7 @@ function AnchoredConversationCard({
 
       <header className="anchored-conversation-header">
         <div className="anchored-conversation-copy">
-          <div className="drawer-eyebrow">{anchorType}</div>
+          <div className="drawer-eyebrow">Work Subthread · {anchorType}</div>
           <h2>{anchorTitle}</h2>
           <div className="anchored-conversation-stage">
             {episode.id} · {EPISODE_STAGES[thread?.stageIndex ?? stageIndex]?.name}
@@ -3150,7 +3807,7 @@ function AnchoredConversationCard({
           <button type="button" onClick={onFullscreen} aria-label="Open full-screen conversation">
             ⛶
           </button>
-          <button type="button" onClick={onMinimize} aria-label="Minimize node conversation">
+          <button type="button" onClick={onMinimize} aria-label="Minimize Work Subthread">
             —
           </button>
         </div>
@@ -3199,7 +3856,7 @@ function FullscreenConversation({
       <section className="fullscreen-conversation" role="dialog" aria-modal="true">
         <header className="fullscreen-conversation-header">
           <div>
-            <div className="drawer-eyebrow">Focused node conversation</div>
+            <div className="drawer-eyebrow">Focused Work Subthread</div>
             <h2>{anchorTitle}</h2>
             <div className="drawer-anchor-meta">
               <span>{episode.id}</span>
@@ -3291,8 +3948,13 @@ function NodeChatDrawer({
   sourceManifest = [],
   nodeSourceManifest = [],
   onOpenSource,
+  onOpenSources,
+  onOpenActivity,
+  onOpenReview,
   onAttachSources,
   onExportReview,
+  onRunFollowUp,
+  followUpExecutionBusy = false,
   attachmentsBusy = false,
 }) {
   const [
@@ -3412,7 +4074,7 @@ function NodeChatDrawer({
       <header className="drawer-header">
         <div className="drawer-header-copy">
           <div className="drawer-eyebrow">
-            {view === "details" ? "Branch node details" : "Node conversation"}
+            {view === "details" ? "Work subthread details" : "Work Subthread"}
           </div>
 
           <h2>
@@ -3444,13 +4106,13 @@ function NodeChatDrawer({
           type="button"
           className="drawer-close"
           onClick={onClose}
-          aria-label="Close node conversation"
+          aria-label="Close Work Subthread"
         >
           ×
         </button>
       </header>
 
-      <div className="drawer-tabs" role="tablist" aria-label="Node surface">
+      <div className="drawer-tabs" role="tablist" aria-label="Work Subthread surface">
         <button type="button" className={view === "details" ? "active" : ""} role="tab" aria-selected={view === "details"} onClick={() => setView("details")}>Details</button>
         <button type="button" className={view === "conversation" ? "active" : ""} role="tab" aria-selected={view === "conversation"} onClick={() => setView("conversation")}>Conversation</button>
       </div>
@@ -3459,6 +4121,12 @@ function NodeChatDrawer({
         <div className="drawer-node-details">
           <div className="drawer-detail-eyebrow">{nodeDetails?.state ?? "Node details"} · {nodeDetails?.kind ?? anchorType}</div>
           <h3>{anchorTitle}</h3>
+          {nodeDetails?.status && <div className="drawer-detail-status"><StatusIndicator status={nodeDetails.status.tone} label={nodeDetails.status.label} size="sm" /></div>}
+          {nodeDetails?.triggeredBy && <section><span>Triggered by</span><p>{nodeDetails.triggeredBy}</p></section>}
+          {nodeDetails?.authority && <section><span>Authorization</span><p>{nodeDetails.authority}</p></section>}
+          {nodeDetails?.evidenceCount > 0 ? <section><span>Evidence</span><p>{nodeDetails.evidenceCount} retained source{nodeDetails.evidenceCount === 1 ? "" : "s"}</p></section> : nodeDetails?.sourceReferences ? <section><span>Evidence</span><p>No retained evidence</p></section> : null}
+          {nodeDetails?.result && <section><span>Result</span><p>{nodeDetails.result}</p></section>}
+          {nodeDetails?.followUp && <section className="drawer-follow-up-panel"><div className="drawer-agent-output-heading"><span>Follow-up Work</span><em>{nodeDetails.followUp.status}</em></div><p>Created from Review → {nodeDetails.followUp.origin?.label ?? "review item"}</p><p>Read-only bounded analysis; human disposition remains unchanged.</p>{nodeDetails.followUp.error && <p className="drawer-error-text">{nodeDetails.followUp.error}</p>}{nodeDetails.followUp.result && <p><strong>Result:</strong> {nodeDetails.followUp.result}</p>}{nodeDetails.followUp.status !== "completed" && <button type="button" className="drawer-ask-agent-button" onClick={() => onRunFollowUp?.()} disabled={followUpExecutionBusy || nodeDetails.followUp.status === "running"}>{nodeDetails.followUp.status === "failed" ? "Retry bounded work" : followUpExecutionBusy ? "Starting…" : "Run bounded work"}</button>}</section>}
           {anchorNodeId === "context" && (
             <section>
               <span>Full context</span>
@@ -3483,8 +4151,13 @@ function NodeChatDrawer({
             <div className="drawer-agent-next-step"><strong>Recommended next step</strong><p>{nodeDetails.agentOutput.recommendedNextStep || "Review the retained findings before deciding the next human action."}</p></div>
             <button type="button" className="drawer-export-review-button" onClick={() => onExportReview?.(nodeDetails)}>Download review (.md)</button>
           </section>}
-          {nodeDetails?.authority && <section><span>Authority</span><p>{nodeDetails.authority}</p></section>}
           {nodeDetails?.acceptedAt && <section><span>Accepted by human</span><p>{new Date(nodeDetails.acceptedAt).toLocaleString()}</p></section>}
+          <div className="drawer-detail-actions">
+            <button type="button" onClick={() => { setView("conversation"); window.setTimeout(() => composerRef.current?.focus(), 0); }}>View Work Subthread <span aria-hidden="true">→</span></button>
+            {nodeDetails?.evidenceCount > 0 && onOpenSources && <button type="button" onClick={onOpenSources}>Review evidence <span aria-hidden="true">→</span></button>}
+            {onOpenActivity && <button type="button" onClick={onOpenActivity}>View activity <span aria-hidden="true">→</span></button>}
+            {nodeDetails?.kind === "gate" && onOpenReview && <button type="button" onClick={onOpenReview}>Open Review <span aria-hidden="true">→</span></button>}
+          </div>
           <button type="button" className="drawer-ask-agent-button" onClick={() => { setView("conversation"); window.setTimeout(() => composerRef.current?.focus(), 0); }}>Ask agent about this node</button>
         </div>
       )}
@@ -3492,7 +4165,7 @@ function NodeChatDrawer({
       {view === "conversation" && <div className="drawer-thread">
         <section className="drawer-node-sources">
           <div>
-            <span className="drawer-eyebrow">Node context</span>
+            <span className="drawer-eyebrow">Work Subthread context</span>
             <strong>{nodeSourceManifest.length ? `${nodeSourceManifest.length} attached source${nodeSourceManifest.length === 1 ? "" : "s"}` : "No node-specific sources"}</strong>
           </div>
           {nodeSourceManifest.length > 0 && <div className="drawer-source-list">{nodeSourceManifest.map((source) => <button type="button" key={source.sourceId} onClick={() => onOpenSource(source.sourceId)}>{source.fileName}</button>)}</div>}
@@ -3599,8 +4272,8 @@ function NodeChatDrawer({
               pending
                 ? "Waiting for the agent to respond..."
                 : thread
-                ? "Continue this node conversation..."
-                : "Ask the agent about this node..."
+                ? "Continue this Work Subthread..."
+                : "Ask WRX about this Work Subthread..."
             }
           />
 
@@ -3720,6 +4393,7 @@ export default function App() {
 
   const [projects, setProjects] = useState(() => loadProjects());
   const [projectModalOpen, setProjectModalOpen] = useState(false);
+  const [sidebarCreateMenuOpen, setSidebarCreateMenuOpen] = useState(false);
   const [editingProject, setEditingProject] = useState(null);
   const [openProjectMenuId, setOpenProjectMenuId] = useState(null);
   const [openEpisodeMenuId, setOpenEpisodeMenuId] = useState(null);
@@ -3727,8 +4401,8 @@ export default function App() {
   const [renamingEpisode, setRenamingEpisode] = useState(null);
   const [episodeSearch, setEpisodeSearch] = useState("");
   const [expandedProjects, setExpandedProjects] = useState({});
+  const showArchivedEpisodes = false;
   const [newEpisodeProjectId, setNewEpisodeProjectId] = useState(null);
-  const [workflowExpanded, setWorkflowExpanded] = useState(true);
 
   const [
     activeEpisodeId,
@@ -3742,6 +4416,9 @@ export default function App() {
     viewStage,
     setViewStage,
   ] = useState(0);
+
+  const [workspaceMode, setWorkspaceMode] = useState("overview");
+  const [collectionView, setCollectionView] = useState("workroom-overview");
 
   const [
     sidebarOpen,
@@ -3773,9 +4450,7 @@ export default function App() {
     setActivityOpen,
   ] = useState(false);
 
-  const [activitySeenByEpisode, setActivitySeenByEpisode] = useState({});
   const [notificationsOpen, setNotificationsOpen] = useState(false);
-  const [notificationSeenByEpisode, setNotificationSeenByEpisode] = useState({});
 
   const [
     drawerView,
@@ -3833,18 +4508,22 @@ export default function App() {
   const [codexRun, setCodexRun] = useState(null);
   const codexEventSourceRef = useRef(null);
   const orchestrationEventSourceRef = useRef(null);
+  const followUpEventSourceRef = useRef(null);
   const autopilotEventSourceRef = useRef(null);
   const [orchestrationRun, setOrchestrationRun] = useState(null);
   const [autopilotRun, setAutopilotRun] = useState(null);
   const [followAutopilotWork, setFollowAutopilotWork] = useState(true);
   const [showGeneratedArtifacts, setShowGeneratedArtifacts] = useState(false);
   const [showAutopilotInspector, setShowAutopilotInspector] = useState(true);
-  const [showEpisodeCockpit, setShowEpisodeCockpit] = useState(false);
-  const [showCanvasHeader, setShowCanvasHeader] = useState(true);
   const [agentNotifications, setAgentNotifications] = useState([]);
   const [sourceViewerId, setSourceViewerId] = useState(null);
   const [sourceLibraryOpen, setSourceLibraryOpen] = useState(false);
   const [nodeSourceBusy, setNodeSourceBusy] = useState(false);
+  const [reviewOutputDetail, setReviewOutputDetail] = useState(null);
+  const [reviewProposal, setReviewProposal] = useState(null);
+  const [followUpExecutionNodeId, setFollowUpExecutionNodeId] = useState(null);
+  const [followUpExecutionRun, setFollowUpExecutionRun] = useState(null);
+  const [episodeConversationPrompt, setEpisodeConversationPrompt] = useState("");
 
   const [
     viewportRevision,
@@ -3983,7 +4662,6 @@ export default function App() {
       activeEpisode.currentStage
     );
 
-    setWorkflowExpanded(true);
 
     setSelectedNodeId(
       null
@@ -4012,9 +4690,14 @@ export default function App() {
     setOrchestrationPreviews(activeEpisode.runtime?.codex?.orchestration ?? {});
     setOrchestrationRun(null);
     setAutopilotRun(activeEpisode.autopilotRun ?? null);
+    setReviewOutputDetail(null);
+    setReviewProposal(null);
+    setFollowUpExecutionNodeId(null);
+    setFollowUpExecutionRun(null);
+    setEpisodeConversationPrompt("");
     setFollowAutopilotWork(Boolean(activeEpisode.autopilotRun?.status === "working"));
     setIntakePanelOpen(
-      ["pending", "proposed"].includes(activeEpisode.intake?.status)
+      ["intent-review", "pending", "proposed"].includes(activeEpisode.intake?.status)
     );
   }, [activeEpisodeId]);
 
@@ -4060,6 +4743,103 @@ export default function App() {
       activeEpisodeId,
       updater
     );
+  }
+
+  function askAboutReviewItem(prompt) {
+    if (!activeEpisode || !prompt) return;
+    setReviewOutputDetail(null);
+    setReviewProposal(null);
+    setEpisodeConversationPrompt(prompt);
+    setCollectionView(null);
+    setWorkspaceMode("conversation");
+  }
+
+  function proposeReviewFollowUp(item) {
+    if (!activeEpisode || !item) return;
+    const sourceIds = [...new Set(item.sourceIds ?? [])].filter((sourceId) => activeEpisode.sources?.some((source) => source.sourceId === sourceId));
+    const sourceNames = sourceIds.map((sourceId) => activeEpisode.sources.find((source) => source.sourceId === sourceId)?.fileName).filter(Boolean);
+    const valueText = typeof item.value === "string" ? item.value : item.value?.summary || item.value?.body || "Retained output requires human inspection.";
+    const title = item.title || valueText || "Review item";
+    const type = item.type || "review item";
+    const objective = type === "evidence"
+      ? `Verify whether ${title} sufficiently supports the current evaluation claim.`
+      : type === "conflict"
+      ? `Investigate the unresolved conflict: ${title}`
+      : type === "risk"
+      ? `Bound the review risk: ${title}`
+      : type === "finding"
+      ? `Resolve the review finding: ${title}`
+      : `Resolve the retained review output: ${title}`;
+    setReviewProposal({
+      originLabel: item.label || title,
+      originType: type,
+      objective,
+      why: valueText || title,
+      scope: `Current episode (${activeEpisode.id}) · approved sources only · read-only inspection`,
+      inputs: sourceNames.length ? sourceNames.join(", ") : "Episode objective, retained outputs, and recorded review context",
+      expectedOutput: type === "evidence" ? "Evidence-backed support assessment and draft findings" : type === "conflict" ? "Evidence-backed conflict assessment" : "Evidence-backed assessment and draft findings",
+      sourceIds,
+      parentNodeId: item.parentNodeId || (activeEpisode.currentStage === 0 ? "work" : activeEpisode.currentStage === 1 ? "evidence" : "human"),
+    });
+  }
+
+  function approveReviewFollowUp(proposal) {
+    if (!activeEpisode || !proposal) return;
+    const stageIndex = activeEpisode.currentStage;
+    const parentNodeId = proposal.parentNodeId || (stageIndex === 0 ? "work" : stageIndex === 1 ? "evidence" : "human");
+    const id = `review-follow-up-${crypto.randomUUID()}`;
+    const position = makeAdditionPosition(activeEpisode, stageIndex, parentNodeId);
+    const node = {
+      id,
+      kind: "action",
+      type: "action",
+      label: "Bounded follow-up",
+      title: proposal.objective,
+      body: proposal.expectedOutput,
+      meta: proposal.why,
+      description: proposal.objective,
+      rationale: proposal.why,
+      expectedOutcome: proposal.expectedOutput,
+      sourceIds: proposal.sourceIds ?? [],
+      stageIndex,
+      parentNodeId,
+      position,
+      status: "ready",
+      metadata: {
+        reviewOrigin: { type: proposal.originType, label: proposal.originLabel },
+        requestedBy: "human",
+        authority: "human-approved-scope",
+        approvalRecordedAt: new Date().toISOString(),
+        execution: {
+          status: "ready",
+          runId: null,
+          taskStates: {},
+          taskOutputs: [],
+          artifactIds: [],
+          startedAt: null,
+          completedAt: null,
+          error: null,
+        },
+      },
+      createdFrom: "review",
+      createdAt: new Date().toISOString(),
+    };
+    updateEpisode(activeEpisode.id, (episode) => ({ ...episode, additions: [...(episode.additions ?? []), node] }));
+    appendActivity(activeEpisode.id, {
+      type: "review.follow_up_created",
+      actor: "human",
+      title: "Bounded follow-up Work created",
+      summary: proposal.objective,
+      relatedNodeId: id,
+      metadata: { originType: proposal.originType, originLabel: proposal.originLabel, sourceIds: proposal.sourceIds ?? [] },
+      authorityImpact: "human-approved-scope",
+    });
+    setReviewProposal(null);
+    setReviewOutputDetail(null);
+    setCollectionView(null);
+    setViewStage(stageIndex);
+    setSelectedNodeId(id);
+    setWorkspaceMode("work");
   }
 
   async function attachNodeSources(nodeId, files) {
@@ -4533,6 +5313,92 @@ export default function App() {
       ...plan,
       request,
     };
+  }
+
+  function getFollowUpNode(nodeId, episode = activeEpisode) {
+    return episode?.additions?.find((item) => item.id === nodeId && isReviewFollowUpAddition(item)) ?? null;
+  }
+
+  function updateFollowUpNode(nodeId, updater) {
+    if (!activeEpisode) return;
+    updateEpisode(activeEpisode.id, (episode) => ({
+      ...episode,
+      additions: (episode.additions ?? []).map((item) => item.id === nodeId ? normalizeFollowUpAddition(updater(item)) : item),
+    }));
+  }
+
+  function openFollowUpExecution(nodeId) {
+    const node = getFollowUpNode(nodeId);
+    const executionStatus = node?.metadata?.execution?.status ?? node?.status;
+    if (!node || node.metadata?.authority !== "human-approved-scope" || ["running", "completed"].includes(executionStatus)) return;
+    setSelectedNodeId(nodeId);
+    setFollowUpExecutionNodeId(nodeId);
+  }
+
+  async function runFollowUpWork() {
+    const nodeId = followUpExecutionNodeId;
+    const node = getFollowUpNode(nodeId);
+    if (!activeEpisode || !node) return;
+    const currentStatus = node.metadata?.execution?.status ?? node.status;
+    if (currentStatus === "running" || currentStatus === "completed") return;
+    const threads = getThreadsForNode(activeEpisode, node.stageIndex ?? viewStage, node.id);
+    const plan = createFollowUpOrchestrationPlan({ episode: activeEpisode, node, threads, context: { expectedOutcome: node.expectedOutcome } });
+    const sourceRecords = [];
+    try {
+      for (const source of activeEpisode.sources ?? []) {
+        if ((node.sourceIds ?? []).length > 0 && !node.sourceIds.includes(source.sourceId)) continue;
+        const stored = await getEpisodeSource(source.sourceId);
+        if (!stored) throw new Error(`Source ${source.fileName} is missing from local storage.`);
+        sourceRecords.push(sourceForAnalysis(source, stored));
+      }
+    } catch (error) {
+      updateFollowUpNode(node.id, (item) => ({ ...item, status: "failed", metadata: { ...item.metadata, execution: { ...item.metadata?.execution, status: "failed", error: error.message } } }));
+      appendActivity(activeEpisode.id, { type: "review.follow_up_failed", actor: "system", title: "Bounded follow-up could not start", summary: groundedRuntimeMessage(error.message), relatedNodeId: node.id, authorityImpact: "analysis" });
+      setFollowUpExecutionNodeId(null);
+      return;
+    }
+    const tasks = selectOrchestrationTasks(plan);
+    const startedAt = new Date().toISOString();
+    const initial = { episodeId: activeEpisode.id, nodeId: node.id, status: "queued", runId: null, taskStates: tasks.reduce((state, task) => ({ ...state, [task.id]: "Queued" }), {}), taskOutputs: [], events: [], startedAt };
+    setFollowUpExecutionRun(initial);
+    updateFollowUpNode(node.id, (item) => ({ ...item, status: "running", metadata: { ...item.metadata, execution: { ...item.metadata?.execution, status: "running", taskStates: initial.taskStates, taskOutputs: [], startedAt, error: null } } }));
+    appendActivity(activeEpisode.id, { type: "review.follow_up_run_started", actor: "human", title: "Approved bounded follow-up started", summary: `Up to ${tasks.length} read-only specialist turns.`, relatedNodeId: node.id, authorityImpact: "analysis" });
+    try {
+      const response = await fetch("/api/codex/orchestration/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ approved: true, episodeId: activeEpisode.id, nodeId: node.id, episodeName: activeEpisode.name, objective: node.title, context: activeEpisode.context, node: { id: node.id, kind: "action", title: node.title, body: node.body, sourceIds: node.sourceIds ?? [], createdFrom: "review", metadata: node.metadata }, threads, sources: sourceRecords, plan, followUp: { approved: true, nodeId: node.id, origin: node.metadata?.reviewOrigin ?? null, objective: node.title, reason: node.rationale, scope: node.description, approvedSourceIds: node.sourceIds ?? [], expectedOutput: node.expectedOutcome, authority: node.metadata?.authority } }) });
+      const result = await response.json();
+      if (!response.ok || !result.runId) throw new Error(result.message || "Local follow-up runtime unavailable.");
+      setFollowUpExecutionRun((current) => current ? { ...current, status: "working", runId: result.runId } : current);
+      updateFollowUpNode(node.id, (item) => ({ ...item, metadata: { ...item.metadata, execution: { ...item.metadata?.execution, runId: result.runId, status: "running" } } }));
+      const eventSource = new EventSource(`/api/codex/runs/${result.runId}/events`);
+      followUpEventSourceRef.current = eventSource;
+      eventSource.onmessage = (event) => {
+        const normalized = JSON.parse(event.data);
+        setFollowUpExecutionRun((current) => current && current.nodeId === node.id ? applyOrchestrationEvent(current, normalized) : current);
+        if (normalized.type === "task" && normalized.status === "complete") appendActivity(activeEpisode.id, { type: "review.follow_up_task_completed", actor: "codex", title: "Follow-up specialist completed", summary: normalized.label ?? normalized.taskId, relatedNodeId: node.id, authorityImpact: "analysis" });
+        if (["completed", "cancelled", "error"].includes(normalized.type)) {
+          const outputs = normalized.outputs ?? [];
+          const knownSourceIds = sourceRecords.map((source) => source.sourceId);
+          const validOutputs = outputs.every((output) => validateOrchestrationTaskOutput(output, output.taskId, knownSourceIds).valid);
+          const status = normalized.type === "completed" && validOutputs ? "completed" : normalized.type === "cancelled" ? "failed" : "failed";
+          const reviewOutcome = outputs.map((output) => output.reviewOutcome).find(Boolean) ?? "still-unresolved";
+          const artifacts = status === "completed" ? mapOrchestrationArtifacts(outputs, { nodeId: node.id, nodeKind: "action", runId: result.runId, stageIndex: node.stageIndex ?? viewStage }).map((artifact) => ({ ...artifact, createdFrom: "review", metadata: { ...(artifact.metadata ?? {}), reviewFollowUp: { nodeId: node.id, originType: node.metadata?.reviewOrigin?.type ?? "review item", originLabel: node.metadata?.reviewOrigin?.label ?? node.title, reviewOutcome } } })) : [];
+          const errorMessage = !validOutputs && normalized.type === "completed" ? "The runtime returned an invalid or ungrounded follow-up result." : normalized.message ? groundedRuntimeMessage(normalized.message) : null;
+          updateFollowUpNode(node.id, (item) => ({ ...item, status, resultSummary: status === "completed" ? (outputs.at(-1)?.summary ?? "Bounded follow-up completed.") : null, metadata: { ...item.metadata, execution: { ...item.metadata?.execution, status, runId: result.runId, taskStates: Object.fromEntries(tasks.map((task) => [task.id, outputs.some((output) => output.taskId === task.id) ? "complete" : "failed"])), taskOutputs: status === "completed" ? outputs : [], artifactIds: artifacts.map((artifact) => artifact.id), completedAt: new Date().toISOString(), error: errorMessage, reviewOutcome } } }));
+          updateEpisode(activeEpisode.id, (episode) => ({ ...episode, additions: artifacts.length ? [...(episode.additions ?? []), ...artifacts] : episode.additions }));
+          appendActivity(activeEpisode.id, { type: status === "completed" ? "review.follow_up_completed" : "review.follow_up_failed", actor: status === "completed" ? "codex" : "system", title: status === "completed" ? "Bounded follow-up completed" : "Bounded follow-up failed", summary: status === "completed" ? (outputs.at(-1)?.summary ?? "A bounded result is ready to inspect.") : (errorMessage ?? "No follow-up result was retained."), relatedNodeId: node.id, metadata: { evidenceCount: [...new Set(artifacts.flatMap((artifact) => artifact.sourceIds ?? []))].length, unresolvedCount: outputs.at(-1)?.unresolvedQuestions?.length ?? 0, reviewOutcome }, authorityImpact: "analysis" });
+          setFollowUpExecutionRun((current) => current ? { ...current, status, taskOutputs: status === "completed" ? outputs : [], finishedAt: new Date().toISOString(), error: errorMessage } : current);
+          eventSource.close();
+          followUpEventSourceRef.current = null;
+          setFollowUpExecutionNodeId(null);
+        }
+      };
+      eventSource.onerror = () => { if (eventSource.readyState === EventSource.CLOSED || followUpEventSourceRef.current !== eventSource) return; eventSource.close(); followUpEventSourceRef.current = null; updateFollowUpNode(node.id, (item) => ({ ...item, status: "failed", metadata: { ...item.metadata, execution: { ...item.metadata?.execution, status: "failed", error: "Local follow-up runtime unavailable." } } })); appendActivity(activeEpisode.id, { type: "review.follow_up_failed", actor: "system", title: "Bounded follow-up failed", summary: "Local follow-up runtime unavailable.", relatedNodeId: node.id, authorityImpact: "analysis" }); setFollowUpExecutionRun((current) => current ? { ...current, status: "failed", error: "Local follow-up runtime unavailable." } : current); };
+    } catch (error) {
+      updateFollowUpNode(node.id, (item) => ({ ...item, status: "failed", metadata: { ...item.metadata, execution: { ...item.metadata?.execution, status: "failed", error: error.message } } }));
+      appendActivity(activeEpisode.id, { type: "review.follow_up_failed", actor: "system", title: "Bounded follow-up failed", summary: groundedRuntimeMessage(error.message), relatedNodeId: node.id, authorityImpact: "analysis" });
+      setFollowUpExecutionRun((current) => current ? { ...current, status: "failed", error: error.message } : current);
+      setFollowUpExecutionNodeId(null);
+    }
   }
 
   function pushAgentNotification({ title, summary, nodeId }) {
@@ -5010,12 +5876,37 @@ export default function App() {
       source.expectedOutcome ?? source.output ?? source.expectedOutput;
     const isProposal = Boolean(proposalNode) && !workflowNode;
     const isAccepted = Boolean(workflowNode);
+    const isFollowUp = isReviewFollowUpAddition(addition);
+    const followUpExecution = addition?.metadata?.execution ?? null;
     const isAgentOutput = Boolean(addition && isGeneratedRunArtifact(addition));
     const outputRole = addition?.taskRole ?? addition?.metadata?.taskRole;
     const titleSummary = typeof addition?.title === "string" && outputRole && addition.title.startsWith(`${outputRole} · `)
       ? addition.title.slice(outputRole.length + 3)
       : addition?.body;
     const findings = addition?.findings ?? (addition?.metadata?.taskId ? String(addition.body ?? "").split(/\n\s*\n/).filter(Boolean) : []);
+    const relatedOutputs = (activeEpisode.additions ?? []).filter((item) => item.parentNodeId === nodeId && isGeneratedRunArtifact(item));
+    const latestOutput = relatedOutputs.at(-1);
+    const evidenceCount = sourceReferences.filter((source) => source?.sourceId && activeEpisode.sources?.some((item) => item.sourceId === source.sourceId)).length || ((source.kind === "evidence" || source.type === "Evidence") ? (activeEpisode.autopilotRun?.finalPackage?.evidenceSourceIds?.length ?? activeEpisode.sources?.length ?? 0) : 0);
+    const taskStatus = String(activeEpisode.autopilotRun?.taskStates?.[`specialist-${nodeId}`] ?? "").toLowerCase();
+    const status = isFollowUp
+      ? followUpExecution?.status === "running"
+        ? { label: "Running", tone: "working" }
+        : followUpExecution?.status === "completed"
+          ? { label: "Complete", tone: "complete" }
+          : followUpExecution?.status === "failed"
+            ? { label: "Failed", tone: "error" }
+            : { label: "Ready", tone: "ready" }
+      : isProposal
+      ? { label: "Ready", tone: "ready" }
+      : taskStatus === "working"
+      ? { label: "Running", tone: "working" }
+      : taskStatus === "failed"
+      ? { label: "Failed", tone: "error" }
+      : taskStatus === "completed" || taskStatus === "complete" || (isAccepted && viewStage < activeEpisode.currentStage)
+      ? { label: "Complete", tone: "complete" }
+      : source.kind === "gate" || source.type === "Human checkpoint"
+      ? { label: "Needs review", tone: "human-required" }
+      : { label: "Ready", tone: "ready" };
 
     return {
       state: isProposal
@@ -5036,6 +5927,11 @@ export default function App() {
         : null,
       acceptedAt: isAccepted ? activeEpisode.intake?.acceptedAt : null,
       sourceReferences,
+      status,
+      evidenceCount,
+      triggeredBy: isAccepted || isProposal ? "Episode Conversation" : null,
+      result: isFollowUp ? (addition.resultSummary ?? latestOutput?.summary ?? null) : (latestOutput?.summary ?? latestOutput?.title ?? null),
+      hasWorkSubthread: getThreadStats(activeEpisode, viewStage, nodeId).threads.length > 0,
       agentOutput: isAgentOutput ? {
         role: outputRole ?? "Codex analysis",
         summary: titleSummary || "A retained agent output is ready for review.",
@@ -5043,6 +5939,16 @@ export default function App() {
         assumptions: addition.assumptions ?? addition.metadata?.assumptions ?? [],
         unresolvedQuestions: addition.unresolvedQuestions ?? addition.metadata?.unresolvedQuestions ?? [],
         recommendedNextStep: addition.recommendedNextStep ?? addition.metadata?.recommendedNextStep ?? "",
+      } : null,
+      followUp: isFollowUp ? {
+        status: followUpExecution?.status ?? "ready",
+        runId: followUpExecution?.runId ?? null,
+        origin: addition.metadata?.reviewOrigin ?? null,
+        expectedOutput: expectedOutcome,
+        result: addition.resultSummary ?? latestOutput?.summary ?? null,
+        error: followUpExecution?.error ?? null,
+        evidenceCount: (followUpExecution?.taskOutputs ?? []).reduce((count, output) => count + (output.evidenceSourceIds?.length ?? 0), 0),
+        reviewOutcome: followUpExecution?.reviewOutcome ?? null,
       } : null,
     };
   }
@@ -5527,6 +6433,8 @@ export default function App() {
 
       template: template ? { id: template.id, name: template.name, version: template.version } : null,
 
+      intent: setupMode === "agent-assisted" ? createIntentSummary({ episode: { title, context, sources: sourceManifest } }) : null,
+
       currentStage: 0,
 
       status: "active",
@@ -5537,8 +6445,10 @@ export default function App() {
 
       additions: [],
 
+      conversation: normalizeEpisodeConversation(null),
+
       intake: {
-        status: setupMode === "agent-assisted" ? "pending" : "idle",
+        status: setupMode === "agent-assisted" ? "intent-review" : "idle",
         request: null,
         proposal: null,
         acceptedAt: null,
@@ -5561,19 +6471,7 @@ export default function App() {
         },
       },
 
-      autopilotRun: setupMode === "agent-assisted" ? {
-        status: "queued",
-        runId: null,
-        startedAt: null,
-        draftPlan: null,
-        taskStates: { "intake-planner": "queued" },
-        outputs: [],
-        assumptions: [],
-        unresolvedItems: [],
-        errors: [],
-        finalPackage: null,
-        humanReviewStatus: "pending",
-      } : null,
+      autopilotRun: null,
 
       activity: [
         createActivityEvent({
@@ -5598,6 +6496,14 @@ export default function App() {
           title: "Source material ingested",
           summary: `${sourceManifest.length} source${sourceManifest.length === 1 ? "" : "s"} extracted and stored locally.`,
           metadata: { sourceIds: sourceManifest.map((source) => source.sourceId) },
+        })] : []),
+        ...(setupMode === "agent-assisted" ? [createActivityEvent({
+          episodeId: id,
+          type: "intent.review_required",
+          actor: "system",
+          title: "Intent review required",
+          summary: "No agent analysis will start until a human confirms the objective, context, and authority boundaries.",
+          authorityImpact: "human-review",
         })] : []),
         ...sourceEvents.map((event) => createActivityEvent({
           episodeId: id,
@@ -5641,13 +6547,33 @@ export default function App() {
     );
     setNewEpisodeProjectId(null);
 
-    if (setupMode === "agent-assisted") {
-      void runAutopilotEpisode(episode);
-    }
+  }
+
+  function confirmIntentForAnalysis() {
+    if (!activeEpisode?.intent || activeEpisode.intent.status === "confirmed") return;
+    const confirmedAt = new Date().toISOString();
+    const confirmedEpisode = {
+      ...activeEpisode,
+      intent: { ...activeEpisode.intent, status: "confirmed", confirmedAt },
+    };
+    confirmedEpisode.intake = {
+      ...normalizeEpisodeIntake(activeEpisode.intake),
+      status: "pending",
+      request: createEpisodeIntakeRequest({ episode: confirmedEpisode }),
+    };
+    updateEpisode(activeEpisode.id, () => confirmedEpisode);
+    appendActivity(activeEpisode.id, {
+      type: "intent.confirmed",
+      actor: "human",
+      title: "Intent confirmed for analysis",
+      summary: "Human confirmed the objective, context, and bounded read-only authority. No stage or disposition changed.",
+      authorityImpact: "human-review",
+    });
+    void runAutopilotEpisode(confirmedEpisode);
   }
 
   async function runAutopilotEpisode(episode, instruction = "") {
-    if (!episode?.id || autopilotEventSourceRef.current || episode.autopilotRun?.status === "working") return;
+    if (!episode?.id || (episode.intent && episode.intent.status !== "confirmed") || autopilotEventSourceRef.current || episode.autopilotRun?.status === "working") return;
     const startedAt = new Date().toISOString();
     const initial = { ...(episode.autopilotRun ?? {}), episodeId: episode.id, status: "queued", runId: null, startedAt, finishedAt: null, instruction, activeTaskId: null, activeNodeId: null, taskStates: { "intake-planner": "queued" }, outputs: [], errors: [], error: null, finalPackage: null, humanReviewStatus: "pending", events: [], context: { objective: episode.title, sourceCount: episode.sources?.length ?? 0, sourceNames: (episode.sources ?? []).map((source) => source.fileName).slice(0, 4) } };
     setAutopilotRun(initial);
@@ -5756,7 +6682,7 @@ export default function App() {
   }
 
   async function runNativeCodexIntake(episode, revisionInstruction = "") {
-    if (!episode?.id || codexRunningEpisodeId) return;
+    if (!episode?.id || (episode.intent && episode.intent.status !== "confirmed") || codexRunningEpisodeId) return;
     const isRevision = Boolean(revisionInstruction.trim() || episode.runtime?.codex?.intakeThreadId);
     appendActivity(episode.id, {
       type: isRevision ? "codex.intake.revision_started" : "codex.intake.started",
@@ -6199,6 +7125,93 @@ export default function App() {
     }));
   }
 
+  function resolveEpisodeConversation(episodeId, content, { codexThreadId = null, status = "complete" } = {}) {
+    updateEpisode(episodeId, (episode) => ({
+      ...episode,
+      conversation: {
+        ...normalizeEpisodeConversation(episode.conversation),
+        messages: [...(episode.conversation?.messages ?? []), createMessage("agent", content)],
+        status,
+        codexThreadId: codexThreadId ?? episode.conversation?.codexThreadId ?? null,
+        updatedAt: new Date().toISOString(),
+      },
+    }));
+  }
+
+  async function runEpisodeConversation({ episodeId, question, messages, codexThreadId = null }) {
+    const episode = episodes.find((item) => item.id === episodeId);
+    if (!episode) return;
+    const sourceRecords = [];
+    try {
+      for (const source of episode.sources ?? []) {
+        const stored = await getEpisodeSource(source.sourceId);
+        if (!stored) throw new Error(`Source ${source.fileName} is missing from local storage.`);
+        sourceRecords.push(sourceForAnalysis(source, stored));
+      }
+      const response = await fetch("/api/codex/episode-conversation/start", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          episodeId: episode.id,
+          episodeName: episode.name,
+          objective: episode.title,
+          context: episode.context,
+          question,
+          messages,
+          codexThreadId,
+          sources: sourceRecords,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.runId) throw new Error(result.message || "Local Codex runtime unavailable.");
+      const eventSource = new EventSource(`/api/codex/runs/${result.runId}/events`);
+      eventSource.onmessage = (event) => {
+        const normalized = JSON.parse(event.data);
+        if (normalized.type === "completed") {
+          resolveEpisodeConversation(episodeId, normalized.response, { codexThreadId: normalized.threadId });
+          appendActivity(episodeId, { type: "episode.agent_responded", actor: "codex", title: "WRX responded about the episode", summary: compactArtifactSummary(normalized.response), authorityImpact: "analysis" });
+          eventSource.close();
+        }
+        if (["error", "cancelled"].includes(normalized.type)) {
+          resolveEpisodeConversation(episodeId, normalized.message ?? "WRX could not complete this episode response.", { status: normalized.type });
+          appendActivity(episodeId, { type: "episode.agent_response_failed", actor: "system", title: "WRX episode response unavailable", summary: normalized.message ?? "No response was returned.", authorityImpact: "analysis" });
+          eventSource.close();
+        }
+      };
+      eventSource.onerror = () => {
+        if (eventSource.readyState === EventSource.CLOSED) return;
+        resolveEpisodeConversation(episodeId, "The local Codex connection ended before a response was returned.", { status: "error" });
+        eventSource.close();
+      };
+    } catch (error) {
+      resolveEpisodeConversation(episodeId, error.message || "WRX could not start this episode response.", { status: "error" });
+      appendActivity(episodeId, { type: "episode.agent_response_failed", actor: "system", title: "WRX episode response unavailable", summary: error.message, authorityImpact: "analysis" });
+    }
+  }
+
+  function handleEpisodeConversationSend(content) {
+    if (!activeEpisode || activeEpisode.conversation?.status === "pending") return;
+    setEpisodeConversationPrompt("");
+    const previousMessages = activeEpisode.conversation?.messages ?? [];
+    const nextMessage = createMessage("human", content);
+    updateEpisode(activeEpisode.id, (episode) => ({
+      ...episode,
+      conversation: {
+        ...normalizeEpisodeConversation(episode.conversation),
+        messages: [...(episode.conversation?.messages ?? []), nextMessage],
+        status: "pending",
+        updatedAt: new Date().toISOString(),
+      },
+    }));
+    appendActivity(activeEpisode.id, { type: "episode.question_asked", actor: "human", title: "Human messaged WRX about the episode", summary: compactArtifactSummary(content), authorityImpact: "human-review" });
+    void runEpisodeConversation({
+      episodeId: activeEpisode.id,
+      question: content,
+      messages: [...previousMessages, { role: "human", content }],
+      codexThreadId: activeEpisode.conversation?.codexThreadId ?? null,
+    });
+  }
+
   async function runNodeConversation({ threadId, nodeId, question, messages, codexThreadId = null }) {
     if (!activeEpisode || !threadId || !nodeId) return;
     const episodeId = activeEpisode.id;
@@ -6512,6 +7525,39 @@ export default function App() {
           const orchestration =
             orchestrationPreviews[node.id];
 
+          const nodeSourceIds = [...new Set([
+            ...(node.sourceIds ?? []),
+            ...(activeEpisode.nodeSourceIds?.[node.id] ?? []),
+          ])];
+          const episodeEvidenceCount = activeEpisode.autopilotRun?.finalPackage?.evidenceSourceIds?.length ?? activeEpisode.sources?.length ?? 0;
+          const nodeOutputs = (activeEpisode.additions ?? []).filter(
+            (item) => item.parentNodeId === node.id && isDurableArtifact(item)
+          );
+          const latestNodeOutput = nodeOutputs.at(-1);
+          const rawTaskStatus = activeEpisode.autopilotRun?.taskStates?.[`specialist-${node.id}`];
+          const normalizedTaskStatus = String(rawTaskStatus ?? "").toLowerCase();
+          const nodeIsHumanCheckpoint = node.kind === "gate" || node.kind === "human";
+          const nodeStatus = node.proposed
+            ? { label: "Ready", tone: "ready" }
+            : normalizedTaskStatus === "working"
+            ? { label: "Running", tone: "working" }
+            : normalizedTaskStatus === "failed"
+            ? { label: "Failed", tone: "error" }
+            : normalizedTaskStatus === "completed" || normalizedTaskStatus === "complete"
+            ? { label: "Complete", tone: "complete" }
+            : nodeIsHumanCheckpoint && activeEpisode.disposition
+            ? { label: "Complete", tone: "complete" }
+            : nodeIsHumanCheckpoint
+            ? { label: "Needs review", tone: "human-required" }
+            : viewStage < activeEpisode.currentStage
+            ? { label: "Complete", tone: "complete" }
+            : { label: "Ready", tone: "ready" };
+          const resultSummary = latestNodeOutput?.title
+            ? latestNodeOutput.title.replace(/^[^·]+·\s*/, "")
+            : latestNodeOutput?.body
+            ? compactArtifactSummary(latestNodeOutput.body)
+            : null;
+
           let type =
             "card";
 
@@ -6569,6 +7615,18 @@ export default function App() {
               autopilotStatus: activeEpisode.autopilotRun?.taskStates?.[`specialist-${node.id}`] ?? null,
 
               autopilotActive: activeEpisode.autopilotRun?.activeNodeId === node.id,
+
+              statusLabel: nodeStatus.label,
+
+              statusTone: nodeStatus.tone,
+
+              evidenceCount: nodeSourceIds.length || (node.kind === "evidence" ? episodeEvidenceCount : 0),
+
+              showEvidenceState: Boolean(node.sourceIds || activeEpisode.nodeSourceIds?.[node.id] || node.kind === "evidence"),
+
+              resultSummary,
+
+              requiresHuman: nodeIsHumanCheckpoint && !activeEpisode.disposition,
 
               runArtifactCount: runArtifactCounts.get(node.id) ?? 0,
 
@@ -6695,6 +7753,18 @@ export default function App() {
               item.id
             );
 
+          const additionSourceIds = [...new Set([
+            ...(item.sourceIds ?? []),
+            ...(item.metadata?.evidenceSourceIds ?? []),
+            ...(activeEpisode.nodeSourceIds?.[item.id] ?? []),
+          ])];
+          const followUpExecution = item.metadata?.execution;
+          const additionStatus = isReviewFollowUpAddition(item)
+            ? followUpExecution?.status === "running" ? { label: "Running", tone: "working" } : followUpExecution?.status === "completed" ? { label: "Complete", tone: "complete" } : followUpExecution?.status === "failed" ? { label: "Failed", tone: "error" } : { label: "Ready", tone: "ready" }
+            : isGeneratedRunArtifact(item)
+              ? (activeEpisode.autopilotRun?.status === "working" ? { label: "Running", tone: "working" } : activeEpisode.autopilotRun?.status === "error" ? { label: "Failed", tone: "error" } : { label: "Complete", tone: "complete" })
+              : { label: "Ready", tone: "ready" };
+
           return {
             id:
               item.id,
@@ -6719,7 +7789,21 @@ export default function App() {
 
                 durableArtifact: true,
 
-                compactNode: true,
+              compactNode: true,
+
+              statusLabel: additionStatus.label,
+
+              statusTone: additionStatus.tone,
+
+              evidenceCount: additionSourceIds.length,
+
+              showEvidenceState: Boolean(item.sourceIds || item.metadata?.evidenceSourceIds),
+
+              resultSummary: isReviewFollowUpAddition(item) ? (item.resultSummary || (followUpExecution?.status === "completed" ? "Bounded follow-up completed." : null)) : isGeneratedRunArtifact(item) ? (item.title || compactArtifactSummary(item.body)) : null,
+
+              followUp: isReviewFollowUpAddition(item) ? { status: followUpExecution?.status ?? "ready" } : null,
+
+              onRunFollowUp: isReviewFollowUpAddition(item) ? () => openFollowUpExecution(item.id) : undefined,
 
               meta:
                 item.meta,
@@ -6976,6 +8060,37 @@ export default function App() {
     ];
   }
 
+  const getWorkflowFitNodes = useCallback((includeAll = false) => {
+    if (includeAll) return nodes;
+    const primaryNodes = nodes.filter((node) => (
+      !node.data?.orchestrationPreview &&
+      node.type !== "thread" &&
+      !node.data?.durableArtifact
+    ));
+    return primaryNodes.length > 0 ? primaryNodes : nodes;
+  }, [nodes]);
+
+  const fitWorkflowCanvas = useCallback((includeAll = false) => {
+    if (!reactFlowInstance) return;
+    const targetNodes = getWorkflowFitNodes(includeAll);
+    reactFlowInstance.fitView({
+      nodes: targetNodes,
+      padding: includeAll ? 0.2 : 0.28,
+      minZoom: includeAll ? 0.35 : 0.45,
+      duration: 250,
+    });
+  }, [getWorkflowFitNodes, reactFlowInstance]);
+
+  const focusSelectedNode = useCallback(() => {
+    if (!reactFlowInstance) return;
+    const selected = nodes.find((node) => node.id === selectedNodeId);
+    if (selected) {
+      reactFlowInstance.fitView({ nodes: [selected], padding: 0.7, duration: 250, maxZoom: 1.1 });
+      return;
+    }
+    fitWorkflowCanvas();
+  }, [fitWorkflowCanvas, nodes, reactFlowInstance, selectedNodeId]);
+
   /* ---------------------------------------------------------------------- */
   /* REBUILD FLOW                                                           */
   /* ---------------------------------------------------------------------- */
@@ -7042,10 +8157,7 @@ export default function App() {
 
     const timeoutId = window.setTimeout(
       () => {
-        reactFlowInstance.fitView({
-          padding: 0.18,
-          duration: 250,
-        });
+        fitWorkflowCanvas();
       },
       60
     );
@@ -7058,6 +8170,7 @@ export default function App() {
     activeEpisodeId,
     viewStage,
     visibleTopologyKey,
+    fitWorkflowCanvas,
   ]);
 
   useEffect(() => {
@@ -8250,6 +9363,15 @@ export default function App() {
         activeEpisode.additions?.some((item) => item.id === selectedNodeId))
   );
 
+  const needsReviewCount = episodes.filter((episode) => episode.autopilotRun?.finalPackage && episode.autopilotRun.humanReviewStatus !== "promoted" && episode.autopilotRun.humanReviewStatus !== "rejected").length;
+  const activeEpisodeCount = episodes.filter((episode) => episode.status === "active").length;
+  const draftEpisodeCount = episodes.filter((episode) => ["intent-review", "pending", "proposed"].includes(episode.intake?.status)).length;
+  const hasWorkNodes = Boolean(
+    activeEpisode.workflow?.nodes?.length ||
+      activeEpisode.intake?.proposal?.workNodes?.length ||
+      activeEpisode.additions?.some((item) => item.stageIndex === viewStage && isDurableArtifact(item) && item.kind !== "thread")
+  );
+
   /* ---------------------------------------------------------------------- */
   /* RENDER                                                                 */
   /* ---------------------------------------------------------------------- */
@@ -8291,6 +9413,19 @@ export default function App() {
 
       {sourceViewerId && <SourceViewer sourceId={sourceViewerId} onClose={() => setSourceViewerId(null)} />}
       {sourceLibraryOpen && <SourceLibrary episode={activeEpisode} onClose={() => setSourceLibraryOpen(false)} onOpenSource={setSourceViewerId} />}
+      {reviewOutputDetail && <ReviewOutputDetail
+        output={reviewOutputDetail}
+        episode={activeEpisode}
+        getNodeTitle={(nodeId, stageIndex) => findNodeTitle(activeEpisode, stageIndex, nodeId)}
+        hasSubthread={(nodeId, stageIndex) => getThreadStats(activeEpisode, stageIndex, nodeId).threads.length > 0}
+        onClose={() => setReviewOutputDetail(null)}
+        onAsk={askAboutReviewItem}
+        onWork={proposeReviewFollowUp}
+        onOpenWork={() => { setReviewOutputDetail(null); setWorkspaceMode("work"); }}
+        onOpenSources={() => { setReviewOutputDetail(null); setSourceLibraryOpen(true); }}
+      />}
+      {reviewProposal && <BoundedWorkProposalModal proposal={reviewProposal} onClose={() => setReviewProposal(null)} onApprove={approveReviewFollowUp} />}
+      {followUpExecutionNodeId && <FollowUpExecutionModal node={getFollowUpNode(followUpExecutionNodeId)} onClose={() => setFollowUpExecutionNodeId(null)} onRun={() => { setFollowUpExecutionNodeId(null); void runFollowUpWork(); }} busy={followUpExecutionRun?.status === "queued" || followUpExecutionRun?.status === "working"} />}
 
       <RenameEpisodeModal
         key={renamingEpisode?.id ?? "rename-episode"}
@@ -8307,7 +9442,9 @@ export default function App() {
           <div className="topbar-left">
             <button
               type="button"
-              className="button"
+              className="button shell-toggle-button"
+              aria-label={sidebarOpen ? "Collapse sidebar" : "Open sidebar"}
+              title={sidebarOpen ? "Collapse sidebar" : "Open sidebar"}
               onClick={() =>
                 setSidebarOpen(
                   (value) =>
@@ -8315,93 +9452,16 @@ export default function App() {
                 )
               }
             >
-              ☰ Tree view
+              <span aria-hidden="true">☰</span>
             </button>
 
-            <strong>
+            <strong className="topbar-product">
               SSI-WRX Workroom
             </strong>
-
-            <span className="badge">
-              {
-                activeEpisode.id
-              }
-            </span>
           </div>
 
-          <div className="topbar-actions">
-            <button
-              type="button"
-              className="button"
-              onClick={() =>
-                reactFlowInstance?.fitView(
-                  {
-                    padding:
-                      0.18,
-
-                    duration:
-                      250,
-                  }
-                )
-              }
-            >
-              Fit canvas
-            </button>
-
-            {viewStage === 0 && ["accepted", "proposed"].includes(activeEpisode.intake?.status) && (
-              <button
-                type="button"
-                className="button"
-                onClick={organizeVisibleWorkflow}
-              >
-                Arrange for review
-              </button>
-            )}
-
-            {["pending", "proposed"].includes(activeEpisode.intake?.status) && !intakePanelOpen && (
-              <button
-                type="button"
-                className="button"
-                onClick={() => setIntakePanelOpen(true)}
-              >
-                Review setup
-              </button>
-            )}
-
-            <button
-              type="button"
-              className="button"
-              onClick={() => {
-                setShowCanvasHeader((value) => !value);
-                if (showCanvasHeader) setShowEpisodeCockpit(false);
-              }}
-            >
-              {showCanvasHeader ? "Focus canvas" : "Show header"}
-            </button>
-
-            {traceNodeId && (
-              <button
-                type="button"
-                className="button"
-                onClick={() => setTraceNodeId(null)}
-              >
-                Clear trace
-              </button>
-            )}
-
-            {(activeEpisode.additions ?? []).some((item) => item.stageIndex === viewStage && isGeneratedRunArtifact(item)) && (
-              <button
-                type="button"
-                className="button"
-                onClick={() => setShowGeneratedArtifacts((value) => !value)}
-              >
-                {showGeneratedArtifacts ? "Hide run outputs" : "Show run outputs"}
-              </button>
-            )}
-
-            <span className="badge">
-              Human authority
-            </span>
+          <div className="topbar-actions" aria-label="Workroom status">
+            <span className="topbar-status">Local-first · human-owned decisions</span>
           </div>
         </header>
 
@@ -8416,17 +9476,30 @@ export default function App() {
 
           <aside className="sidebar">
             <div className="sidebar-content">
+              <div className="sidebar-brand"><strong>SSI-WRX</strong><span>Workroom</span></div>
               <div className="sidebar-section-header">
                 <span>Projects</span>
                 <div className="sidebar-project-actions">
-                  <button type="button" className="small-button" onClick={() => setProjectModalOpen(true)}>+ New Project</button>
-                  <button type="button" className="small-button" onClick={() => { setNewEpisodeProjectId(null); setCreateOpen(true); }}>+ Episode</button>
+                  <div className="sidebar-create-wrap">
+                    <button type="button" className="small-button sidebar-create-button" aria-label="Create" title="Create project or episode" aria-expanded={sidebarCreateMenuOpen} onClick={() => setSidebarCreateMenuOpen((value) => !value)}>+</button>
+                    {sidebarCreateMenuOpen && <div className="sidebar-create-menu" role="menu">
+                      <button type="button" role="menuitem" onClick={() => { setProjectModalOpen(true); setSidebarCreateMenuOpen(false); }}>New project</button>
+                      <button type="button" role="menuitem" onClick={() => { setNewEpisodeProjectId(null); setCreateOpen(true); setSidebarCreateMenuOpen(false); }}>New episode</button>
+                    </div>}
+                  </div>
                 </div>
               </div>
               <label className="episode-search">
                 <input aria-label="Search episodes" value={episodeSearch} onChange={(event) => setEpisodeSearch(event.target.value)} placeholder="Search episodes..." />
                 {episodeSearch && <button type="button" className="episode-search-clear" aria-label="Clear episode search" onClick={() => setEpisodeSearch("")}>×</button>}
               </label>
+              <nav className="sidebar-quick-nav" aria-label="Workroom navigation">
+                <button type="button" aria-current={collectionView === "workroom-overview" ? "page" : undefined} className={collectionView === "workroom-overview" ? "active" : ""} onClick={() => { setCollectionView("workroom-overview"); setEpisodeSearch(""); setDrawerOpen(false); setActivityOpen(false); setNotificationsOpen(false); setSourceLibraryOpen(false); setSourceViewerId(null); }}><span>⌂</span>Overview</button>
+                <button type="button" aria-current={collectionView === "needs-review" ? "page" : undefined} className={collectionView === "needs-review" ? "active" : ""} onClick={() => { setCollectionView("needs-review"); setEpisodeSearch(""); setDrawerOpen(false); setActivityOpen(false); setNotificationsOpen(false); setSourceLibraryOpen(false); setSourceViewerId(null); }}><span>◈</span>Needs review {needsReviewCount > 0 && <small>{needsReviewCount}</small>}</button>
+                <button type="button" aria-current={collectionView === "active" ? "page" : undefined} className={collectionView === "active" ? "active" : ""} onClick={() => { setCollectionView("active"); setEpisodeSearch(""); setDrawerOpen(false); setActivityOpen(false); setNotificationsOpen(false); setSourceLibraryOpen(false); setSourceViewerId(null); }}><span>▦</span>Active <small>{activeEpisodeCount}</small></button>
+                <button type="button" aria-current={collectionView === "drafts" ? "page" : undefined} className={`${draftEpisodeCount > 0 ? "has-items" : ""} ${collectionView === "drafts" ? "active" : ""}`} onClick={() => { setCollectionView("drafts"); setEpisodeSearch(""); setDrawerOpen(false); setActivityOpen(false); setNotificationsOpen(false); setSourceLibraryOpen(false); setSourceViewerId(null); }}><span>▱</span>Drafts {draftEpisodeCount > 0 && <small>{draftEpisodeCount}</small>}</button>
+                <button type="button" aria-current={collectionView === "archive" ? "page" : undefined} className={collectionView === "archive" ? "active" : ""} onClick={() => { setCollectionView("archive"); setEpisodeSearch(""); setDrawerOpen(false); setActivityOpen(false); setNotificationsOpen(false); setSourceLibraryOpen(false); setSourceViewerId(null); }}><span>□</span>Archive</button>
+              </nav>
               <div className="project-tree">
                 {(() => {
                   const query = episodeSearch.trim().toLowerCase();
@@ -8436,58 +9509,11 @@ export default function App() {
                     const projectName = projects.find((project) => project.id === episode.projectId)?.name ?? "Unassigned";
                     return !query || episode.id.toLowerCase().includes(query) || episode.name.toLowerCase().includes(query) || episode.title.toLowerCase().includes(query) || projectName.toLowerCase().includes(query);
                   });
-                  const renderWorkflow = (episode) => {
-                    if (episode.id !== activeEpisodeId) {
-                      return null;
-                    }
-
-                    return <div className="episode-workflow" aria-label="Episode workflow">
-                      <button type="button" className="episode-workflow-toggle" onClick={() => setWorkflowExpanded((current) => !current)} aria-expanded={workflowExpanded}>
-                        <span>{workflowExpanded ? "▾" : "▸"}</span>
-                        <strong>Workflow</strong>
-                      </button>
-                      {workflowExpanded && <div className="tree">
-                        {EPISODE_STAGES.map((stage, index) => {
-                          const unlocked = index <= episode.currentStage;
-                          const current = index === viewStage;
-                          const childNodes = index === 0 && episode.intake?.status === "accepted" && episode.workflow?.nodes?.length
-                            ? episode.workflow.nodes
-                            : stage.nodes;
-
-                          return <div key={stage.name}>
-                            <button type="button" disabled={!unlocked} className={`tree-stage ${current ? "active" : ""} ${!unlocked ? "locked" : ""}`} onClick={() => {
-                              if (!unlocked) return;
-                              setViewStage(index);
-                              setSelectedNodeId(null);
-                              setActiveThreadId(null);
-                              setDrawerOpen(false);
-                              setOrchestrationNodeId(null);
-                              setOrchestrationExpanded(false);
-                              setOrchestrationMinimized(false);
-                              setOrchestrationDetailId(null);
-                              setOrchestrationPreviews({});
-                            }}>
-                              <span>{index < episode.currentStage ? "✓" : index === episode.currentStage ? "▾" : "›"}</span>
-                              <span>{index + 1}. {stage.name}</span>
-                            </button>
-                            {current && childNodes.filter((node) => node.kind !== "gate").map((node) => <button type="button" key={node.id} className="tree-node" onClick={() => {
-                              setSelectedNodeId(node.id);
-                              setAnchoredConversationMinimized(false);
-                              setActiveThreadId(null);
-                            }}>
-                              <span className="tree-icon" />
-                              {node.type ?? node.title ?? node.kind}
-                            </button>)}
-                          </div>;
-                        })}
-                      </div>}
-                    </div>;
-                  };
                   const renderEpisode = (episode) => (
                     <div className="project-episode" key={episode.id}>
-                      <button type="button" className={`episode ${episode.id === activeEpisodeId ? "active" : ""}`} onClick={() => setActiveEpisodeId(episode.id)}>
-                        <span className="episode-symbol">E</span>
-                        <span className="episode-copy"><small>{episode.id}</small><strong title={episode.title}>{episode.name || deriveEpisodeName(episode.title)}</strong><small>Stage {episode.currentStage + 1} · {episode.intake?.status === "pending" ? "Pending intake" : episode.status === "archived" ? "Archived" : "Active"}</small></span>
+                      <button type="button" className={`episode ${episode.id === activeEpisodeId ? "active" : ""}`} onClick={() => { setCollectionView(null); setActiveEpisodeId(episode.id); setExpandedProjects({ [episode.projectId ?? "unassigned"]: true }); }}>
+                        <span className={`episode-status-dot ${episode.status === "archived" ? "archived" : episode.intake?.status === "pending" ? "pending" : episode.autopilotRun?.finalPackage ? "review" : "active"}`} title={episode.status === "archived" ? "Archived" : episode.intake?.status === "pending" ? "Pending intake" : episode.autopilotRun?.finalPackage ? "Ready for review" : "Active"} aria-hidden="true" />
+                        <span className="episode-copy"><small>{episode.id}</small><strong title={episode.title}>{episode.name || deriveEpisodeName(episode.title)}</strong></span>
                       </button>
                       {openEpisodeMenuId === episode.id && <div className="episode-menu-wrap">
                         <button type="button" className="episode-menu-button" aria-label={`Episode options for ${episode.name}`} aria-expanded="true" onClick={(event) => { event.stopPropagation(); setOpenEpisodeMenuId(null); setMovingEpisodeId(null); }}>⋮</button>
@@ -8501,14 +9527,14 @@ export default function App() {
                         </div>
                       </div>}
                       {openEpisodeMenuId !== episode.id && <button type="button" className="episode-menu-button" aria-label={`Episode options for ${episode.name}`} title="Episode options" onClick={(event) => { event.stopPropagation(); setOpenEpisodeMenuId(episode.id); setMovingEpisodeId(null); }}>⋮</button>}
-                      {renderWorkflow(episode)}
                     </div>
                   );
                   const renderGroup = (project, projectEpisodes) => {
-                    const expanded = query || expandedProjects[project.id] !== false;
+                    const expanded = Boolean(query || (expandedProjects[project.id] ?? projectEpisodes.some((episode) => episode.id === activeEpisodeId)));
                     return <div className="project-group" key={project.id}>
                       <div className="project-row">
-                        <button type="button" className="project-toggle" onClick={() => setExpandedProjects((current) => ({ ...current, [project.id]: !current[project.id] }))}><span>{expanded ? "▾" : "▸"}</span><strong>{project.name}</strong><small>{projectEpisodes.length}</small></button>
+                        <button type="button" aria-expanded={expanded} className="project-toggle" onClick={() => setExpandedProjects(expanded ? { [project.id]: false } : { [project.id]: true })}><span>{expanded ? "▾" : "▸"}</span><strong title={project.name}>{deriveSidebarProjectName(project.name)}</strong></button>
+                        <small className="project-count" aria-label={`${projectEpisodes.length} episodes`}>{projectEpisodes.length}</small>
                         {project.id !== "unassigned" && <div className="project-row-actions">
                           <button type="button" className="project-add" aria-label={`Create episode in ${project.name}`} onClick={() => { setNewEpisodeProjectId(project.id); setCreateOpen(true); }}>+</button>
                           <div className="project-menu-wrap">
@@ -8524,23 +9550,53 @@ export default function App() {
                     </div>;
                   };
                   return <>
-                    {projects.filter((project) => !project.archived && projectMatches(project)).map((project) => renderGroup(project, episodes.filter((episode) => episode.projectId === project.id && episode.status !== "archived")))}
-                    {renderGroup({ id: "unassigned", name: "Unassigned" }, episodes.filter((episode) => !episode.projectId && episode.status !== "archived").filter((episode) => !query || episode.id.toLowerCase().includes(query) || episode.name.toLowerCase().includes(query) || episode.title.toLowerCase().includes(query)))}
+                    {projects.filter((project) => !project.archived && projectMatches(project)).map((project) => renderGroup(project, episodes.filter((episode) => episode.projectId === project.id && (showArchivedEpisodes || episode.status !== "archived"))))}
+                    {renderGroup({ id: "unassigned", name: "Unassigned" }, episodes.filter((episode) => !episode.projectId && (showArchivedEpisodes || episode.status !== "archived")).filter((episode) => !query || episode.id.toLowerCase().includes(query) || episode.name.toLowerCase().includes(query) || episode.title.toLowerCase().includes(query)))}
                     {query && !hasMatchingEpisode && <div className="episode-search-empty">No matching episodes</div>}
                   </>;
                 })()}
               </div>
 
+              <div className="sidebar-footer">
+                <span className="sidebar-user-avatar">E</span>
+                <div><strong>Emmanuel</strong><span>Workspace owner</span></div>
+                <button type="button" disabled aria-label="Settings unavailable" title="Settings unavailable">⚙</button>
+              </div>
             </div>
           </aside>
 
           {/* MAIN */}
 
-          <section className="main">
-            {showCanvasHeader && <div className="canvas-header">
-              <div>
+          <section className={`main ${collectionView ? "collection-view-active" : ""}`}>
+            {collectionView === "workroom-overview" && <WorkroomOverview
+              episodes={episodes}
+              projects={projects}
+              onOpenEpisode={(episode, destination) => {
+                setCollectionView(null);
+                setActiveEpisodeId(episode.id);
+                setSelectedNodeId(null);
+                setActiveThreadId(null);
+                setWorkspaceMode(destination === "review" ? "review" : "overview");
+              }}
+              onOpenCollection={(view) => { setCollectionView(view); setEpisodeSearch(""); }}
+              onOpenProject={(projectId) => setExpandedProjects({ [projectId]: true })}
+            />}
+            {collectionView && collectionView !== "workroom-overview" && <CollectionWorkspace
+              view={collectionView}
+              episodes={episodes}
+              projects={projects}
+              onOpenEpisode={(episode, destination) => {
+                setCollectionView(null);
+                setActiveEpisodeId(episode.id);
+                setSelectedNodeId(null);
+                setActiveThreadId(null);
+                setWorkspaceMode(destination === "review" ? "review" : "overview");
+              }}
+            />}
+            <div className="canvas-header">
+              <div className="canvas-header-copy">
                 <div className="breadcrumb">
-                  {activeEpisode.id} · {viewStage === activeEpisode.currentStage ? `Stage ${activeEpisode.currentStage + 1} of 3` : `Viewing Stage ${viewStage + 1} · Episode at Stage ${activeEpisode.currentStage + 1} of 3`}
+                  <span>Projects</span><span>/</span><span>{projects.find((project) => project.id === activeEpisode.projectId)?.name ?? "Unassigned"}</span><span>/</span><strong>{activeEpisode.id}</strong>
                 </div>
 
                 <h1>
@@ -8558,76 +9614,29 @@ export default function App() {
               </div>
 
               <div className="canvas-badges">
-                <button
-                  type="button"
-                  className={`action-button action-button-secondary notification-trigger ${notificationsOpen ? "active" : ""}`}
-                  aria-expanded={notificationsOpen}
-                  aria-controls="episode-notifications-drawer"
-                  aria-label="Notifications"
-                  title="Notifications"
-                  onClick={() => {
-                    if (notificationsOpen) {
-                      setNotificationsOpen(false);
-                      return;
-                    }
-                    const latestNotification = getLatestAgentNotification(activeEpisode.activity);
-                    setNotificationSeenByEpisode((current) => ({ ...current, [activeEpisode.id]: latestNotification?.id ?? null }));
-                    setNotificationsOpen(true);
-                    setActivityOpen(false);
-                    setDrawerOpen(false);
-                  }}
-                >
-                  <NotificationIcon />
-                  {getLatestAgentNotification(activeEpisode.activity)?.id !== notificationSeenByEpisode[activeEpisode.id] && <span className="notification-unseen-dot" aria-label="Unseen notifications" />}
-                </button>
-                <button
-                  type="button"
-                  className={`action-button action-button-secondary activity-trigger ${activityOpen ? "active" : ""}`}
-                  aria-expanded={activityOpen}
-                  aria-controls="episode-activity-drawer"
-                  onClick={() => {
-                    if (activityOpen) {
-                      setActivityOpen(false);
-                      return;
-                    }
-                    const latestActivity = activeEpisode.activity?.at(-1);
-                    setActivitySeenByEpisode((current) => ({
-                      ...current,
-                      [activeEpisode.id]: latestActivity?.id ?? null,
-                    }));
-                    setActivityOpen(true);
-                    setNotificationsOpen(false);
-                    setDrawerOpen(false);
-                  }}
-                >
-                  <ActivityIcon />
-                  <span>Activity{activeEpisode.activity?.length ? ` · ${activeEpisode.activity.length}` : ""}</span>
-                  {activeEpisode.activity?.length > 0 && activitySeenByEpisode[activeEpisode.id] !== activeEpisode.activity.at(-1)?.id && <span className="activity-unseen-dot" aria-label="Unseen activity" />}
-                </button>
-                <div className="canvas-status-context">
-                <button
-                  type="button"
-                  className={`badge episode-cockpit-trigger ${showEpisodeCockpit ? "active" : ""}`}
-                  aria-expanded={showEpisodeCockpit}
-                  aria-label={showEpisodeCockpit ? "Hide episode status" : "Show episode status"}
-                  onClick={() => setShowEpisodeCockpit((value) => !value)}
-                >
-                  <span className="episode-cockpit-stage"><strong>{activeEpisode.currentStage + 1}</strong><span>Stage</span></span>
-                  <span className="episode-cockpit-label">{showEpisodeCockpit ? "Hide status" : "Status"}</span>
-                </button>
-
-                <span className="badge codex-status-badge" title="Runtime: Local Codex · Mode: Analysis only">
-                  <StatusIndicator
-                    status={codexStatus.message === "Checking local Codex…" ? "waiting" : codexStatus.ready ? "ready" : codexStatus.authenticated === false && codexStatus.cliAvailable ? "human-required" : codexStatus.cliAvailable ? "waiting" : "error"}
-                    label={codexStatus.ready ? "Codex Ready" : codexStatus.message}
-                    size="sm"
-                  />
-                </span>
+                <div className="header-action-row">
+                  {activeEpisode.autopilotRun?.finalPackage && <button type="button" className="action-button action-button-primary workspace-review-cta" onClick={() => setWorkspaceMode("review")}>Review package <span aria-hidden="true">→</span></button>}
+                  <div className="header-meta"><span>Last updated</span><strong>{activeEpisode.activity?.at(-1)?.timestamp ? new Date(activeEpisode.activity.at(-1).timestamp).toLocaleString([], { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }) : "Not recorded"}</strong></div>
+                </div>
+                <div className="header-status-row">
+                  <span className="badge header-stage-badge">Stage {activeEpisode.currentStage + 1} · {activeStageTemplate.name}</span>
+                  <span className="badge header-active-badge">{activeEpisode.status === "archived" ? "Archived" : "Active"}</span>
+                  {codexStatus.ready && <span className="badge header-codex-badge">Codex Ready</span>}
+                  <span className="badge header-authority-badge">Human authority</span>
                 </div>
               </div>
-            </div>}
+            </div>
 
-            {showEpisodeCockpit && <EpisodeProgressGuide
+            <nav className="workspace-mode-tabs" aria-label="Episode workspace modes" role="tablist">
+              {[
+                ["overview", "Overview"],
+                ["conversation", "Conversation"],
+                ["work", "Work"],
+                ["review", "Review"],
+              ].map(([mode, label]) => <button key={mode} type="button" role="tab" aria-selected={workspaceMode === mode} className={workspaceMode === mode ? "active" : ""} onClick={() => { setWorkspaceMode(mode); setActivityOpen(false); setNotificationsOpen(false); }}>{label}</button>)}
+            </nav>
+
+            {workspaceMode === "overview" && <OverviewWorkspace
               episode={activeEpisode}
               viewStage={viewStage}
               liveOrchestrationRun={orchestrationRun}
@@ -8638,20 +9647,88 @@ export default function App() {
               }}
               onOpenIntake={() => setIntakePanelOpen(true)}
               onOpenActivity={() => {
-                const latestActivity = activeEpisode.activity?.at(-1);
-                setActivitySeenByEpisode((current) => ({ ...current, [activeEpisode.id]: latestActivity?.id ?? null }));
                 setActivityOpen(true);
+                setNotificationsOpen(false);
                 setDrawerOpen(false);
               }}
+              onOpenNotifications={() => {
+                setNotificationsOpen(true);
+                setActivityOpen(false);
+                setDrawerOpen(false);
+              }}
+              onOpenReview={() => setWorkspaceMode("review")}
+              onOpenWork={() => setWorkspaceMode("work")}
               onOpenOrchestration={openNodeOrchestration}
               onOpenSources={() => setSourceLibraryOpen(true)}
+              onExport={() => exportEpisodeReview(activeEpisode)}
             />}
+
+            {workspaceMode === "conversation" && <ConversationWorkspace
+              episode={activeEpisode}
+              conversation={activeEpisode.conversation}
+              threads={(activeEpisode.additions ?? []).filter((item) => item.kind === "thread")}
+              getNodeTitle={(thread) => findNodeTitle(activeEpisode, thread.stageIndex ?? viewStage, thread.parentNodeId) || "Episode conversation"}
+              onOpenThread={(thread) => {
+                setViewStage(thread.stageIndex ?? activeEpisode.currentStage);
+                setSelectedNodeId(thread.parentNodeId);
+                setActiveThreadId(thread.id);
+                setDrawerView("conversation");
+                setDrawerOpen(true);
+              }}
+              onOpenActivity={() => setActivityOpen(true)}
+              onOpenSources={() => setSourceLibraryOpen(true)}
+              onOpenWork={() => setWorkspaceMode("work")}
+              onOpenReview={() => setWorkspaceMode("review")}
+              onSend={handleEpisodeConversationSend}
+              contextPrompt={episodeConversationPrompt}
+            />}
+
+            {workspaceMode === "review" && <ReviewWorkspace
+              episode={activeEpisode}
+              run={autopilotRun?.episodeId === activeEpisode.id ? autopilotRun : activeEpisode.autopilotRun}
+              onOpenSources={() => setSourceLibraryOpen(true)}
+              onOpenActivity={() => setActivityOpen(true)}
+              onOpenWork={() => setWorkspaceMode("work")}
+              onAskWrx={askAboutReviewItem}
+              onInspectOutput={setReviewOutputDetail}
+              onWorkOnItem={proposeReviewFollowUp}
+              onPromote={promoteAutopilotPackage}
+              onPause={() => setAutopilotHumanStatus("paused")}
+              onReject={() => setAutopilotHumanStatus("rejected")}
+              onDisposition={recordDisposition}
+            />}
+
+            {workspaceMode === "work" && <div className="work-mode-toolbar" aria-label="Work canvas controls">
+              <div><span className="work-mode-eyebrow">Work</span><strong>Workflow canvas</strong><span className="work-mode-description">Inspect nodes, evidence branches, and retained run outputs.</span></div>
+              <div className="work-mode-actions">
+                <button type="button" className="mode-secondary-action" onClick={() => fitWorkflowCanvas()}>Fit workflow</button>
+                <button type="button" className="mode-secondary-action" onClick={() => fitWorkflowCanvas(true)}>Fit all</button>
+                {viewStage === 0 && ["accepted", "proposed"].includes(activeEpisode.intake?.status) && <button type="button" className="mode-secondary-action" onClick={organizeVisibleWorkflow}>Arrange</button>}
+                <button type="button" className="mode-secondary-action" onClick={focusSelectedNode} disabled={!selectedNodeIsValid}>Focus selected</button>
+                {(activeEpisode.additions ?? []).some((item) => item.stageIndex === viewStage && isGeneratedRunArtifact(item)) && <button type="button" className="mode-secondary-action" onClick={() => setShowGeneratedArtifacts((value) => !value)}>{showGeneratedArtifacts ? "Hide run outputs" : "Show run outputs"}</button>}
+                {!showAutopilotInspector && (autopilotRun?.episodeId === activeEpisode.id || activeEpisode.autopilotRun) && <button type="button" className="mode-secondary-action" onClick={() => setShowAutopilotInspector(true)}>Run inspector</button>}
+                {traceNodeId && <button type="button" className="mode-secondary-action" onClick={() => setTraceNodeId(null)}>Clear trace</button>}
+                <button type="button" className="mode-secondary-action" onClick={() => setActivityOpen(true)}>Activity</button>
+              </div>
+            </div>}
+
+            {workspaceMode === "work" && !hasWorkNodes && (
+              <section className="work-empty-state" aria-label="No work created">
+                <div className="work-empty-icon" aria-hidden="true">○</div>
+                <div>
+                  <span className="work-mode-eyebrow">No work yet</span>
+                  <h2>No work has been created for this episode yet.</h2>
+                  <p>Work is created from the episode Conversation after intent and authorization are established.</p>
+                  <button type="button" className="mode-primary-action" onClick={() => setWorkspaceMode("conversation")}>Open Conversation <span aria-hidden="true">→</span></button>
+                </div>
+              </section>
+            )}
 
             {/* CANVAS */}
 
             <div
               ref={flowWrapperRef}
-              className={`flow-wrapper ${showAutopilotInspector && (autopilotRun?.episodeId === activeEpisode.id || activeEpisode.autopilotRun) ? "with-run-inspector" : ""}`}
+              className={`flow-wrapper ${workspaceMode !== "work" ? "mode-hidden" : ""} ${workspaceMode === "work" && !hasWorkNodes ? "work-empty-canvas" : ""} ${showAutopilotInspector && (autopilotRun?.episodeId === activeEpisode.id || activeEpisode.autopilotRun) ? "with-run-inspector" : ""}`}
             >
               <ReactFlow
                 nodes={
@@ -8708,6 +9785,15 @@ export default function App() {
 
                     setDrawerOpen(false);
 
+                    return;
+                  }
+
+                  if (workspaceMode === "work") {
+                    setSelectedNodeId(node.id);
+                    setActiveThreadId(getThreadStats(activeEpisode, viewStage, node.id).latestThread?.id ?? null);
+                    setAnchoredConversationMinimized(false);
+                    setDrawerView("details");
+                    setDrawerOpen(true);
                     return;
                   }
 
@@ -8802,8 +9888,6 @@ export default function App() {
                 }}
               />
 
-              {!showAutopilotInspector && (autopilotRun?.episodeId === activeEpisode.id || activeEpisode.autopilotRun) && <button type="button" className="autopilot-inspector-reopen" onClick={() => setShowAutopilotInspector(true)}>Show run inspector</button>}
-
               {showAutopilotInspector && <AutopilotRunPanel
                 run={autopilotRun?.episodeId === activeEpisode.id ? autopilotRun : activeEpisode.autopilotRun}
                 onStop={cancelAutopilotEpisode}
@@ -8832,6 +9916,7 @@ export default function App() {
                 onClose={() => setIntakePanelOpen(false)}
                 onRequestRevision={requestIntakeRevision}
                 onAccept={acceptEpisodeStructure}
+                onConfirmIntent={confirmIntentForAnalysis}
                 codexRunning={codexRunningEpisodeId === activeEpisode.id}
                 codexStatus={codexStatus}
                 codexRun={codexRun?.episodeId === activeEpisode.id ? codexRun : null}
@@ -8958,7 +10043,7 @@ export default function App() {
               </OrchestrationErrorBoundary>
             </div>
 
-            {!drawerOpen &&
+            {workspaceMode === "work" && !drawerOpen &&
               !anchoredConversationMinimized &&
               selectedNodeIsValid && (
               <AnchoredConversationCard
@@ -9034,11 +10119,16 @@ export default function App() {
               sourceManifest={activeEpisode.sources ?? []}
               nodeSourceManifest={(activeEpisode.sources ?? []).filter((source) => (activeEpisode.nodeSourceIds?.[drawerAnchorId] ?? []).includes(source.sourceId))}
               onOpenSource={setSourceViewerId}
+              onOpenSources={() => { setDrawerOpen(false); setSourceLibraryOpen(true); }}
+              onOpenActivity={() => { setDrawerOpen(false); setActivityOpen(true); }}
+              onOpenReview={() => { setDrawerOpen(false); setWorkspaceMode("review"); }}
               onAttachSources={(files) => { void attachNodeSources(drawerAnchorId, files).catch((error) => window.alert(error.message || "Could not attach those files.")); }}
               attachmentsBusy={nodeSourceBusy}
               initialView={drawerView}
               nodeDetails={getNodeDetails(drawerAnchorId)}
               onExportReview={exportNodeOutputReview}
+              onRunFollowUp={() => openFollowUpExecution(drawerAnchorId)}
+              followUpExecutionBusy={followUpExecutionRun?.status === "queued" || followUpExecutionRun?.status === "working"}
               onSend={
                 handleDrawerSend
               }

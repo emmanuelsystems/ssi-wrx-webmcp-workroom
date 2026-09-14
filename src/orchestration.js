@@ -12,6 +12,7 @@ export const ORCHESTRATION_TASK_OUTPUT_SCHEMA = {
     assumptions: { type: "array", items: { type: "string" } },
     unresolvedQuestions: { type: "array", items: { type: "string" } },
     recommendedNextStep: { type: "string" },
+    reviewOutcome: { type: "string", enum: ["resolved", "partially-resolved", "still-unresolved"] },
   },
   required: [
     "taskId",
@@ -129,6 +130,12 @@ function slugify(value) {
 
 function getTemplateKey(node) {
   const nodeKind = node?.data?.workflowKind ?? node?.kind;
+  if (nodeKind === "action" && node?.createdFrom === "review") {
+    const originType = node?.metadata?.reviewOrigin?.type ?? node?.data?.metadata?.reviewOrigin?.type;
+    if (originType === "evidence") return "evidence";
+    if (["conflict", "risk", "gap", "finding"].includes(originType)) return "gaps";
+    return "recommendation";
+  }
   if (nodeKind === "inquiry") return "inquiry";
   if (nodeKind === "evidence") return "evidence";
   if (nodeKind === "gap") return "gaps";
@@ -239,6 +246,40 @@ export function createOrchestrationPlan({
   };
 }
 
+export function isReviewFollowUpNode(node) {
+  return Boolean(node && (node.kind ?? node.data?.workflowKind) === "action" && node.createdFrom === "review");
+}
+
+export function createFollowUpOrchestrationPlan({ episode, node, threads = [], context = {} }) {
+  const plan = createOrchestrationPlan({ episode, node, threads, context });
+  return {
+    ...plan,
+    status: "approved",
+    objective: node?.title ?? plan.objective,
+    request: {
+      ...plan.request,
+      allowedAuthority: "Approved bounded read-only analysis. No stage advancement or disposition.",
+      expectedOutcome: node?.expectedOutcome ?? context.expectedOutcome ?? plan.request.expectedOutcome,
+    },
+    authority: {
+      ...plan.authority,
+      mayNot: plan.authority.mayNot.filter((item) => item !== "execute anything in this prototype"),
+    },
+    followUp: {
+      origin: node?.metadata?.reviewOrigin ?? null,
+      approvedScope: node?.description ?? node?.expectedOutcome ?? "Read-only inspection of the approved review follow-up.",
+      approvedSourceIds: node?.sourceIds ?? [],
+    },
+  };
+}
+
+export function validateFollowUpOutput(output) {
+  if (output?.reviewOutcome !== undefined && !["resolved", "partially-resolved", "still-unresolved"].includes(output.reviewOutcome)) {
+    return { valid: false, error: "reviewOutcome is invalid." };
+  }
+  return { valid: true };
+}
+
 export function createMockExecutionState(plan) {
   const assignments = plan?.assignments ?? [];
   return assignments.reduce((state, assignment, index) => {
@@ -292,6 +333,8 @@ export function validateOrchestrationTaskOutput(output, taskId, sourceIds = []) 
   }
   const knownSourceIds = new Set(sourceIds);
   if (output.evidenceSourceIds.some((sourceId) => !knownSourceIds.has(sourceId))) return { valid: false, error: "Task output cited an unknown source." };
+  const outcomeValidation = validateFollowUpOutput(output);
+  if (!outcomeValidation.valid) return outcomeValidation;
   return { valid: true };
 }
 
@@ -360,6 +403,7 @@ export function mapOrchestrationArtifacts(outputs, { nodeId, nodeKind, runId, st
       assumptions: output.assumptions,
       unresolvedQuestions: output.unresolvedQuestions,
       recommendedNextStep: output.recommendedNextStep,
+      reviewOutcome: output.reviewOutcome,
     };
   });
 }

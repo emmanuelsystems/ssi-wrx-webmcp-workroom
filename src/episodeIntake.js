@@ -16,6 +16,8 @@ const ALLOWED_NODE_KINDS = new Set([
   "evaluation",
 ]);
 
+const INTENT_REVIEW_STATUSES = new Set(["review-required", "confirmed"]);
+
 import { validateSourceManifest, validateSourceReferences } from "./episodeSources.js";
 
 export const EPISODE_STRUCTURE_OUTPUT_SCHEMA = {
@@ -70,10 +72,11 @@ export const EPISODE_STRUCTURE_OUTPUT_SCHEMA = {
 };
 
 export function createEpisodeIntakeRequest({ episode }) {
+  const intent = normalizeIntentSummary(episode?.intent, episode);
   return {
     episodeId: episode?.id,
-    objective: episode?.title ?? "",
-    providedContext: episode?.context ?? "",
+    objective: intent?.objective ?? episode?.title ?? "",
+    providedContext: intent?.context ?? episode?.context ?? "",
     sources: episode?.sources ?? [],
     requestedAnalysis: REQUESTED_ANALYSIS,
     authority: {
@@ -92,6 +95,41 @@ export function createEpisodeIntakeRequest({ episode }) {
         "silently expand scope",
       ],
     },
+  };
+}
+
+export function createIntentSummary({ episode }) {
+  return {
+    status: "review-required",
+    objective: String(episode?.title ?? "").trim(),
+    context: String(episode?.context ?? "").trim(),
+    sourceCount: Array.isArray(episode?.sources) ? episode.sources.length : 0,
+    authority: {
+      may: "read-only analysis and a proposed episode structure",
+      mayNot: "advance stages, make a disposition, execute work, or expand scope",
+    },
+    confirmedAt: null,
+  };
+}
+
+export function normalizeIntentSummary(intent, episode) {
+  if (!intent || typeof intent !== "object") return null;
+  return {
+    status: INTENT_REVIEW_STATUSES.has(intent.status) ? intent.status : "review-required",
+    objective: typeof intent.objective === "string" ? intent.objective : String(episode?.title ?? ""),
+    context: typeof intent.context === "string" ? intent.context : String(episode?.context ?? ""),
+    sourceCount: Number.isInteger(intent.sourceCount) && intent.sourceCount >= 0
+      ? intent.sourceCount
+      : (Array.isArray(episode?.sources) ? episode.sources.length : 0),
+    authority: {
+      may: typeof intent.authority?.may === "string"
+        ? intent.authority.may
+        : "read-only analysis and a proposed episode structure",
+      mayNot: typeof intent.authority?.mayNot === "string"
+        ? intent.authority.mayNot
+        : "advance stages, make a disposition, execute work, or expand scope",
+    },
+    confirmedAt: typeof intent.confirmedAt === "string" ? intent.confirmedAt : null,
   };
 }
 
@@ -237,7 +275,7 @@ export function createWorkflowGateEdges(humanGates = [], terminalNodeIds = []) {
 
 export function normalizeEpisodeIntake(intake) {
   return {
-    status: ["idle", "pending", "proposed", "accepted"].includes(intake?.status)
+    status: ["idle", "intent-review", "pending", "proposed", "accepted"].includes(intake?.status)
       ? intake.status
       : "idle",
     request: intake?.request ?? null,

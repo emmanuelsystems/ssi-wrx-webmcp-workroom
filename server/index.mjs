@@ -4,6 +4,7 @@ import { createEpisodeIntakeProposal, streamEpisodeIntakeProposal } from "./epis
 import { streamOrchestrationRun, validateOrchestrationInput } from "./orchestrationAgent.mjs";
 import { streamAutopilotRun, validateAutopilotInput } from "./autopilotAgent.mjs";
 import { streamNodeConversation, validateNodeConversationInput } from "./nodeConversationAgent.mjs";
+import { streamEpisodeConversation, validateEpisodeConversationInput } from "./episodeConversationAgent.mjs";
 import { MAX_SOURCE_FILES, validateSourceManifest } from "../src/episodeSources.js";
 
 const HOST = "127.0.0.1";
@@ -117,6 +118,7 @@ const server = createServer(async (request, response) => {
         nodeId: input.nodeId,
         plan: input.plan,
         sourceIds: (input.sources ?? []).map((source) => source.sourceId),
+        followUp: input.followUp ?? null,
       };
       const run = { id: crypto.randomUUID(), kind: "orchestration", input: retainedInput, outputs: [], events: [], subscribers: new Set(), controller: new AbortController(), done: false, status: "queued", startedAt: Date.now() };
       runs.set(run.id, run);
@@ -140,6 +142,19 @@ const server = createServer(async (request, response) => {
       void streamNodeConversation({ input, repoRoot: REPO_ROOT, signal: run.controller.signal, onEvent: (event) => emit(run, event) })
         .then((result) => finishRun(run, { type: "completed", response: result.response, threadId: result.threadId }))
         .catch((error) => finishRun(run, { type: error.name === "AbortError" ? "cancelled" : "error", message: error.name === "AbortError" ? "Node conversation cancelled." : (error.message || "Codex node response failed.") }));
+      sendJson(response, 202, { runId: run.id });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/codex/episode-conversation/start") {
+      const input = await readJson(request);
+      validateEpisodeConversationInput(input);
+      pruneRuns();
+      const run = { id: crypto.randomUUID(), kind: "episode-conversation", input: { episodeId: input.episodeId }, events: [], subscribers: new Set(), controller: new AbortController(), done: false, status: "queued", startedAt: Date.now() };
+      runs.set(run.id, run);
+      emit(run, { type: "status", label: "WRX queued" });
+      void streamEpisodeConversation({ input, repoRoot: REPO_ROOT, signal: run.controller.signal, onEvent: (event) => emit(run, event) })
+        .then((result) => finishRun(run, { type: "completed", response: result.response, threadId: result.threadId }))
+        .catch((error) => finishRun(run, { type: error.name === "AbortError" ? "cancelled" : "error", message: error.name === "AbortError" ? "Episode conversation cancelled." : (error.message || "WRX episode response failed.") }));
       sendJson(response, 202, { runId: run.id });
       return;
     }
