@@ -74,6 +74,24 @@ import {
 } from "./projects";
 
 import StatusIndicator from "./StatusIndicator";
+import SharedAccessPanel from "./SharedAccessPanel";
+import { exportLocalEpisode, validateLegacyEpisodeBundle } from "./legacyEpisodeTransfer";
+import {
+  applyAuthorityAction,
+  createSharedEpisode,
+  createSharedProject,
+  createSharedSource,
+  getUser,
+  loadSharedEpisodeAudit,
+  loadSharedWorkroom,
+  saveSharedSession,
+  sharedWorkroomConfigured,
+  signInWithPassword,
+  signOut,
+  storedSharedSession,
+  updateSharedEpisode,
+  uploadSharedSource,
+} from "./sharedWorkroom";
 
 import "./App.css";
 
@@ -198,7 +216,7 @@ function createActivityEvent({
     episodeId,
     timestamp: new Date().toISOString(),
     type,
-    actor: { kind: actor },
+    actor: typeof actor === "string" ? { kind: actor } : actor,
     title,
     summary,
     metadata,
@@ -3910,14 +3928,14 @@ function SourceLibrary({ episode, onClose, onOpenSource }) {
         <div>
           <div className="drawer-eyebrow">Episode source material</div>
           <h2>{sources.length} uploaded {sources.length === 1 ? "file" : "files"}</h2>
-          <p>Files stay in this browser. Codex only receives bounded extracted text when you start an analysis.</p>
+          <p>{episode?.sharedId ? "Files are stored privately in the shared Workroom. Codex only receives bounded extracted text when you start an analysis." : "Files stay in this browser. Codex only receives bounded extracted text when you start an analysis."}</p>
         </div>
         <button type="button" onClick={onClose} aria-label="Close source material">×</button>
       </header>
       {sources.length > 0 ? <div className="source-library-list">
         {sources.map((source) => <button type="button" key={source.sourceId} onClick={() => { onOpenSource(source.sourceId); onClose(); }}>
           <span className="source-library-file-icon" aria-hidden="true">⌁</span>
-          <span><strong>{source.fileName}</strong><small>{source.fileType || source.extension?.toUpperCase() || "File"} · {source.charCount.toLocaleString()} extracted characters · Stored locally</small></span>
+          <span><strong>{source.fileName}</strong><small>{source.fileType || source.extension?.toUpperCase() || "File"} · {source.charCount.toLocaleString()} extracted characters · {episode?.sharedId ? "Private shared storage" : "Stored locally"}</small></span>
           <span className="source-library-open">Open</span>
         </button>)}
       </div> : <p className="source-library-empty">No source material has been attached to this episode.</p>}
@@ -4363,7 +4381,7 @@ function ActivityDrawer({ episode, open, onClose }) {
             <article key={event.id} className={`activity-event ${event.authorityImpact ?? ""}`}>
               <time>{new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
               <div className="activity-event-marker" aria-hidden="true">{event.actor?.kind === "human" ? "♙" : event.actor?.kind === "codex" ? "●" : "•"}</div>
-              <div className="activity-event-copy"><strong>{event.title}</strong><span>{event.actor?.kind === "codex" ? "Codex" : event.actor?.kind === "human" ? "Human" : "System"}</span>{event.summary && <p>{event.summary}</p>}</div>
+              <div className="activity-event-copy"><strong>{event.title}</strong><span>{event.actor?.label ?? (event.actor?.kind === "codex" ? "Codex" : event.actor?.kind === "human" ? "Human" : event.actor?.kind === "UNKNOWN_LEGACY" ? "Unknown legacy actor" : "System")}</span>{event.summary && <p>{event.summary}</p>}</div>
             </article>
           )) : <p className="activity-empty">No activity recorded for this filter.</p>}
         </div>
@@ -4392,6 +4410,14 @@ export default function App() {
   );
 
   const [projects, setProjects] = useState(() => loadProjects());
+  const [sharedSession, setSharedSession] = useState(() => sharedWorkroomConfigured ? storedSharedSession() : null);
+  const [sharedLoading, setSharedLoading] = useState(Boolean(sharedWorkroomConfigured && storedSharedSession()));
+  const [sharedError, setSharedError] = useState("");
+  const [sharedAudit, setSharedAudit] = useState(null);
+  const [controlledSaveCheck, setControlledSaveCheck] = useState(null);
+  const [legacyExportSummary, setLegacyExportSummary] = useState(null);
+  const [sharedConflict, setSharedConflict] = useState(null);
+  const sharedWriteTimers = useRef(new Map());
   const [projectModalOpen, setProjectModalOpen] = useState(false);
   const [sidebarCreateMenuOpen, setSidebarCreateMenuOpen] = useState(false);
   const [editingProject, setEditingProject] = useState(null);
@@ -4630,17 +4656,39 @@ export default function App() {
   /* ---------------------------------------------------------------------- */
 
   useEffect(() => {
+    if (sharedSession) return;
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify(
         episodes
       )
     );
-  }, [episodes]);
+  }, [episodes, sharedSession]);
 
   useEffect(() => {
+    if (sharedSession) return;
     localStorage.setItem(PROJECTS_STORAGE_KEY, JSON.stringify(projects));
-  }, [projects]);
+  }, [projects, sharedSession]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!sharedSession) {
+      setSharedLoading(false);
+      return undefined;
+    }
+    setSharedLoading(true);
+    loadSharedWorkroom(sharedSession.accessToken)
+      .then((shared) => {
+        if (cancelled) return;
+        setEpisodes(shared.episodes);
+        setProjects(shared.projects);
+        setActiveEpisodeId(shared.episodes[0]?.id ?? null);
+        setSharedError("");
+      })
+      .catch((error) => { if (!cancelled) setSharedError(error.message || "Could not load shared Workroom."); })
+      .finally(() => { if (!cancelled) setSharedLoading(false); });
+    return () => { cancelled = true; };
+  }, [sharedSession]);
 
   useEffect(() => {
     let cancelled = false;
@@ -4710,23 +4758,167 @@ export default function App() {
     updater
   ) {
     setEpisodes(
-      (current) =>
-        current.map(
-          (episode) =>
-            episode.id ===
-            episodeId
-              ? updater(
-                  episode
-                )
-              : episode
-        )
+      (current) => {
+        const next = current.map((episode) => episode.id === episodeId ? updater(episode) : episode);
+        const changed = next.find((episode) => episode.id === episodeId);
+        if (sharedSession && changed?.sharedId) scheduleSharedEpisodeSave(changed);
+        return next;
+      }
     );
   }
 
+  function scheduleSharedEpisodeSave(episode) {
+    const existing = sharedWriteTimers.current.get(episode.sharedId);
+    if (existing) clearTimeout(existing.timer);
+    const timer = window.setTimeout(async () => {
+      const pending = sharedWriteTimers.current.get(episode.sharedId);
+      if (!pending || !sharedSession) return;
+      sharedWriteTimers.current.delete(episode.sharedId);
+      try {
+        const saved = await updateSharedEpisode(sharedSession.accessToken, pending.episode, pending.episode.sharedVersion, sharedSession.user.id);
+        setEpisodes((current) => current.map((item) => item.sharedId === saved.id ? { ...item, sharedVersion: saved.version } : item));
+      } catch (error) {
+        if (error.code === "WRX_CONFLICT") setSharedConflict(pending.episode);
+        else setSharedError(error.message || "Shared Episode save failed.");
+      }
+    }, 120);
+    sharedWriteTimers.current.set(episode.sharedId, { timer, episode });
+  }
+
+  function applySharedAuthority(episodeId, actionType, updater, activity) {
+    if (!sharedSession) {
+      updateEpisode(episodeId, updater);
+      appendActivity(episodeId, activity);
+      return;
+    }
+    setEpisodes((current) => current.map((episode) => {
+      if (episode.id !== episodeId) return episode;
+      const actor = { kind: "human", id: sharedSession.user.id, label: sharedSession.user.email };
+      const updated = updater(episode);
+      const next = { ...updated, activity: [...(updated.activity ?? []), createActivityEvent({ episodeId, ...activity, actor })] };
+      void applyAuthorityAction(sharedSession.accessToken, {
+        episode: next,
+        expectedVersion: episode.sharedVersion,
+        actorId: sharedSession.user.id,
+        actionType,
+        payload: { title: activity.title, summary: activity.summary, approvedScope: activity.metadata ?? {} },
+      }).then((saved) => {
+        setEpisodes((items) => items.map((item) => item.sharedId === saved.id ? { ...item, sharedVersion: saved.version } : item));
+      }).catch((error) => {
+        if (error.code === "WRX_CONFLICT") setSharedConflict(next);
+        else setSharedError(error.message || "Shared authority action failed.");
+      });
+      return next;
+    }));
+  }
+
+  async function inspectSharedAudit() {
+    if (!sharedSession || !activeEpisode?.sharedId) return;
+    try {
+      setSharedError("");
+      const audit = await loadSharedEpisodeAudit(sharedSession.accessToken, activeEpisode.sharedId);
+      setSharedAudit({ episodeId: activeEpisode.sharedId, ...audit });
+    } catch (error) {
+      setSharedError(error.message || "Could not load shared audit records.");
+    }
+  }
+
+  async function verifyControlledSaveProtection() {
+    if (!sharedSession || !activeEpisode?.sharedId) return;
+    const attempts = [
+      ["stage", { ...activeEpisode, currentStage: Math.min((activeEpisode.currentStage ?? 0) + 1, 2) }],
+      ["final disposition", { ...activeEpisode, disposition: "temporary-test" }],
+      ["resolved state", { ...activeEpisode, status: "resolved" }],
+    ];
+    const results = [];
+    for (const [label, episode] of attempts) {
+      try {
+        await updateSharedEpisode(sharedSession.accessToken, episode, activeEpisode.sharedVersion, sharedSession.user.id);
+        results.push(`${label}: unexpectedly accepted`);
+      } catch (error) {
+        results.push(`${label}: ${error.message || "rejected"}`);
+      }
+    }
+    setControlledSaveCheck({ episodeId: activeEpisode.sharedId, results });
+    void inspectSharedAudit();
+  }
+
+  async function prepareLegacyExport(displayKey = "E0-020") {
+    try {
+      const bundle = await exportLocalEpisode(displayKey);
+      validateLegacyEpisodeBundle(bundle);
+      const episode = bundle.episode;
+      const sourceIds = new Set((episode.sources ?? []).map((source) => source.sourceId));
+      const nestedIds = [
+        ...(episode.workflow?.nodes ?? []).map((node) => node.id),
+        ...(episode.additions ?? []).map((item) => item.id),
+      ];
+      const duplicateNestedIds = nestedIds.length !== new Set(nestedIds).size;
+      const missingSourceReferences = [
+        ...(episode.workflow?.nodes ?? []),
+        ...(episode.additions ?? []),
+      ].flatMap((item) => item.sourceIds ?? []).filter((sourceId) => !sourceIds.has(sourceId));
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${displayKey}-legacy-export.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setLegacyExportSummary({
+        displayKey,
+        title: episode.name || episode.title || "Untitled Episode",
+        projectId: episode.projectId ?? null,
+        sourceCount: bundle.sources.length,
+        conversationCount: episode.conversation?.length ?? 0,
+        workNodeCount: episode.workflow?.nodes?.length ?? 0,
+        workSubthreadCount: (episode.additions ?? []).filter((item) => item.kind === "thread").length,
+        evidenceOutputCount: (episode.additions ?? []).filter((item) => item.kind !== "thread").length,
+        activityCount: episode.activity?.length ?? 0,
+        reviewState: episode.autopilotRun?.humanReviewStatus ?? "none",
+        disposition: episode.disposition ?? "none",
+        duplicateNestedIds,
+        missingSourceReferences,
+        allLegacyActors: (episode.activity ?? []).every((event) => event.actor?.kind === "UNKNOWN_LEGACY"),
+      });
+    } catch (error) {
+      setLegacyExportSummary({ error: error.message || `Could not export ${displayKey}.` });
+    }
+  }
+
+  async function handleSharedSignIn(email, password) {
+    setSharedError("");
+    try {
+      const auth = await signInWithPassword(email, password);
+      const session = { accessToken: auth.access_token, refreshToken: auth.refresh_token ?? null, user: auth.user };
+      const user = await getUser(session.accessToken);
+      session.user = user;
+      saveSharedSession(session);
+      setSharedSession(session);
+    } catch (error) {
+      setSharedError(error.message || "Sign-in failed.");
+      throw error;
+    }
+  }
+
+  async function handleSharedSignOut() {
+    try { if (sharedSession) await signOut(sharedSession.accessToken); } catch { /* Expired sessions can still be cleared locally. */ }
+    for (const item of sharedWriteTimers.current.values()) clearTimeout(item.timer);
+    sharedWriteTimers.current.clear();
+    saveSharedSession(null);
+    setSharedSession(null);
+    setEpisodes(loadEpisodes());
+    setProjects(loadProjects());
+    setActiveEpisodeId(loadEpisodes()[0]?.id ?? null);
+  }
+
   function appendActivity(episodeId, event) {
+    const actor = event.actor === "human" && sharedSession
+      ? { kind: "human", id: sharedSession.user.id, label: sharedSession.user.email }
+      : event.actor;
     updateEpisode(episodeId, (episode) => ({
       ...episode,
-      activity: [...(episode.activity ?? []), createActivityEvent({ episodeId, ...event })],
+      activity: [...(episode.activity ?? []), createActivityEvent({ episodeId, ...event, actor })],
     }));
   }
 
@@ -4824,8 +5016,10 @@ export default function App() {
       createdFrom: "review",
       createdAt: new Date().toISOString(),
     };
-    updateEpisode(activeEpisode.id, (episode) => ({ ...episode, additions: [...(episode.additions ?? []), node] }));
-    appendActivity(activeEpisode.id, {
+    applySharedAuthority(activeEpisode.id, "follow_up_authorized", (episode) => ({
+      ...episode,
+      additions: [...(episode.additions ?? []), node],
+    }), {
       type: "review.follow_up_created",
       actor: "human",
       title: "Bounded follow-up Work created",
@@ -4855,6 +5049,12 @@ export default function App() {
       const validation = validateSourceManifest([...(activeEpisode.sources ?? []), ...manifest]);
       if (!validation.valid) throw new Error(validation.error);
       await saveEpisodeSources(records, activeEpisode.id);
+      if (sharedSession && activeEpisode.sharedId) {
+        for (const source of records) {
+          const objectKeys = await uploadSharedSource(sharedSession.accessToken, source, activeEpisode.sharedId);
+          await createSharedSource(sharedSession.accessToken, source, activeEpisode.sharedId, sharedSession.user.id, objectKeys);
+        }
+      }
       updateEpisode(activeEpisode.id, (episode) => ({
         ...episode,
         sources: [...(episode.sources ?? []), ...manifest],
@@ -5796,7 +5996,19 @@ export default function App() {
     );
     const workflowGates = createWorkflowGates(proposal.humanGates);
 
-    updateEpisode(activeEpisode.id, (episode) => ({
+    const activity = {
+      type: "proposal.accepted",
+      actor: "human",
+      title: "Structure accepted",
+      summary: `${proposal.workNodes?.length ?? 0} work nodes · ${proposal.humanGates?.length ?? 0} human checkpoints`,
+      metadata: {
+        proposalId: proposal.id ?? null,
+        workNodeCount: proposal.workNodes?.length ?? 0,
+        humanGateCount: proposal.humanGates?.length ?? 0,
+      },
+      authorityImpact: "accepted",
+    };
+    applySharedAuthority(activeEpisode.id, "structure_accepted", (episode) => ({
       ...episode,
       intake: {
         ...normalizeEpisodeIntake(episode.intake),
@@ -5814,19 +6026,7 @@ export default function App() {
           ),
         ],
       },
-    }));
-    appendActivity(activeEpisode.id, {
-      type: "proposal.accepted",
-      actor: "human",
-      title: "Structure accepted",
-      summary: `${proposal.workNodes?.length ?? 0} work nodes · ${proposal.humanGates?.length ?? 0} human checkpoints`,
-      metadata: {
-        proposalId: proposal.id ?? null,
-        workNodeCount: proposal.workNodes?.length ?? 0,
-        humanGateCount: proposal.humanGates?.length ?? 0,
-      },
-      authorityImpact: "accepted",
-    });
+    }), activity);
     setIntakePanelOpen(false);
   }
 
@@ -6494,7 +6694,7 @@ export default function App() {
           type: "source.ingested",
           actor: "human",
           title: "Source material ingested",
-          summary: `${sourceManifest.length} source${sourceManifest.length === 1 ? "" : "s"} extracted and stored locally.`,
+          summary: `${sourceManifest.length} source${sourceManifest.length === 1 ? "" : "s"} extracted and ${sharedSession ? "stored privately in the shared Workroom" : "stored locally"}.`,
           metadata: { sourceIds: sourceManifest.map((source) => source.sourceId) },
         })] : []),
         ...(setupMode === "agent-assisted" ? [createActivityEvent({
@@ -6521,10 +6721,25 @@ export default function App() {
       episode.intake.request = createEpisodeIntakeRequest({ episode });
     }
 
+    let persistedEpisode = episode;
+    if (sharedSession) {
+      try {
+        const created = await createSharedEpisode(sharedSession.accessToken, episode, sharedSession.user.id);
+        for (const source of sources) {
+          const objectKeys = await uploadSharedSource(sharedSession.accessToken, source, created.id);
+          await createSharedSource(sharedSession.accessToken, source, created.id, sharedSession.user.id, objectKeys);
+        }
+        persistedEpisode = { ...episode, sharedId: created.id, sharedVersion: created.version };
+      } catch (error) {
+        setSharedError(error.message || "Could not create the shared Episode.");
+        throw error;
+      }
+    }
+
     setEpisodes(
       (current) => [
         ...current,
-        episode,
+        persistedEpisode,
       ]
     );
 
@@ -6671,14 +6886,19 @@ export default function App() {
     if (!activeEpisode?.autopilotRun?.finalPackage) return;
     if (activeEpisode.autopilotRun.humanReviewStatus === "promoted") return;
     const packageValue = activeEpisode.autopilotRun.finalPackage;
-    updateEpisode(activeEpisode.id, (episode) => ({ ...episode, context: `${episode.context ?? ""}\n\nTrusted context package:\n${packageValue.summary}`, autopilotRun: { ...episode.autopilotRun, humanReviewStatus: "promoted" } }));
-    appendActivity(activeEpisode.id, { type: "autopilot.package_promoted", actor: "human", title: "Autopilot package promoted", summary: "Trusted context updated; stage and disposition unchanged.", authorityImpact: "human-review" });
+    applySharedAuthority(activeEpisode.id, "package_promoted", (episode) => ({ ...episode, context: `${episode.context ?? ""}\n\nTrusted context package:\n${packageValue.summary}`, autopilotRun: { ...episode.autopilotRun, humanReviewStatus: "promoted" } }), { type: "autopilot.package_promoted", actor: "human", title: "Autopilot package promoted", summary: "Trusted context updated; stage and disposition unchanged.", authorityImpact: "human-review" });
   }
 
   function setAutopilotHumanStatus(status) {
     if (!activeEpisode) return;
-    updateEpisode(activeEpisode.id, (episode) => ({ ...episode, autopilotRun: { ...episode.autopilotRun, humanReviewStatus: status } }));
-    appendActivity(activeEpisode.id, { type: `autopilot.package_${status}`, actor: "human", title: `Autopilot package ${status}`, summary: "Human review action recorded; stage and disposition unchanged.", authorityImpact: "human-review" });
+    const activity = { type: `autopilot.package_${status}`, actor: "human", title: `Autopilot package ${status}`, summary: "Human review action recorded; stage and disposition unchanged.", authorityImpact: "human-review" };
+    const actionType = status === "paused" ? "package_paused" : status === "rejected" ? "package_rejected" : null;
+    const updater = (episode) => ({ ...episode, autopilotRun: { ...episode.autopilotRun, humanReviewStatus: status } });
+    if (actionType) applySharedAuthority(activeEpisode.id, actionType, updater, activity);
+    else {
+      updateEpisode(activeEpisode.id, updater);
+      appendActivity(activeEpisode.id, activity);
+    }
   }
 
   async function runNativeCodexIntake(episode, revisionInstruction = "") {
@@ -6824,7 +7044,7 @@ export default function App() {
     setCodexRunningEpisodeId(null);
   }
 
-  function createProject({ name, description }) {
+  async function createProject({ name, description }) {
     const project = {
       id: `project-${crypto.randomUUID()}`,
       name,
@@ -6832,15 +7052,25 @@ export default function App() {
       createdAt: new Date().toISOString(),
       archived: false,
     };
-    setProjects((current) => [...current, project]);
-    setExpandedProjects((current) => ({ ...current, [project.id]: true }));
-    setNewEpisodeProjectId(createOpen ? project.id : null);
+    let persistedProject = project;
+    if (sharedSession) {
+      try {
+        const created = await createSharedProject(sharedSession.accessToken, project, sharedSession.user.id);
+        persistedProject = { ...project, id: created.id, projectId: created.id, createdAt: created.created_at };
+      } catch (error) {
+        setSharedError(error.message || "Could not create the shared project.");
+        return;
+      }
+    }
+    setProjects((current) => [...current, persistedProject]);
+    setExpandedProjects((current) => ({ ...current, [persistedProject.id]: true }));
+    setNewEpisodeProjectId(createOpen ? persistedProject.id : null);
     setProjectModalOpen(false);
   }
 
   function saveProject({ name, description, projectId }) {
     if (!projectId) {
-      createProject({ name, description });
+      void createProject({ name, description });
       return;
     }
     setProjects((current) => current.map((project) => project.id === projectId ? { ...project, name, description } : project));
@@ -6896,16 +7126,12 @@ export default function App() {
       activeEpisode.currentStage +
       1;
 
-    updateActiveEpisode(
-      (episode) => ({
+    applySharedAuthority(activeEpisode.id, "stage_advanced", (episode) => ({
         ...episode,
 
         currentStage:
           nextStage,
-      })
-    );
-
-    appendActivity(activeEpisode.id, {
+      }), {
       type: "stage.advanced",
       actor: "human",
       title: "Human advanced Episode stage",
@@ -6938,17 +7164,14 @@ export default function App() {
   function recordDisposition(
     disposition
   ) {
-    updateActiveEpisode(
-      (episode) => ({
+    applySharedAuthority(activeEpisode.id, "final_disposition_recorded", (episode) => ({
         ...episode,
 
         disposition,
 
         status:
           "resolved",
-      })
-    );
-    appendActivity(activeEpisode.id, {
+      }), {
       type: "human.disposition_recorded",
       actor: "human",
       title: "Human disposition recorded",
@@ -9345,7 +9568,7 @@ export default function App() {
       : "";
 
   const drawerAnchorAddition =
-    activeEpisode.additions?.find(
+    activeEpisode?.additions?.find(
       (item) =>
         item.id ===
         drawerAnchorId
@@ -9367,9 +9590,9 @@ export default function App() {
   const activeEpisodeCount = episodes.filter((episode) => episode.status === "active").length;
   const draftEpisodeCount = episodes.filter((episode) => ["intent-review", "pending", "proposed"].includes(episode.intake?.status)).length;
   const hasWorkNodes = Boolean(
-    activeEpisode.workflow?.nodes?.length ||
-      activeEpisode.intake?.proposal?.workNodes?.length ||
-      activeEpisode.additions?.some((item) => item.stageIndex === viewStage && isDurableArtifact(item) && item.kind !== "thread")
+    activeEpisode?.workflow?.nodes?.length ||
+      activeEpisode?.intake?.proposal?.workNodes?.length ||
+      activeEpisode?.additions?.some((item) => item.stageIndex === viewStage && isDurableArtifact(item) && item.kind !== "thread")
   );
 
   /* ---------------------------------------------------------------------- */
@@ -9379,13 +9602,38 @@ export default function App() {
   if (!activeEpisode) {
     return (
       <main className="app">
-        No episodes available.
+        <SharedAccessPanel
+          configured={sharedWorkroomConfigured}
+          session={sharedSession}
+          loading={sharedLoading}
+          error={sharedError}
+          onSignIn={handleSharedSignIn}
+          onSignOut={handleSharedSignOut}
+        />
+        <NewEpisodeModal
+          open={createOpen}
+          onClose={() => setCreateOpen(false)}
+          onCreate={createEpisode}
+          projects={projects}
+          initialProjectId={newEpisodeProjectId}
+          onCreateProject={() => setProjectModalOpen(true)}
+        />
+        <section className="shared-empty-state"><h1>Shared Workroom is ready</h1><p>No shared Episodes exist yet. Create the first shared Episode, or import one local Episode.</p><button type="button" className="action-button action-button-primary" onClick={() => setCreateOpen(true)}>Create shared Episode</button></section>
       </main>
     );
   }
 
   return (
     <main className="app">
+      <SharedAccessPanel
+        configured={sharedWorkroomConfigured}
+        session={sharedSession}
+        loading={sharedLoading}
+        error={sharedError}
+        onSignIn={handleSharedSignIn}
+        onSignOut={handleSharedSignOut}
+      />
+      {sharedConflict && <div className="shared-conflict" role="alert"><strong>Shared update needs review.</strong><span>Another person changed this Episode first. Reload the shared Workroom before making another decision.</span><button type="button" onClick={() => { setSharedConflict(null); setSharedSession((current) => current ? { ...current } : current); }}>Reload</button></div>}
       <NewEpisodeModal
         open={
           createOpen
@@ -9621,11 +9869,35 @@ export default function App() {
                 <div className="header-status-row">
                   <span className="badge header-stage-badge">Stage {activeEpisode.currentStage + 1} · {activeStageTemplate.name}</span>
                   <span className="badge header-active-badge">{activeEpisode.status === "archived" ? "Archived" : "Active"}</span>
-                  {codexStatus.ready && <span className="badge header-codex-badge">Codex Ready</span>}
+                  <span className={`badge header-codex-badge ${codexStatus.ready ? "" : "header-codex-badge--offline"}`}>Codex Runtime · {codexStatus.ready ? "Connected" : "Not connected"}</span>
                   <span className="badge header-authority-badge">Human authority</span>
                 </div>
               </div>
             </div>
+
+            {sharedSession && activeEpisode.sharedId && <div className="shared-audit-summary">
+              <button type="button" className="mode-secondary-action" onClick={inspectSharedAudit}>Inspect shared audit</button>
+              <button type="button" className="mode-secondary-action" onClick={verifyControlledSaveProtection}>Verify controlled saves</button>
+              {sharedAudit?.episodeId === activeEpisode.sharedId && <span>
+                Server v{sharedAudit.episode?.version ?? "?"} · {sharedAudit.activityEvents.length} activity event{sharedAudit.activityEvents.length === 1 ? "" : "s"} · {sharedAudit.authorityActions.length} authority action{sharedAudit.authorityActions.length === 1 ? "" : "s"}
+              </span>}
+              {sharedAudit?.episodeId === activeEpisode.sharedId && sharedAudit.authorityActions[0] && (() => {
+                const action = sharedAudit.authorityActions[0];
+                const activity = sharedAudit.activityEvents.find((event) => event.type === action.action_type);
+                return <span>
+                  Latest: {action.action_type} · v{action.prior_version} → v{action.resulting_version} · actor {action.actor_id} · {action.occurred_at}{activity ? ` · activity ${activity.actor_kind}/${activity.actor_id}` : " · activity missing"} · provenance {JSON.stringify(action.provenance)}
+                </span>;
+              })()}
+              {controlledSaveCheck?.episodeId === activeEpisode.sharedId && <span>{controlledSaveCheck.results.join(" · ")}</span>}
+            </div>}
+
+            {sharedSession && <div className="shared-audit-summary">
+              <button type="button" className="mode-secondary-action" onClick={() => prepareLegacyExport()}>Export local E0-020 for migration review</button>
+              {legacyExportSummary?.error && <span>{legacyExportSummary.error}</span>}
+              {legacyExportSummary?.displayKey && <span>
+                {legacyExportSummary.displayKey} · {legacyExportSummary.title} · project {legacyExportSummary.projectId ?? "unassigned"} · {legacyExportSummary.sourceCount} source{legacyExportSummary.sourceCount === 1 ? "" : "s"} · {legacyExportSummary.conversationCount} conversation message{legacyExportSummary.conversationCount === 1 ? "" : "s"} · {legacyExportSummary.workNodeCount} work node{legacyExportSummary.workNodeCount === 1 ? "" : "s"} · {legacyExportSummary.workSubthreadCount} work subthread{legacyExportSummary.workSubthreadCount === 1 ? "" : "s"} · {legacyExportSummary.evidenceOutputCount} evidence/output item{legacyExportSummary.evidenceOutputCount === 1 ? "" : "s"} · {legacyExportSummary.activityCount} activity event{legacyExportSummary.activityCount === 1 ? "" : "s"} · review {legacyExportSummary.reviewState} · disposition {legacyExportSummary.disposition} · {legacyExportSummary.duplicateNestedIds ? "duplicate nested IDs found" : "nested IDs unique"} · {legacyExportSummary.missingSourceReferences.length ? `${legacyExportSummary.missingSourceReferences.length} missing source reference${legacyExportSummary.missingSourceReferences.length === 1 ? "" : "s"}` : "source references complete"} · {legacyExportSummary.allLegacyActors ? "UNKNOWN_LEGACY attribution preserved" : "legacy attribution check failed"}
+              </span>}
+            </div>}
 
             <nav className="workspace-mode-tabs" aria-label="Episode workspace modes" role="tablist">
               {[
@@ -9909,21 +10181,6 @@ export default function App() {
                 onHide={() => setShowAutopilotInspector(false)}
               />}
 
-              <EpisodeIntakePanel
-                open={intakePanelOpen}
-                episode={activeEpisode}
-                intake={activeEpisode.intake}
-                onClose={() => setIntakePanelOpen(false)}
-                onRequestRevision={requestIntakeRevision}
-                onAccept={acceptEpisodeStructure}
-                onConfirmIntent={confirmIntentForAnalysis}
-                codexRunning={codexRunningEpisodeId === activeEpisode.id}
-                codexStatus={codexStatus}
-                codexRun={codexRun?.episodeId === activeEpisode.id ? codexRun : null}
-                onCancelAnalysis={cancelNativeCodexIntake}
-                onRetryAnalysis={() => runNativeCodexIntake(activeEpisode)}
-              />
-
               <ActivityDrawer
                 episode={activeEpisode}
                 open={activityOpen}
@@ -10042,6 +10299,21 @@ export default function App() {
                 )}
               </OrchestrationErrorBoundary>
             </div>
+
+            <EpisodeIntakePanel
+              open={intakePanelOpen}
+              episode={activeEpisode}
+              intake={activeEpisode.intake}
+              onClose={() => setIntakePanelOpen(false)}
+              onRequestRevision={requestIntakeRevision}
+              onAccept={acceptEpisodeStructure}
+              onConfirmIntent={confirmIntentForAnalysis}
+              codexRunning={codexRunningEpisodeId === activeEpisode.id}
+              codexStatus={codexStatus}
+              codexRun={codexRun?.episodeId === activeEpisode.id ? codexRun : null}
+              onCancelAnalysis={cancelNativeCodexIntake}
+              onRetryAnalysis={() => runNativeCodexIntake(activeEpisode)}
+            />
 
             {workspaceMode === "work" && !drawerOpen &&
               !anchoredConversationMinimized &&

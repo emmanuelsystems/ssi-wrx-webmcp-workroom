@@ -1620,6 +1620,15 @@ select:focus-visible {
   font-weight: 700;
 }
 
+.shared-audit-summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 18px 8px;
+  color: #666666;
+  font-size: 10px;
+}
+
 .episode-intake-panel {
   position: absolute;
   top: 18px;
@@ -5801,3 +5810,27 @@ select:focus-visible {
   font-weight: 700;
 }
 .run-inspector-canvas-toggle:hover { background: #eff3ed; }
+ .shared-mode-banner,
+ .shared-sign-in,
+ .shared-conflict {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 18px;
+  background: #12252a;
+  color: #eff8f8;
+  font-size: 13px;
+}
+
+.shared-mode-banner span,
+.shared-sign-in span { color: #b9d2d3; }
+.shared-mode-banner.legacy { background: #343532; }
+.shared-mode-banner.shared { background: #12382d; }
+.shared-mode-banner button,
+.shared-sign-in button,
+.shared-conflict button { margin-left: auto; }
+.shared-sign-in input { min-width: 150px; padding: 6px 8px; border: 1px solid #709399; border-radius: 5px; }
+.shared-sign-in small { color: #ffc3bd; }
+.shared-conflict { background: #5a281d; }
+.header-codex-badge--offline { opacity: .7; }
+.shared-empty-state { max-width: 640px; margin: 12vh auto; padding: 32px; border: 1px solid #d4dfdf; border-radius: 12px; background: #fff; color: #173236; }
